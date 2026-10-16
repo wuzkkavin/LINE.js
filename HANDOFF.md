@@ -45,7 +45,7 @@
 - 雲端 Windows 驗證：2026-10-16 已由老吳核准並啟動，run id 38920095834（workflow build-windows，ref ai-bao）。接手者先用 gh run view 38920095834 --repo wuzkkavin/LINE.js 查結果與下載 artifact（exe、Windows 截圖、打包報告），再判讀：兩個服務 HTTP 200、控制台截圖正常、DPAPI 與認證管理員在 Windows 的實際行為（log 佐證）。若失敗，看該 run 的 job log 修管線，不要宣稱通過。
 - 雲端驗證第二輪（run 38921241900）：失敗。原因為啟動器跨行程競態——監督者與 core 子行程同時呼叫 ensureRuntime 解開資產並以 cpSync 鏡像 dist/web，Windows 檔案鎖下 core 在 copyDir 撞上「檔案正被另一行程使用」（EPIPE）啟動即以 code=1 結束；Linux 本機因檔案鎖語義不同不重現。第一輪通過純屬時序幸運。
 - 競態修復（2026-10-16 深夜）：解開邏輯抽至 pack/launcher/runtime.mjs——mkdir 原子鎖（.runtime-lock）串行化，只有持鎖者動檔案，其餘行程輪詢等待（逾時 120 秒、殘留鎖 60 秒可打破）；解開改走暫存目錄寫入＋.extracted-ok 標記＋原子換名；dist/web 鏡像加 .mirror-ok 版本標記、換名失敗退回就地複製；檔案操作包 retryOnBusy 對 EBUSY/EPERM/EPIPE/EACCES 退避重試。pack/test 新增並發回歸測試（3 行程並發 ensureRuntime），pack 測試 33/33、本機重打包 exe 104,715,776 bytes（build-report ok）。
-- 雲端驗證第三輪：run id 待填（觸發後補記）。
+- 雲端驗證第三輪（run 38922892169，commit ae37c72）：整體結論 failure，但競態修復已驗證有效——「啟動 exe 並等待服務就緒」步驟通過（第二輪正是死在此步），打包與關閉、上傳皆成功。唯一失敗步驟是「截圖核心登入頁與控制台」：Chrome headless 啟動約 0.8 秒即結束且未產生 PNG，步驟在 Test-Path 檢查如設計拋錯（截圖失敗, 檔案未產生: pack/build/core-3789.png），故本輪 artifact 仍只有 exe（104,716,288 bytes）與打包報告、無截圖。截圖問題與啟動器無關，下一步應查 runner 上 Chrome headless 的實際錯誤（目前 log 無 Chrome stderr；可改為擷取 Chrome 輸出與 exit code，或換截圖工具），修好再重跑一輪補截圖，不要把第三輪說成全過。
 - 尚未 commit 到 main 的內容：ai-bao 分支 commit c04adaa（含 helper/、pack/、workflow 副本）。main 只有 workflow 檔 commit 633ecd1（workflow_dispatch 必須存在於預設分支才可被呼叫，這是 GitHub 的限制）。
 
 ## 6. 待辦（依序）
