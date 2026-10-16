@@ -46,13 +46,15 @@
 - 雲端驗證第二輪（run 38921241900）：失敗。原因為啟動器跨行程競態——監督者與 core 子行程同時呼叫 ensureRuntime 解開資產並以 cpSync 鏡像 dist/web，Windows 檔案鎖下 core 在 copyDir 撞上「檔案正被另一行程使用」（EPIPE）啟動即以 code=1 結束；Linux 本機因檔案鎖語義不同不重現。第一輪通過純屬時序幸運。
 - 競態修復（2026-10-16 深夜）：解開邏輯抽至 pack/launcher/runtime.mjs——mkdir 原子鎖（.runtime-lock）串行化，只有持鎖者動檔案，其餘行程輪詢等待（逾時 120 秒、殘留鎖 60 秒可打破）；解開改走暫存目錄寫入＋.extracted-ok 標記＋原子換名；dist/web 鏡像加 .mirror-ok 版本標記、換名失敗退回就地複製；檔案操作包 retryOnBusy 對 EBUSY/EPERM/EPIPE/EACCES 退避重試。pack/test 新增並發回歸測試（3 行程並發 ensureRuntime），pack 測試 33/33、本機重打包 exe 104,715,776 bytes（build-report ok）。
 - 雲端驗證第三輪（run 38922892169，commit ae37c72）：整體結論 failure，但競態修復已驗證有效——「啟動 exe 並等待服務就緒」步驟通過（第二輪正是死在此步），打包與關閉、上傳皆成功。唯一失敗步驟是「截圖核心登入頁與控制台」：Chrome headless 啟動約 0.8 秒即結束且未產生 PNG，步驟在 Test-Path 檢查如設計拋錯（截圖失敗, 檔案未產生: pack/build/core-3789.png），故本輪 artifact 仍只有 exe（104,716,288 bytes）與打包報告、無截圖。截圖問題與啟動器無關，下一步應查 runner 上 Chrome headless 的實際錯誤（目前 log 無 Chrome stderr；可改為擷取 Chrome 輸出與 exit code，或換截圖工具），修好再重跑一輪補截圖，不要把第三輪說成全過。
-- 尚未 commit 到 main 的內容：ai-bao 分支 commit c04adaa（含 helper/、pack/、workflow 副本）。main 只有 workflow 檔 commit 633ecd1（workflow_dispatch 必須存在於預設分支才可被呼叫，這是 GitHub 的限制）。
+- 雲端驗證第四輪（run 38923430084）：啟動再次通過（競態修復穩定）；截圖仍失敗但已錄到關鍵證據——pwsh 直接呼叫 GUI 子系統的 Chrome 不會等待（exit 立即返回、無輸出），PNG 未產生即被判失敗。
+- 雲端驗證第五輪（run 38923830484）：全步驟成功，階段三驗證完成。截圖步驟改用 Start-Process -Wait 等待瀏覽器結束後，console-3790.png 與 core-3789.png 皆取得（存於 pack/cloud-run-38923830484/）。雲端版 exe 104,716,288 bytes 已備份 Drive「AI寶 LINE 小幫手」資料夾（file id 1yTbIkbr80ame9KFg26sXJIJY-cdwmCnY，大小核對一致）；五輪的 Actions artifact 已全數刪除（老吳既定流程）。注意：雲端跑的是乾淨 runner 無真 Key/真帳號，DPAPI 與認證管理員的真實寫入仍待階段四或老吳實機操作時佐證（程式路徑已在 runner 上實際執行、未報錯）。
+- 尚未 commit 到 main 的內容：ai-bao 分支開發中。main 只有 workflow 檔 commit 633ecd1（workflow_dispatch 必須存在於預設分支才可被呼叫，這是 GitHub 的限制）；workflow 內容更新時須同步 main 與 ai-bao 兩處的 .github/workflows/build-windows.yml（正本在 pack/build-windows.yml）。
 
 ## 6. 待辦（依序）
 
-1. 判讀雲端驗證 run 38920095834 結果；若全過，下載該次 exe artifact 作為第一個 Windows 實測版，存 Drive「AI寶 LINE 小幫手」資料夾，並向老吳回報（含 Windows 截圖）。
+1. （已完成）雲端驗證五輪結果判讀、最終版 exe 備份 Drive、五輪 artifact 清理，皆於 2026-10-16 深夜完成，見第 5 節。
 2. 每次發布/驗證完成後，刪除該次 Actions artifact（老吳既定流程，避免儲存額度累積；Release 與 Drive 備份不受影響）。
-3. 階段四（真帳號實測）：等老吳提供次要帳號並在場掃 QR。先進測試小群驗收（觸發、知識庫、防詐騙、log），老吳點頭才進正式公司群。相關流程：exe 啟動後在控制台操作登入，Token 以 --role cli 產生並填入 helper 設定。
+3. 階段四（真帳號實測）：等老吳提供次要帳號並在場掃 QR。先進測試小群驗收（觸發、知識庫、防詐騙、log），老吳點頭才進正式公司群。相關流程：exe 啟動後在控制台操作登入，Token 以 --role cli 產生並填入 helper 設定。建議老吳可先在他自己的 Windows 電腦雙擊 Drive 上的 AI寶.exe 試跑（免安裝、免帳號也能開控制台看介面；首次會跳 SmartScreen 需按「仍要執行」）。
 4. 上游同步機制：老吳要求「上游更新要跟著更新」，但自動同步的授權範圍與檢查頻率尚未拍板（比照 Craft 家族的每日追蹤＋自動更新模式是候選）。未經老吳確認前，只做手動 git fetch upstream 比對並回報，不要自動合併發布。
 5. 知識庫第二版格式（pdf/docx/xlsx）與 Jev 實際串接：未排期，等老吳指示。
 
