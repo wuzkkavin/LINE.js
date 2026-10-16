@@ -43,6 +43,9 @@
 - 階段二（helper 體驗版）：完成。helper 測試 13/13（含端到端：FakeProvider 真核心＋本機 AI stub；句尾觸發、改名、知識庫附來源、防詐騙警告、log 無 Key 皆有斷言）。控制台截圖在 helper/screenshots/。
 - 階段三（打包）：VM 內完成。pack 測試 28/28；產出 pack/out/AI寶.exe（103,270,400 bytes，PE32+ x64，基底 Node v24.20.0，icon 與版本資訊已寫入，LegalCopyright 為版權字串，證據 pack/build/build-report.json）。注意：pack/out 與 pack/build、pack/.cache 已被 .gitignore 排除，不進 Git。
 - 雲端 Windows 驗證：2026-10-16 已由老吳核准並啟動，run id 38920095834（workflow build-windows，ref ai-bao）。接手者先用 gh run view 38920095834 --repo wuzkkavin/LINE.js 查結果與下載 artifact（exe、Windows 截圖、打包報告），再判讀：兩個服務 HTTP 200、控制台截圖正常、DPAPI 與認證管理員在 Windows 的實際行為（log 佐證）。若失敗，看該 run 的 job log 修管線，不要宣稱通過。
+- 雲端驗證第二輪（run 38921241900）：失敗。原因為啟動器跨行程競態——監督者與 core 子行程同時呼叫 ensureRuntime 解開資產並以 cpSync 鏡像 dist/web，Windows 檔案鎖下 core 在 copyDir 撞上「檔案正被另一行程使用」（EPIPE）啟動即以 code=1 結束；Linux 本機因檔案鎖語義不同不重現。第一輪通過純屬時序幸運。
+- 競態修復（2026-10-16 深夜）：解開邏輯抽至 pack/launcher/runtime.mjs——mkdir 原子鎖（.runtime-lock）串行化，只有持鎖者動檔案，其餘行程輪詢等待（逾時 120 秒、殘留鎖 60 秒可打破）；解開改走暫存目錄寫入＋.extracted-ok 標記＋原子換名；dist/web 鏡像加 .mirror-ok 版本標記、換名失敗退回就地複製；檔案操作包 retryOnBusy 對 EBUSY/EPERM/EPIPE/EACCES 退避重試。pack/test 新增並發回歸測試（3 行程並發 ensureRuntime），pack 測試 33/33、本機重打包 exe 104,715,776 bytes（build-report ok）。
+- 雲端驗證第三輪：run id 待填（觸發後補記）。
 - 尚未 commit 到 main 的內容：ai-bao 分支 commit c04adaa（含 helper/、pack/、workflow 副本）。main 只有 workflow 檔 commit 633ecd1（workflow_dispatch 必須存在於預設分支才可被呼叫，這是 GitHub 的限制）。
 
 ## 6. 待辦（依序）

@@ -10,12 +10,13 @@
 // 資料一律落在 resolveDataDir() 決定的目錄 (Windows 為 %LOCALAPPDATA%/HwLineHelper), 不寫 exe 旁邊。
 // 開發模式 (非 SEA, 直接以 node 執行本檔) 時, 核心與 helper 改從 Repo 原始檔案載入, 行為與 SEA 版一致。
 import { spawn } from "node:child_process";
-import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolveDataDir, dataPaths } from "./paths.mjs";
 import { createSessionVault } from "./vault.mjs";
 import { probeHttp, waitForHttp, buildChildSpec } from "./probe.mjs";
+import { ensureRuntime } from "./runtime.mjs";
 
 const CORE_PORT = 3789;
 const HELPER_PORT = 3790;
@@ -49,57 +50,8 @@ function makeLog(paths) {
   };
 }
 
-// 把 SEA 內嵌資產解開到 <dataDir>/runtime/<版本>/, 並把核心網頁鏡像到 <dataDir>/dist/web
-// (核心以 CWD 的 dist/web 提供網頁, 而核心子行程的 CWD 就是資料目錄)。
-// 回傳本次版本的 runtime 目錄。已有完整解開標記時只做鏡像與舊版清理。
-function extractAssets(sea, paths, log) {
-  const manifest = JSON.parse(Buffer.from(sea.getAsset("manifest.json")).toString("utf8"));
-  const runtimeVerDir = join(paths.runtimeDir, manifest.version);
-  const marker = join(runtimeVerDir, ".extracted-ok");
-  if (!existsSync(marker)) {
-    log(`解開內嵌檔案到 ${runtimeVerDir} (共 ${manifest.files.length} 個)`);
-    for (const key of manifest.files) {
-      const dest = join(runtimeVerDir, ...key.split("/"));
-      mkdirSync(dirname(dest), { recursive: true });
-      writeFileSync(dest, Buffer.from(sea.getAsset(key)));
-    }
-    writeFileSync(marker, `files=${manifest.files.length}\n`);
-  }
-  const webSrc = join(runtimeVerDir, "core", "dist", "web");
-  if (existsSync(webSrc)) {
-    mkdirSync(paths.distWebDir, { recursive: true });
-    cpSync(webSrc, paths.distWebDir, { recursive: true, force: true });
-  }
-  // 核心首次啟動會把 CWD 的 config.example.yaml 複製成 config.yaml; 資料目錄裡必須先備好範本。
-  const exampleSrc = join(runtimeVerDir, "core", "config.example.yaml");
-  const exampleDest = join(paths.root, "config.example.yaml");
-  if (existsSync(exampleSrc) && !existsSync(exampleDest)) cpSync(exampleSrc, exampleDest);
-  try {
-    for (const name of readdirSync(paths.runtimeDir)) {
-      const p = join(paths.runtimeDir, name);
-      if (p !== runtimeVerDir) rmSync(p, { recursive: true, force: true });
-    }
-  } catch { /* 清理舊版失敗不影響啟動 */ }
-  return runtimeVerDir;
-}
-
-// 開發模式: 只鏡像核心網頁與設定範本到資料目錄, JS 本體直接從 Repo 載入。
-function devMirror(paths) {
-  const webSrc = join(repoRoot, "dist", "web");
-  if (existsSync(webSrc)) {
-    mkdirSync(paths.distWebDir, { recursive: true });
-    cpSync(webSrc, paths.distWebDir, { recursive: true, force: true });
-  }
-  const exampleSrc = join(repoRoot, "config.example.yaml");
-  const exampleDest = join(paths.root, "config.example.yaml");
-  if (existsSync(exampleSrc) && !existsSync(exampleDest)) cpSync(exampleSrc, exampleDest);
-  return null;
-}
-
-function ensureRuntime(sea, paths, log) {
-  return sea ? extractAssets(sea, paths, log) : devMirror(paths);
-}
-
+// 執行期資產的解開與鏡像在 runtime.mjs: 監督者與各子行程都會呼叫 ensureRuntime,
+// 以跨行程鎖串行化並用完成標記避免重工, 避免 Windows 檔案鎖下互撞 (競態修復)。
 function openBrowser() {
   try {
     const opts = { detached: true, stdio: "ignore" };
@@ -111,7 +63,7 @@ function openBrowser() {
 
 async function roleCore(sea, paths) {
   const log = makeLog(paths);
-  const runtimeVerDir = ensureRuntime(sea, paths, log);
+  const runtimeVerDir = await ensureRuntime(sea, paths, log, { repoRoot });
   process.chdir(paths.root);
   const target = sea ? join(runtimeVerDir, "core", "dist", "main.js") : join(repoRoot, "dist", "main.js");
   await import(pathToFileURL(target).href);
@@ -119,7 +71,7 @@ async function roleCore(sea, paths) {
 
 async function roleHelper(sea, paths) {
   const log = makeLog(paths);
-  const runtimeVerDir = ensureRuntime(sea, paths, log);
+  const runtimeVerDir = await ensureRuntime(sea, paths, log, { repoRoot });
   if (!process.env.HELPER_DATA_DIR) process.env.HELPER_DATA_DIR = paths.root;
   if (!process.env.HELPER_PORT) process.env.HELPER_PORT = String(HELPER_PORT);
   const target = sea ? join(runtimeVerDir, "helper", "src", "main.mjs") : join(repoRoot, "helper", "src", "main.mjs");
@@ -128,7 +80,7 @@ async function roleHelper(sea, paths) {
 
 async function roleCli(sea, paths, args) {
   const log = makeLog(paths);
-  const runtimeVerDir = ensureRuntime(sea, paths, log);
+  const runtimeVerDir = await ensureRuntime(sea, paths, log, { repoRoot });
   process.chdir(paths.root);
   process.argv = [process.argv[0], "cli", ...args];
   const target = sea ? join(runtimeVerDir, "core", "scripts", "cli.mjs") : join(repoRoot, "scripts", "cli.mjs");
@@ -140,7 +92,7 @@ async function supervise(sea, paths) {
   mkdirSync(paths.logsDir, { recursive: true });
   const log = makeLog(paths);
   log(`AI寶 啟動中; 資料目錄: ${paths.root}; 模式: ${sea ? "SEA 單一執行檔" : "開發模式"}`);
-  ensureRuntime(sea, paths, log);
+  await ensureRuntime(sea, paths, log, { repoRoot });
 
   const vault = createSessionVault({ paths });
   try {
