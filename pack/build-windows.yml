@@ -91,8 +91,10 @@ jobs:
           foreach ($shot in $shots) {
             $i++
             $profile = Join-Path $env:TEMP "shot-profile-$i"
-            $out = & $browser --headless=new --disable-gpu --no-sandbox --no-first-run --hide-scrollbars --virtual-time-budget=15000 --user-data-dir=$profile "--screenshot=$($shot.path)" --window-size=1440,900 $shot.url 2>&1
-            Write-Host "exit=$LASTEXITCODE output: $out"
+            $args = @('--headless=new', '--disable-gpu', '--no-sandbox', '--no-first-run', '--hide-scrollbars', '--virtual-time-budget=15000', "--user-data-dir=$profile", "--screenshot=$($shot.path)", '--window-size=1440,900', $shot.url)
+            $proc = Start-Process -FilePath $browser -ArgumentList $args -Wait -PassThru -NoNewWindow
+            Write-Host "browser exit=$($proc.ExitCode)"
+            foreach ($w in 1..20) { if (Test-Path $shot.path) { break }; Start-Sleep -Milliseconds 500 }
             if (-not (Test-Path $shot.path)) { throw "截圖失敗, 檔案未產生: $($shot.path)" }
           }
           Get-ChildItem $buildDir/*.png | Select-Object Name, Length
