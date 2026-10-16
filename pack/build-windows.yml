@@ -74,15 +74,25 @@ jobs:
       - name: 截圖核心登入頁與控制台
         shell: pwsh
         run: |
-          $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
-          if (-not (Test-Path $chrome)) { throw "找不到 Chrome: $chrome" }
+          $candidates = @(
+            'C:\Program Files\Google\Chrome\Application\chrome.exe',
+            'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+            'C:\Program Files\Microsoft\Edge\Application\msedge.exe'
+          )
+          $browser = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $browser) { throw '找不到 Chrome 或 Edge' }
+          Write-Host "使用瀏覽器: $browser"
           $buildDir = (Resolve-Path 'pack/build').Path
           $shots = @(
             @{ path = Join-Path $buildDir 'core-3789.png';    url = 'http://127.0.0.1:3789/' },
             @{ path = Join-Path $buildDir 'console-3790.png'; url = 'http://127.0.0.1:3790/' }
           )
+          $i = 0
           foreach ($shot in $shots) {
-            & $chrome --headless=new --disable-gpu --no-sandbox --hide-scrollbars --virtual-time-budget=15000 "--screenshot=$($shot.path)" --window-size=1440,900 $shot.url
+            $i++
+            $profile = Join-Path $env:TEMP "shot-profile-$i"
+            $out = & $browser --headless=new --disable-gpu --no-sandbox --no-first-run --hide-scrollbars --virtual-time-budget=15000 --user-data-dir=$profile "--screenshot=$($shot.path)" --window-size=1440,900 $shot.url 2>&1
+            Write-Host "exit=$LASTEXITCODE output: $out"
             if (-not (Test-Path $shot.path)) { throw "截圖失敗, 檔案未產生: $($shot.path)" }
           }
           Get-ChildItem $buildDir/*.png | Select-Object Name, Length
