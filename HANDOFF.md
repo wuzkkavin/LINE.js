@@ -34,10 +34,8 @@
 ## 4. 素材（helper/assets/）
 
 - ai-bao-icon.png：綠色對話泡泡，老吳提供。用途：App/exe 圖示、控制台 Logo、favicon。
-- ai-bao-cutout.png：現行透明母檔（無白邊）。來源：AI 乾淨版（ai-bao-avatar-ai.png，1600×1600）以 rembg（isnet-general-use）去背，1075×1222。
-- ai-bao-avatar.png：現行頭像 480×480（去背母檔＋米白底合成）。控制台狀態卡與日後 LINE 大頭貼用。
-- 備份（不要打包、不要用）：ai-bao-cutout-bordered.png（舊帶白邊版，左邊白邊有缺損，勿用）、ai-bao-cutout-original.png（原照片無白邊擷取版，僅 255×295，解析度低）、ai-bao-avatar-photo.png、ai-bao-avatar-original.png。
-- 原始素材出處：老吳提供的四角色合照與角色原圖在 ~/workspace/user/media_library/；弄正後的原圖在 ~/workspace/linejs-test/ai-bao-original-straightened.png（原圖斜 9.2 度，以眼睛連線量測校正）。
+- ai-bao-avatar.png：現行頭像（定版）。老吳於 2026-10-16 深夜親自處理後提供：1277×1232 RGBA、透明底、白色貼紙邊完整均勻。原檔原樣保存（MD5 53d0a1617d54dfa8ad38258349e45f49），不得再裁切或加工；控制台狀態卡與日後 LINE 大頭貼用。原圖出處在 ~/workspace/user/media_library/（image/ca/ 下）。
+- 其餘頭像衍生檔（先前 Muse 製作的 cutout 與各版 avatar）：老吳指示不要，已於 2026-10-16 全數移入 Muse 垃圾桶（2026-11-15 到期，期間可用 trash.restore 救回），Repo 內不再存在，不要再引用。pack 打包的資產清單若列有 ai-bao-cutout.png，須改為只內嵌 ai-bao-avatar.png 與 ai-bao-icon.png。
 
 ## 5. 目前進度與驗證證據（2026-10-16）
 
