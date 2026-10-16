@@ -105,9 +105,9 @@ function collectAssets(coreVer, helperVer) {
   copyTree(join(helperDir, "web"), join(stagingDir, "helper", "web"));
   copyTree(join(helperDir, "package.json"), join(stagingDir, "helper", "package.json"));
   copyTree(join(helperDir, "assets", "fonts"), join(stagingDir, "helper", "assets", "fonts"));
-  // 頭像素材只打現行版: icon (App 圖示)、avatar (去背+米白底頭像)、cutout (透明母檔);
-  // ai-bao-avatar-ai.png / -photo.png / -original.png 是備份, 不進 exe。
-  for (const name of ["ai-bao-icon.png", "ai-bao-avatar.png", "ai-bao-cutout.png"]) {
+  // 頭像素材只打現行版: icon (App 圖示)、avatar (老吳定版頭像, 透明底貼紙版)。
+  // 先前的 cutout 等衍生檔已依老吳指示移除, 不再內嵌。
+  for (const name of ["ai-bao-icon.png", "ai-bao-avatar.png"]) {
     copyTree(join(helperDir, "assets", name), join(stagingDir, "helper", "assets", name));
   }
   const files = listFiles(stagingDir).filter((f) => f !== "manifest.json");
