@@ -1,0 +1,1 @@
+{"dependencies":{"ws":"8.22.0"},"description":"LINE.js 電腦學習小幫手 (伴隨模組, 透過 /api/ws 連接 LINE.js 核心)","engines":{"node":">=22"},"license":"Apache-2.0","name":"linejs-helper","private":true,"scripts":{"start":"node src/main.mjs","test":"node --test test/*.test.mjs"},"type":"module","version":"0.1.0"}

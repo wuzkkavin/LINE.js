@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>機器人控制台</title>
+<link rel="icon" type="image/png" href="/assets/icon.png">
+<link rel="apple-touch-icon" href="/assets/icon.png">
+<meta name="theme-color" content="#0c513d">
+<style>
+@font-face { font-family: "Huninn"; src: url("/assets/font.ttf") format("truetype"); font-display: swap; }
+:root {
+  --dark: #0c513d; --dark2: #083b2d; --green: #06c755; --green-soft: #e5f7ec;
+  --bg: #f3f8f3; --card: #ffffff; --ink: #17352b; --muted: #5f7a6e; --line: #dcebe2;
+  --warn: #b45309; --warn-bg: #fdf3e2; --err: #b3261e; --radius: 18px;
+  --shadow: 0 10px 30px rgba(12, 81, 61, .09), 0 2px 6px rgba(12, 81, 61, .05);
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: "Huninn", "Microsoft JhengHei", sans-serif; }
+header.top {
+  background: linear-gradient(135deg, var(--dark) 0%, var(--dark2) 70%); color: #fff;
+  padding: 26px 20px 30px; border-bottom: 4px solid var(--green);
+}
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 16px; }
+.brand { display: flex; align-items: center; gap: 14px; }
+.avatar {
+  width: 56px; height: 56px; border-radius: 18px; background: #fff; color: #fff;
+  display: flex; align-items: center; justify-content: center; font-size: 26px; box-shadow: var(--shadow); flex: none; overflow: hidden;
+}
+.avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+footer.pagefoot { text-align: center; color: var(--muted); font-size: 13.5px; padding: 26px 16px 8px; line-height: 1.7; }
+.bot-avatar { width: 52px; height: 52px; border-radius: 50%; object-fit: cover; border: 2.5px solid var(--green); box-shadow: var(--shadow); float: right; }
+h1 { font-size: 26px; margin: 0; letter-spacing: .5px; }
+.sub { color: #bfe3cf; font-size: 14px; margin-top: 4px; }
+main { margin-top: -14px; padding-bottom: 110px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 18px; }
+.card h2 { margin: 0 0 6px; font-size: 17px; color: var(--dark); display: flex; align-items: center; gap: 8px; }
+.card h3 { margin: 14px 0 8px; font-size: 15px; color: var(--dark); }
+.stat-label { font-size: 13px; color: var(--muted); }
+.stat-value { font-size: 19px; margin-top: 4px; word-break: break-all; }
+.stat-sub { font-size: 13px; color: var(--muted); margin-top: 3px; }
+.pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12.5px; background: var(--green-soft); color: var(--dark); border: 1px solid #bfe6cd; }
+.pill.off { background: #f3f4f6; color: #6b7280; border-color: #e5e7eb; }
+.pill.warn { background: var(--warn-bg); color: var(--warn); border-color: #f5ddae; }
+section.card { margin-top: 16px; }
+label { display: block; font-size: 13.5px; color: var(--muted); margin: 12px 0 5px; }
+input[type=text], input[type=password], input[type=number], select, textarea {
+  width: 100%; padding: 10px 12px; border: 1.5px solid var(--line); border-radius: 12px; font: inherit; font-size: 15px; background: #fbfefc; color: var(--ink);
+}
+input:focus, select:focus, textarea:focus { outline: 2px solid rgba(6, 199, 85, .35); border-color: var(--green); }
+textarea { min-height: 110px; resize: vertical; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+.hint { font-size: 13px; color: var(--muted); margin-top: 6px; line-height: 1.55; }
+.provider { border: 1.5px solid var(--line); border-radius: 14px; padding: 14px; margin-top: 12px; background: #fbfefc; }
+.provider.active { border-color: var(--green); background: var(--green-soft); }
+button {
+  font: inherit; border: 0; border-radius: 999px; padding: 9px 18px; cursor: pointer;
+  background: var(--dark); color: #fff; font-size: 14.5px;
+}
+button.ghost { background: #fff; color: var(--dark); border: 1.5px solid var(--dark); }
+button:disabled { opacity: .55; cursor: wait; }
+.test-result { font-size: 13.5px; margin-left: 10px; }
+.savebar {
+  position: fixed; left: 0; right: 0; bottom: 0; background: rgba(255,255,255,.94); backdrop-filter: blur(6px);
+  border-top: 1px solid var(--line); padding: 12px 16px; display: flex; justify-content: center; gap: 12px; align-items: center; z-index: 5;
+}
+.savebar button { background: var(--green); font-size: 16px; padding: 11px 30px; }
+#saveMsg { font-size: 14px; color: var(--dark); }
+pre.log { background: #0d2b21; color: #c9e8d5; border-radius: 12px; padding: 12px; font-size: 12px; max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+.checkline { display: flex; gap: 8px; align-items: center; margin-top: 12px; font-size: 14.5px; color: var(--ink); }
+.checkline input { width: 18px; height: 18px; accent-color: var(--green); }
+a.btn { text-decoration: none; }
+@media (max-width: 720px) { .row, .row3 { grid-template-columns: 1fr; } h1 { font-size: 22px; } }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap brand">
+    <div class="avatar"><img src="/assets/icon.png" alt="AI寶 圖示" id="avatarImg" onerror="this.parentElement.textContent='?';"></div>
+    <div>
+      <h1><span id="appName">機器人</span> 控制台</h1>
+      <div class="sub">公司 LINE 群組的電腦學習助理 — 設定都在這台電腦, 不會傳到外面</div>
+    </div>
+  </div>
+</header>
+<main class="wrap">
+  <div class="grid" id="statusGrid">
+    <div class="card"><div class="stat-label">LINE 連線狀態</div><div class="stat-value" id="stLine">讀取中…</div><div class="stat-sub" id="stSelf"></div></div>
+    <div class="card"><img class="bot-avatar" id="botAvatar" src="/assets/avatar.png" alt="AI寶 頭像" onerror="this.style.display='none';"><div class="stat-label">機器人名字 (觸發)</div><div class="stat-value" id="stName">—</div><div class="stat-sub" id="stMode"></div></div>
+    <div class="card"><div class="stat-label">使用中的 AI</div><div class="stat-value" id="stAi">—</div><div class="stat-sub" id="stAiModel"></div></div>
+    <div class="card"><div class="stat-label">知識庫</div><div class="stat-value" id="stKb">—</div><div class="stat-sub" id="stKbSub"></div></div>
+    <div class="card"><div class="stat-label">今日數據</div><div class="stat-value" id="stToday">—</div><div class="stat-sub" id="stScam"></div></div>
+  </div>
+
+  <section class="card">
+    <h2>一般與觸發</h2>
+    <div class="row">
+      <div>
+        <label for="botName">機器人名字 (主名)</label>
+        <input type="text" id="botName" placeholder="範例:AI寶">
+        <div class="hint">名字由你自訂: 同事在群組打到這個名字, 我就會回應。改名不用改程式, 儲存後馬上生效。</div>
+      </div>
+      <div>
+        <label for="aliases">其他叫法 (別名, 可多個, 用逗號分開)</label>
+        <input type="text" id="aliases" placeholder="範例:阿寶,電腦助理">
+        <div class="hint">可以留空, 之後想到再加。</div>
+      </div>
+    </div>
+    <div class="row3">
+      <div>
+        <label for="triggerMode">觸發寬嚴</label>
+        <select id="triggerMode">
+          <option value="loose">寬鬆: 提到名字就回</option>
+          <option value="standard">標準: 名字 + 像在問問題才回 (建議)</option>
+          <option value="strict">嚴格: 名字要在句首才回</option>
+        </select>
+      </div>
+      <div>
+        <label for="cooldownSec">同一個人冷卻秒數</label>
+        <input type="number" id="cooldownSec" min="0" max="600">
+      </div>
+      <div>
+        <label for="dailyLimit">每日回答上限 (則)</label>
+        <input type="number" id="dailyLimit" min="1" max="10000">
+      </div>
+    </div>
+    <label for="lineApiUrl">LINE 核心連線位置 (進階, 通常不用改)</label>
+    <input type="text" id="lineApiUrl">
+  </section>
+
+  <section class="card">
+    <h2>AI 供應商</h2>
+    <div class="hint">三家都填了 Key 也可以, 用哪一家由下面的單選決定。Key 只存在這台電腦的機密存放區, 不會寫進設定檔, 也不會顯示出來 (只看得到末 4 碼)。</div>
+    <div id="providers"></div>
+    <label class="checkline"><input type="checkbox" id="aiFallback"> 啟用自動備援 (使用中的 AI 失敗時, 自動改用下一家)</label>
+    <label for="systemPrompt">回答規則 (系統提示詞)</label>
+    <textarea id="systemPrompt"></textarea>
+  </section>
+
+  <section class="card">
+    <h2>防詐騙</h2>
+    <label class="checkline"><input type="checkbox" id="scamEnabled"> 啟用自動防詐騙掃描 (訊息先經本機規則預篩, 命中才送 AI 判讀)</label>
+    <div class="row">
+      <div>
+        <label for="scamThreshold">警告門檻 (0 到 1, 預設 0.8)</label>
+        <input type="number" id="scamThreshold" min="0" max="1" step="0.05">
+      </div>
+      <div>
+        <label for="scamPerMinute">每分鐘判讀上限</label>
+        <input type="number" id="scamPerMinute" min="1" max="60">
+      </div>
+    </div>
+    <h3>TypeSafe Jev (選用, 預設停用)</h3>
+    <div class="hint">原作者的詐騙分析選項。每次判讀依 TypeSafe 計費; 未填 Key 前不會啟用。</div>
+    <div class="row">
+      <div>
+        <label for="jevKey">Jev API Key</label>
+        <input type="password" id="jevKey" placeholder="尚未設定" autocomplete="off">
+        <div class="hint" id="jevKeyState"></div>
+      </div>
+      <div>
+        <label for="jevModel">Jev 模型</label>
+        <input type="text" id="jevModel">
+        <label class="checkline"><input type="checkbox" id="jevEnabled"> 啟用 Jev 判讀</label>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>知識庫</h2>
+    <label for="kbFolder">知識庫資料夾 (只讀取, 不會修改裡面的檔案; 內容請先脫敏)</label>
+    <input type="text" id="kbFolder" placeholder="範例:D:/公司知識庫">
+    <div class="hint" id="kbStatus">尚未讀取狀態</div>
+    <div style="margin-top:12px"><button type="button" class="ghost" id="btnKb">立即重新整理知識庫</button><span class="test-result" id="kbMsg"></span></div>
+    <div class="hint">第一版支援 .txt、.md、.csv。同事問公司資訊時會先查知識庫, 回答時會註明來源檔名; 查不到會明說, 不會亂編。</div>
+  </section>
+
+  <section class="card">
+    <h2>Log 與診斷包</h2>
+    <div class="hint">Log 只存在這台電腦的使用者資料夾, 不記 API Key、不記訊息全文。出問題時下載診斷包傳給維護人員, 就能查到是哪一步出問題。</div>
+    <label class="checkline"><input type="checkbox" id="logDebug"> 除錯模式 (會記錄問題全文, 查完問題請關掉)</label>
+    <div class="row">
+      <div>
+        <label for="logRetention">Log 保留天數</label>
+        <input type="number" id="logRetention" min="1" max="90">
+      </div>
+      <div>
+        <label>Log 資料夾</label>
+        <div><button type="button" class="ghost" id="btnLogDir">查看位置</button> <a class="btn" href="/api/diagnostic"><button type="button">下載診斷包</button></a></div>
+        <div class="hint" id="logDirText"></div>
+      </div>
+    </div>
+    <h3>今天的 Log (最後 200 行)</h3>
+    <pre class="log" id="logTail">讀取中…</pre>
+    <button type="button" class="ghost" id="btnLogRefresh">重新整理 Log</button>
+  </section>
+
+  <section class="card">
+    <h2>關於</h2>
+    <div style="font-size:15px; line-height:1.8">
+      ©Copyright 2026 By 吳治綱 繁體中文化
+    </div>
+    <div class="hint" style="font-size:13.5px; line-height:1.8">
+      本頁的版權宣告是針對本繁體中文化／客製版本 (helper 伴隨模組)。<br>
+      上游出處: 原始專案 <strong>JS-PACKAGE/LINE.js</strong> (授權: Apache License 2.0), 核心函式庫 <strong>@evex/linejs</strong> (evex-dev)。上游著作權與授權標示完整保留, 詳見 Repo 根目錄 LICENSE 與 helper/README.md。<br>
+      本頁圖示 (AI寶 icon) 由吳治綱提供; 字體 jf open 粉圓依 SIL Open Font License 1.1 使用。
+    </div>
+  </section>
+
+  <footer class="pagefoot">
+    <div>©Copyright 2026 By 吳治綱 繁體中文化</div>
+    <div>上游: JS-PACKAGE/LINE.js (Apache License 2.0) · @evex/linejs</div>
+  </footer>
+</main>
+<div class="savebar">
+  <button type="button" id="btnSave">儲存全部設定</button>
+  <span id="saveMsg"></span>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const PROVIDERS = ["openai", "groq", "minimax"];
+let settings = null;
+function providerCard(p) {
+  const d = document.createElement("div");
+  d.className = "provider"; d.id = "prov-" + p.id;
+  d.innerHTML = `
+    <label class="checkline" style="margin-top:0"><input type="radio" name="aiActive" value="${p.id}"> 使用這家: <strong>${p.label}</strong></label>
+    <div class="row3">
+      <div><label>API Key</label><input type="password" id="key-${p.id}" placeholder="尚未設定" autocomplete="off"><div class="hint" id="keystate-${p.id}"></div></div>
+      <div><label>模型名稱</label><input type="text" id="model-${p.id}"></div>
+      <div><label>Base URL</label><input type="text" id="base-${p.id}"></div>
+    </div>
+    <div style="margin-top:10px"><button type="button" class="ghost" id="test-${p.id}">測試連線</button><span class="test-result" id="testres-${p.id}"></span>
+    <button type="button" class="ghost" id="clear-${p.id}">清除 Key</button></div>`;
+  return d;
+}
+async function loadAll() {
+  const [sRes, stRes] = await Promise.all([fetch("/api/settings"), fetch("/api/status")]);
+  settings = await sRes.json();
+  const status = await stRes.json();
+  const s = settings;
+  document.title = (s.botName || "機器人") + " 控制台";
+  $("appName").textContent = s.botName || "機器人";
+  $("botName").value = s.botName || "";
+  $("aliases").value = (s.aliases || []).join(",");
+  $("triggerMode").value = s.triggerMode;
+  $("cooldownSec").value = s.cooldownSec;
+  $("dailyLimit").value = s.dailyLimit;
+  $("lineApiUrl").value = s.lineApiUrl;
+  const holder = $("providers"); holder.innerHTML = "";
+  for (const id of PROVIDERS) {
+    const p = s.ai.providers[id];
+    holder.appendChild(providerCard({ id, label: p.label }));
+    $("model-" + id).value = p.model;
+    $("base-" + id).value = p.baseUrl;
+    $("keystate-" + id).textContent = p.set ? `已設定 (末 4 碼 ${p.last4}), 要更換直接在左邊欄位輸入新 Key` : "尚未設定, 請輸入 Key 後按儲存";
+    document.querySelector(`input[name=aiActive][value=${id}]`).checked = s.ai.active === id;
+    $("prov-" + id).classList.toggle("active", s.ai.active === id);
+    $("test-" + id).onclick = () => testAi(id);
+    $("clear-" + id).onclick = () => clearKey(id);
+  }
+  $("aiFallback").checked = !!s.ai.fallback;
+  $("systemPrompt").value = s.ai.systemPrompt || "";
+  $("scamEnabled").checked = !!s.scam.enabled;
+  $("scamThreshold").value = s.scam.threshold;
+  $("scamPerMinute").value = s.scam.perMinute;
+  $("jevEnabled").checked = !!s.scam.jev.enabled;
+  $("jevModel").value = s.scam.jev.model || "jev-1.13.0";
+  $("jevKeyState").textContent = s.scam.jev.set ? `已設定 (末 4 碼 ${s.scam.jev.last4})` : "尚未設定";
+  $("kbFolder").value = s.kb.folder || "";
+  $("logDebug").checked = !!s.log.debug;
+  $("logRetention").value = s.log.retentionDays || 14;
+  const b = status.bot || {};
+  $("stLine").innerHTML = b.connected ? '<span class="pill">已連線</span>' : '<span class="pill off">未連線</span>';
+  $("stSelf").textContent = b.selfName ? `登入帳號:${b.selfName} (${b.lineState || ""})` : (b.lineState || "");
+  $("stName").textContent = b.botName || "(尚未設定名字)";
+  $("stMode").textContent = "觸發方式:" + ({ loose: "寬鬆", standard: "標準", strict: "嚴格" })[s.triggerMode] + " · 在群組打到名字就會回應";
+  const ap = s.ai.providers[s.ai.active];
+  $("stAi").textContent = ap ? ap.label : s.ai.active;
+  $("stAiModel").textContent = ap ? ap.model : "";
+  if (b.kb) { $("stKb").textContent = b.kb.ready ? `${b.kb.files} 個檔案 / ${b.kb.chunks} 段` : "尚無資料"; $("stKbSub").textContent = b.kb.folder || "尚未設定資料夾"; }
+  $("stToday").textContent = `已回答 ${b.answeredToday ?? 0} 則`;
+  $("stScam").innerHTML = s.scam.enabled ? `防詐騙:開啟 · 今日判讀 ${b.scam?.checkedToday ?? 0} 則 · 警告 ${b.scam?.warnedToday ?? 0} 則` : "防詐騙:關閉";
+  if (b.kb) $("kbStatus").textContent = `目前狀態:${b.kb.files} 個檔案、${b.kb.chunks} 段, 上次整理:${b.kb.updatedAt || "尚未整理"}`;
+  loadLog();
+}
+async function loadLog() {
+  try { const r = await (await fetch("/api/logs")).json(); $("logTail").textContent = r.tail || "(今天還沒有 log)"; } catch {}
+}
+async function testAi(id) {
+  const btn = $("test-" + id); btn.disabled = true; $("testres-" + id).textContent = "測試中…";
+  try {
+    const r = await (await fetch("/api/test-ai", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider: id, apiKey: $("key-" + id).value || undefined, model: $("model-" + id).value, baseUrl: $("base-" + id).value }) })).json();
+    $("testres-" + id).textContent = r.ok ? `成功 (${r.latencyMs} ms, 模型 ${r.model})` : r.message;
+    $("testres-" + id).style.color = r.ok ? "var(--dark)" : "var(--err)";
+  } catch (e) { $("testres-" + id).textContent = "測試失敗: 連不上控制台服務, 請重新整理頁面"; }
+  btn.disabled = false;
+}
+async function clearKey(id) {
+  await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ai: { providers: { [id]: { apiKey: "__clear__" } } } }) });
+  $("saveMsg").textContent = "已清除這家的 Key"; loadAll();
+}
+function collect() {
+  const providers = {};
+  for (const id of PROVIDERS) {
+    providers[id] = { model: $("model-" + id).value.trim(), baseUrl: $("base-" + id).value.trim() };
+    const k = $("key-" + id).value.trim();
+    if (k) providers[id].apiKey = k;
+  }
+  return {
+    botName: $("botName").value.trim(),
+    aliases: $("aliases").value.split(",").map((x) => x.trim()).filter(Boolean),
+    triggerMode: $("triggerMode").value,
+    cooldownSec: Number($("cooldownSec").value) || 20,
+    dailyLimit: Number($("dailyLimit").value) || 100,
+    lineApiUrl: $("lineApiUrl").value.trim(),
+    ai: { active: document.querySelector("input[name=aiActive]:checked")?.value || "openai", fallback: $("aiFallback").checked, providers, systemPrompt: $("systemPrompt").value },
+    scam: { enabled: $("scamEnabled").checked, threshold: Number($("scamThreshold").value) || 0.8, perMinute: Number($("scamPerMinute").value) || 10, jev: { enabled: $("jevEnabled").checked, model: $("jevModel").value.trim(), ...($("jevKey").value.trim() ? { apiKey: $("jevKey").value.trim() } : {}) } },
+    kb: { folder: $("kbFolder").value.trim() },
+    log: { debug: $("logDebug").checked, retentionDays: Number($("logRetention").value) || 14 },
+  };
+}
+$("btnSave").onclick = async () => {
+  $("btnSave").disabled = true; $("saveMsg").textContent = "儲存中…";
+  try {
+    const r = await (await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(collect()) })).json();
+    $("saveMsg").textContent = r.ok ? r.message : ("儲存失敗:" + (r.message || ""));
+    if (r.ok) loadAll();
+  } catch { $("saveMsg").textContent = "儲存失敗: 連不上控制台服務, 請重新整理頁面再試"; }
+  $("btnSave").disabled = false;
+};
+$("btnKb").onclick = async () => {
+  $("kbMsg").textContent = "整理中… (會先儲存目前設定)";
+  await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(collect()) });
+  const r = await (await fetch("/api/kb/reindex", { method: "POST" })).json();
+  $("kbMsg").textContent = r.message || "";
+  loadAll();
+};
+$("btnLogDir").onclick = async () => { const r = await (await fetch("/api/log-dir")).json(); $("logDirText").textContent = r.dir; };
+$("btnLogRefresh").onclick = loadLog;
+loadAll().catch(() => { $("saveMsg").textContent = "讀不到設定, 請確認程式有在執行, 再重新整理頁面"; });
+</script>
+</body>
+</html>

@@ -1,0 +1,105 @@
+# AI寶 Windows 原生驗證工作流程 (範本, 尚未啟用)
+#
+# 使用方式: 經人工審核後, 把本檔複製到 .github/workflows/build-windows.yml 才會被 GitHub Actions 執行。
+# 放在 pack/ 裡是為了避免未審核就觸發。啟用後僅支援手動觸發 (workflow_dispatch)。
+#
+# 做什麼: 在乾淨的 windows-latest runner 上重跑打包管線, 產出 AI寶.exe, 實際啟動它,
+# 以 HTTP 檢查核心 (3789) 與控制台 (3790) 都回應 200, 以 Chrome headless 截圖兩個頁面,
+# 最後把 exe、截圖與打包報告存成 artifact 供下載與人工實測。
+name: build-windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 安裝相依並建置核心與 helper
+        shell: pwsh
+        run: |
+          npm ci --include=dev
+          npm run build
+          Push-Location helper
+          npm ci
+          Pop-Location
+
+      - name: 打包 Windows exe
+        shell: pwsh
+        working-directory: pack
+        run: |
+          npm ci
+          node build.mjs --target win --skip-core-build
+
+      - name: 啟動 exe 並等待服務就緒
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'pack/out/AI寶.exe'
+          $proc = Start-Process -FilePath $exe -PassThru
+          $proc.Id | Out-File -Encoding ascii pack/build/supervisor.pid
+          $ok = $false
+          foreach ($i in 1..60) {
+            Start-Sleep -Seconds 2
+            try {
+              $a = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3789/' -TimeoutSec 3
+              $b = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/' -TimeoutSec 3
+              if ($a.StatusCode -eq 200 -and $b.StatusCode -eq 200) { $ok = $true; break }
+            } catch {
+              # 尚未就緒, 繼續等
+            }
+          }
+          if (-not $ok) {
+            Write-Host '=== launcher.log ==='
+            Get-Content "$env:LOCALAPPDATA\HwLineHelper\logs\launcher.log" -Tail 50 -ErrorAction SilentlyContinue
+            Write-Host '=== launcher-core.log ==='
+            Get-Content "$env:LOCALAPPDATA\HwLineHelper\logs\launcher-core.log" -Tail 50 -ErrorAction SilentlyContinue
+            Write-Host '=== launcher-helper.log ==='
+            Get-Content "$env:LOCALAPPDATA\HwLineHelper\logs\launcher-helper.log" -Tail 50 -ErrorAction SilentlyContinue
+            throw '核心或控制台未在期限內回應 200'
+          }
+          Write-Host 'core 3789 與 console 3790 皆回應 200'
+
+      - name: 截圖核心登入頁與控制台
+        shell: pwsh
+        run: |
+          $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+          if (-not (Test-Path $chrome)) { throw "找不到 Chrome: $chrome" }
+          & $chrome --headless=new --disable-gpu --hide-scrollbars --screenshot=pack/build/core-3789.png --window-size=1440,900 http://127.0.0.1:3789/
+          & $chrome --headless=new --disable-gpu --hide-scrollbars --screenshot=pack/build/console-3790.png --window-size=1440,900 http://127.0.0.1:3790/
+          Get-ChildItem pack/build/*.png
+
+      - name: 關閉 exe
+        if: always()
+        shell: pwsh
+        run: |
+          # CI 只做冒煙驗證, 直接強制結束監督者與所有 AI寶.exe 子行程;
+          # 這不會走啟動器的優雅關閉 (session 加密收尾), 但 runner 是一次性的, 不影響驗證目的。
+          if (Test-Path pack/build/supervisor.pid) {
+            $supervisorPid = Get-Content pack/build/supervisor.pid
+            Stop-Process -Id $supervisorPid -Force -ErrorAction SilentlyContinue
+          }
+          Get-Process | Where-Object { $_.Path -like '*AI寶.exe' } | Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: 上傳成品、截圖與打包報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aibao-windows-exe
+          path: |
+            pack/out/AI寶.exe
+            pack/build/core-3789.png
+            pack/build/console-3790.png
+            pack/build/build-report.json
+          if-no-files-found: warn
