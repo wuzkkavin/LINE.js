@@ -76,9 +76,16 @@ jobs:
         run: |
           $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
           if (-not (Test-Path $chrome)) { throw "找不到 Chrome: $chrome" }
-          & $chrome --headless=new --disable-gpu --hide-scrollbars --screenshot=pack/build/core-3789.png --window-size=1440,900 http://127.0.0.1:3789/
-          & $chrome --headless=new --disable-gpu --hide-scrollbars --screenshot=pack/build/console-3790.png --window-size=1440,900 http://127.0.0.1:3790/
-          Get-ChildItem pack/build/*.png
+          $buildDir = (Resolve-Path 'pack/build').Path
+          $shots = @(
+            @{ path = Join-Path $buildDir 'core-3789.png';    url = 'http://127.0.0.1:3789/' },
+            @{ path = Join-Path $buildDir 'console-3790.png'; url = 'http://127.0.0.1:3790/' }
+          )
+          foreach ($shot in $shots) {
+            & $chrome --headless=new --disable-gpu --no-sandbox --hide-scrollbars --virtual-time-budget=15000 "--screenshot=$($shot.path)" --window-size=1440,900 $shot.url
+            if (-not (Test-Path $shot.path)) { throw "截圖失敗, 檔案未產生: $($shot.path)" }
+          }
+          Get-ChildItem $buildDir/*.png | Select-Object Name, Length
 
       - name: 關閉 exe
         if: always()
