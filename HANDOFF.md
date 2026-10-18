@@ -56,6 +56,7 @@
 2. 每次發布/驗證完成後，刪除該次 Actions artifact（老吳既定流程，避免儲存額度累積；Release 與 Drive 備份不受影響）。
 3. 階段四（真帳號實測）：等老吳提供次要帳號並在場掃 QR。先進測試小群驗收（觸發、知識庫、防詐騙、log），老吳點頭才進正式公司群。相關流程：exe 啟動後在控制台操作登入，Token 以 --role cli 產生並填入 helper 設定。建議老吳可先在他自己的 Windows 電腦雙擊 Drive 上的 AI寶.exe 試跑（免安裝、免帳號也能開控制台看介面；首次會跳 SmartScreen 需按「仍要執行」）。
 4. 上游同步機制（2026-10-18 已拍板並落地）：老吳授權比照 Craft 家族——併入每日排程「每日 Git Repo 更新日報」（cron cadcraft-upstream-weekly-check，每日約 09:47）第 C 節：每日 fetch upstream 比對基準，有新提交即自動同步 main 與 ai-bao、跑三套測試（上游 typecheck＋test、helper、pack），全過才觸發雲端 Windows 驗證並把新 exe 備份 Drive（舊版移垃圾桶、刪該次 artifact），結果寫進當日 email 日報；衝突（固定衝突點 .github/workflows/build-windows.yml 以 pack 正本為準除外）或測試/雲端不過就停下回報、不發布半成品。基準紀錄在 ~/workspace/goals/cadcraft/hidden_files/storytold-state.md 末尾「LINE.js 基準」段。首次同步已於 2026-10-18 手動完成：上游 3 提交（8750efd 機器人 API 查聊天室管理員、e9e8c2b、12b9385 Jev 範本改 jev-latest）併入，上游測試增至 235 項全過、helper 13、pack 33；雲端 run 39088178621 全步驟成功；新 exe 104,719,872 bytes 已備份 Drive（id 1bpc5rjU2BapeWHGgzW2NmvDmH0V7s8p1）。同日老吳另交辦 Ubuntu 版（私人 repo wuzkkavin/ubuntu-line-helper），其同步同樣由該排程第 C 節涵蓋（Windows 先、Ubuntu 後）。
+   - 第二次同步（2026-10-18，排程漏項補做）：上游 2 提交（42a50dc 完整支援 NekoGuard 管理員擴充契約、db2a0cd 加速詐騙分析並合併重複請求）併入，main＝c72e3e0、ai-bao＝aa1dba6，合併無衝突（workflow 檔經核對與 pack 正本一致）。三套測試：上游 typecheck 通過、測試 273/273（新提交新增 hub/provider 測試）、helper 13/13、pack 33/33。雲端 run 39095534744 conclusion＝success，artifact 含 exe 與核心／控制台兩張截圖（控制台截圖介面與頭像正常），該次 artifact 已刪除。新 exe 104,722,944 bytes 已備份 Drive（id 1J1RiMfiQ8J7d-uOIgWqyBKZRkBK3LZ9G，大小核對一致），舊版 exe（id 1bpc5rjU2BapeWHGgzW2NmvDmH0V7s8p1）已移入垃圾桶。
 5. 知識庫第二版格式（pdf/docx/xlsx）與 Jev 實際串接：未排期，等老吳指示。
 
 ## 7. 操作手冊（常用指令）
