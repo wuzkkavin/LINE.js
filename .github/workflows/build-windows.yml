@@ -74,11 +74,30 @@ jobs:
       - name: 截圖核心登入頁與控制台
         shell: pwsh
         run: |
-          $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
-          if (-not (Test-Path $chrome)) { throw "找不到 Chrome: $chrome" }
-          & $chrome --headless=new --disable-gpu --hide-scrollbars --screenshot=pack/build/core-3789.png --window-size=1440,900 http://127.0.0.1:3789/
-          & $chrome --headless=new --disable-gpu --hide-scrollbars --screenshot=pack/build/console-3790.png --window-size=1440,900 http://127.0.0.1:3790/
-          Get-ChildItem pack/build/*.png
+          $candidates = @(
+            'C:\Program Files\Google\Chrome\Application\chrome.exe',
+            'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+            'C:\Program Files\Microsoft\Edge\Application\msedge.exe'
+          )
+          $browser = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $browser) { throw '找不到 Chrome 或 Edge' }
+          Write-Host "使用瀏覽器: $browser"
+          $buildDir = (Resolve-Path 'pack/build').Path
+          $shots = @(
+            @{ path = Join-Path $buildDir 'core-3789.png';    url = 'http://127.0.0.1:3789/' },
+            @{ path = Join-Path $buildDir 'console-3790.png'; url = 'http://127.0.0.1:3790/' }
+          )
+          $i = 0
+          foreach ($shot in $shots) {
+            $i++
+            $profile = Join-Path $env:TEMP "shot-profile-$i"
+            $args = @('--headless=new', '--disable-gpu', '--no-sandbox', '--no-first-run', '--hide-scrollbars', '--virtual-time-budget=15000', "--user-data-dir=$profile", "--screenshot=$($shot.path)", '--window-size=1440,900', $shot.url)
+            $proc = Start-Process -FilePath $browser -ArgumentList $args -Wait -PassThru -NoNewWindow
+            Write-Host "browser exit=$($proc.ExitCode)"
+            foreach ($w in 1..20) { if (Test-Path $shot.path) { break }; Start-Sleep -Milliseconds 500 }
+            if (-not (Test-Path $shot.path)) { throw "截圖失敗, 檔案未產生: $($shot.path)" }
+          }
+          Get-ChildItem $buildDir/*.png | Select-Object Name, Length
 
       - name: 關閉 exe
         if: always()
