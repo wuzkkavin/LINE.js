@@ -96,7 +96,8 @@ PWA としてインストールできます（ブラウザーの「安裝」（�
 - 送信：WS 接続ごとに毎秒最大 5 回。メディアアップロード：画像は 1 ファイル最大 10MB（PNG／JPEG／GIF）、動画は 1 ファイル最大 50MB（MP4／MOV、`limits.uploadVideoMaxBytes` で変更可能、上限 200MB。動画全体をメモリに一時保存）、接続ごとに毎分最大 5 回。
 - 受信メディアとファイル：1 件あたり最大 50MB（`limits.downloadMaxBytes`）。超過したものは種類のラベルのみ表示します（ファイルのダウンロードは失敗します）。
 - ボット API：既定で無効です。`api.enabled`、`api.chats`（必須、チャットルーム id が 1 個以上）、`api.sendsPerMinute`（既定 20、≤120）。詳細は[ボット API](#ボット-apiapiws)を参照してください。
-- 詐欺メッセージ分析（オプション）：`jev.token` に [TypeSafe](https://console.typesafe.ai/keys) の API キーを設定して再起動すると、Web ページで**相手から届いたテキストメッセージ**を右クリック（タッチ画面では長押し）したときに「詐騙機率分析」（詐欺確率分析）が表示され、TypeSafe の Jev 決定モデルで詐欺である確率（> 80% は詐欺の疑いが高い、≤ 20% は詐欺らしくない、その間は判断不能）と最も近い手口を推定します。TypeSafe（`api.typesafe.ai`）に送るのは選んだ 1 件のテキストのみです（サーバーは自身のキャッシュの内容を使い、ページから送られたテキストは使いません。送信者やチャットの情報は送りません）。1 回ごとに TypeSafe の料金がかかり、Web 接続ごとに毎分最大 10 回です。ボットも[ボット API](#ボット-apiapiws) の `scam:check` で `api.chats` 内のメッセージを分析できます（全ボット合計で毎分最大 10 回）。キーはサーバーにのみ保持し、ページに送らず、ログにも記録しません。`jev.model` の既定は固定版の `jev-1.13.0` です。結果はモデルの推定であり、参考程度にしてください。`token` を空にするか省略すると無効になります。
+- 詐欺メッセージ分析（オプション）：`jev.token` に [TypeSafe](https://console.typesafe.ai/keys) の API キーを設定して再起動すると、Web ページで**相手から届いたテキストメッセージ**を右クリック（タッチ画面では長押し）したときに「詐騙機率分析」（詐欺確率分析）が表示され、TypeSafe の Jev 決定モデルで詐欺である確率（> 80% は詐欺の疑いが高い、≤ 20% は詐欺らしくない、その間は判断不能）と最も近い手口を推定します。新たな分析が必要な場合、TypeSafe（`api.typesafe.ai`）に送るのは選んだ 1 件のテキストのみです（サーバーは自身のキャッシュの内容を使い、ページから送られたテキストは使いません。送信者やチャットの情報は送りません）。実際の上流リクエストに TypeSafe の料金がかかり、Web 接続ごとに毎分最大 10 回の照会が可能です。ボットも[ボット API](#ボット-apiapiws) の `scam:check` で `api.chats` 内のメッセージを分析できます（全ボット合計で毎分最大 10 回）。キーはサーバーにのみ保持し、ページに送らず、ログにも記録しません。`jev.model` の既定は固定版の `jev-1.13.0` です。結果はモデルの推定であり、参考程度にしてください。`token` を空にするか省略すると無効になります。
+- 分析の高速化：同じログイン期間中、Web と API による**完全に同じテキスト**の同時照会は、上流リクエストを共有します。成功結果は完了から 5 分間有効で、再照会ではテキストを再送せず直ちに返します。メモリ内の LRU は処理中を含め最大 256 件で、テキストのハッシュを索引に使用し、原文の追加コピーやディスク保存は行いません。失敗はキャッシュせず、ログアウト／アカウント変更時に消去します。毎回、メッセージの適格性・チャットの権限・従来のレート制限を確認します。待機中にテキストが変更・送信取消・メッセージキャッシュから削除された場合、古い結果ではなく `INVALID_REQUEST` を返します。モデル・質問・全文は変更せず、新しい内容の初回分析は引き続き Jev／ネットワークの速度に依存します。実際の上流レイテンシーは保証しません。
 
 ## 通信プロトコル
 
@@ -162,17 +163,21 @@ HTTP：`GET /media/:mediaId`（スタンプ、スタンプパックのアイコ�
 |---|---|---|
 | ボット → サービス | `message:send` | `{ requestId, chatId, text, mentions?, replyTo? }`：**テキストのみ**。`mediaId`／`sticker` は `INVALID_REQUEST` を返します。成功時は `sent { requestId, messageId }` |
 | ボット → サービス | `history:fetch` | `{ requestId, chatId, limit?, before? }`：Web ページと同じページ取得ですが、既読 snapshot は含みません |
-| ボット → サービス | `scam:check` | `{ requestId, chatId, messageId }`：`api.chats` 内の**相手から届いた**、サービスが表示済み（リアルタイム受信または `history:fetch` で取得）のテキストメッセージを Jev で分析します。サーバーは自身のキャッシュのテキストを送ります。`jev.token` の設定が必要で（未設定時は `SCAM_CHECK_UNAVAILABLE`）、全ボット合計で毎分 10 回、1 回ごとに TypeSafe の料金がかかります。成功時は `scam:result { requestId, chatId, messageId, analysis: { probability, tactic? } }` |
+| ボット → サービス | `scam:check` | `{ requestId, chatId, messageId }`：`api.chats` 内の**相手から届いた**、サービスが表示済み（リアルタイム受信または `history:fetch` で取得）のテキストメッセージを Jev で分析します。サーバーは自身のキャッシュのテキストを送ります。`jev.token` の設定が必要で（未設定時は `SCAM_CHECK_UNAVAILABLE`）、キャッシュヒットを含め全ボット合計で毎分 10 回です。実際の上流リクエストのみ TypeSafe の料金がかかります。成功時は `scam:result { requestId, chatId, messageId, analysis: { probability, tactic? } }` |
 | ボット → サービス | `profile:get` | `{ requestId }`：自分の ID と名前をいつでも取得できます。`profile { requestId, profile: { userId, displayName, pictureId? } }` を返します（`auth:ready` と同じ内容。LINE には問い合わせず、`history:fetch` と接続ごとに毎秒 10 回の枠を共有。未ログイン時は `INVALID_REQUEST`） |
-| ボット → サービス | `chat:admins` | `{ requestId, chatId }`：指定した OpenChat ルームの管理者・共同管理者全員を取得します（未発言者も含む）。`api.chats` 内のみで、`history:fetch`／`profile:get` と接続ごとに毎秒 10 回の枠を共有します。要求した接続にのみ `chat:admins { requestId, chatId, admins: [{ userId, displayName, role, pictureId? }] }` を返します。`role` は `admin`／`coAdmin`、`userId` は OpenChat メンバー ID です。通常のグループ／個人チャットは `CHAT_ADMINS_UNSUPPORTED`、未ログイン・不明・許可外のチャットは `UNKNOWN_CHAT`。LINE 問い合わせ失敗やページ取得が不完全な場合は `CHAT_ADMINS_FAILED` とし、一部だけの一覧は返しません。ブラウザーの `/ws` では利用不可 |
+| ボット → サービス | `chat:admins:get` | `{ requestId, chatId }`：指定した OpenChat ルームの現任管理者・共同管理者全員を取得します（未発言者も含む）。`api.chats` 内のみで、`history:fetch`／`profile:get` と接続ごとに毎秒 10 回の枠を共有します。要求した接続にのみ `chat:admins { requestId, chatId, ownMemberId, admins: [{ userId, displayName, role, pictureId? }] }` を返します。`role` は `admin`／`coAdmin`、`displayName` は文字列で、`ownMemberId`（そのチャットでの自分のメンバー ID）と `userId` はともに `/^p[A-Za-z0-9]{10,64}$/` に一致します。通常のグループ／個人チャットは `CHAT_ADMINS_UNSUPPORTED`、未ログイン・不明・許可外のチャットは `UNKNOWN_CHAT`。LINE 問い合わせ失敗、不正な ID、ページ取得が不完全な場合は `CHAT_ADMINS_FAILED` とし、一部だけの一覧は返しません。ブラウザーの `/ws` では利用不可 |
 | ボット → サービス | `ping` → `pong` | 接続維持。サービスは WebSocket プロトコルレベルの Ping でも 30 秒ごとに確認し、2 回続けて応答がなければ切断します（一般的な WebSocket ライブラリは自動で応答します） |
-| サービス → ボット | `hello`、`auth:state`、`status` | 接続時に送信。`auth:state` が `ready` でない場合（LINE 未ログイン）、まだ送受信できません |
-| サービス → ボット | `auth:ready` | 自分の `profile.userId` を含み、自分が送ったメッセージを除外するために使えます（スマートフォンから送ったメッセージもこの id です） |
+| サービス → ボット | `hello`、`auth:state`、`status` | 接続時に送信。`hello` は数値の `protocol: 2` と `serverVersion` を維持し、`capabilities: ["chat:admins"]` で拡張を宣言します。`auth:state` が `ready` でない場合（LINE 未ログイン）、まだ送受信できません |
+| サービス → ボット | `auth:ready` | 自分の `profile.userId` を含み、通常のチャットで自分が送ったメッセージを除外できます。OpenChat では代わりに `chat:admins` 応答の `ownMemberId` を使います |
 | サービス → ボット | `channels` | `api.chats` のチャットルームのみ。変更時に再送します |
 | サービス → ボット | `message`、`message:edit`、`message:unsend` | `api.chats` のチャットルームの**リアルタイム**メッセージ、編集、送信取消のみ。自分が送ったものも含みます |
 | サービス → ボット | `sent`、`history`、`scam:result`、`profile`、`chat:admins`、`error` | 対応するリクエストへの応答。エラーは汎用コードのみ（`UNKNOWN_CHAT`、`INVALID_REQUEST`、`RATE_LIMITED`、`SEND_FAILED`、`SCAM_CHECK_FAILED`、`CHAT_ADMINS_UNSUPPORTED`、`CHAT_ADMINS_FAILED`…） |
 
 それ以外はすべて `UNKNOWN_TYPE` を返します。ログイン／ログアウト、`chat:read`（既読通知）、`message:unsend`（送信取消）、`message:react`（リアクション）、`channels:refresh`、スタンプ一覧、Token 管理は利用できません。**過去のメッセージは再送しません**（ボットは「今」から開始し、履歴に重複して応答しません。履歴は `history:fetch` を使ってください）。`read`、`update:available`、`api:state`、`scam:state` は送信しません。画像／動画などのメディアのバイト列も取得できません（ボットにはメッセージの `contentType` のみ見えます）。
+
+**管理者のメンション権限**：取得成功後、同じ接続・同じチャットで `message:send.mentions` を使い、取得した未発言の管理者をメンションできます。形式は従来どおり `{ userId, start, end }`（`@` で始まる文字範囲の UTF-16 インデックス）で、1 メッセージにつき最大 20 人です。この追加権限は他の接続・チャット・Web ページに共有しません。再取得を開始した時点で旧権限を取り消し（レート制限や後続の失敗も含む）、最新の取得が成功した場合だけ新しい一覧を許可します。古い並行リクエストは `CHAT_ADMINS_FAILED` となります。切断・ログアウト・アカウント変更でも権限を消去し、処理中の古い結果を無効化します。表示済みメッセージの送信者は従来の規則で引き続きメンション可能です。旧 `chat:admins` **リクエスト**は受け付けず（`UNKNOWN_TYPE`）、応答名としてのみ残します。
+
+隔離した LINE 応答と実際の HTTP／WS Token 認証で、ハンドシェイク、全ページ取得、自分のメンバー ID、メンション権限の付与・取り消しを確認しました。実際の LINE アカウントや NekoGuard プロセスとの結合検証は未実施で、Gate 通過を意味しません。
 
 **頻度とリスク**
 - 各接続は `limits.sendsPerSecond`（≤5）の制限を受け、全ボット合計で毎分 `api.sendsPerMinute` を超えてはいけません。超過すると `RATE_LIMITED` を返します。
@@ -192,7 +197,7 @@ ws.on("message", (data) => {
 });
 ```
 
-相手から届いたメッセージの分析（`jev.token` の設定が必要）：`analysis.probability` は 0～1 の詐欺確率です。`tactic` はない場合があり、ある場合の `kind` は `investment`（偽投資）、`impersonation`（機関・銀行・カスタマーサービスのなりすまし）、`phishing`（フィッシング）、`shopping`（ネット通販・分割払い解除）、`friend`（親族・友人のなりすまし）、`romance`（恋愛）、`job`（求人・アルバイト／口座貸し）、`prize`（当選）、`loan`（ローン）、`other` のいずれかで、`confidence` は 0～1 です。呼び出しごとに TypeSafe の料金がかかり、全ボット合計で毎分 10 回までなので、分析するメッセージを絞ってください（下の例はリンクを含むメッセージだけを分析します）。
+相手から届いたメッセージの分析（`jev.token` の設定が必要）：`analysis.probability` は 0～1 の詐欺確率です。`tactic` はない場合があり、ある場合の `kind` は `investment`（偽投資）、`impersonation`（機関・銀行・カスタマーサービスのなりすまし）、`phishing`（フィッシング）、`shopping`（ネット通販・分割払い解除）、`friend`（親族・友人のなりすまし）、`romance`（恋愛）、`job`（求人・アルバイト／口座貸し）、`prize`（当選）、`loan`（ローン）、`other` のいずれかで、`confidence` は 0～1 です。実際の上流リクエストのみ TypeSafe の料金がかかります。キャッシュヒットを含め全ボット合計で毎分 10 回までなので、分析するメッセージを絞ってください（下の例はリンクを含むメッセージだけを分析します）。
 
 ```js
 ws.on("message", (data) => {
@@ -319,6 +324,8 @@ npm audit
 同じチェックは GitHub Actions（`.github/workflows/ci.yml`）で push／PR のたびにクリーンインストールから自動実行されます（Node 22：`npm ci --include=dev`、typecheck、test、`npm audit --audit-level=high`）。
 
 テストには `node --test` と Mock Provider を使用します。Mock は実際の LINE による受け入れ確認の代わりにはなりません。Gate 1 ではサブアカウントで QR コードを読み取り、60 秒以内に実際のメッセージを 1 件受信する必要があります。Gate 2–4 では Web 同期、履歴、送信、メディアも確認します。すべての Gate と受け入れ条件は [PLAN.md](PLAN.md)を参照してください。
+
+詐欺分析の高速化で確認済み：typecheck、build、273 件のテストが成功し、リクエスト共有、完全一致、期限切れ、LRU による削除、失敗後の再試行、権限、レート制限、ログアウト／アカウント間の分離を検証しました。実際の HTTP／WS の cookie・Token 認証を使い、正式な JevClient と 200ms 遅延の隔離上流による smoke を実施しました。同じ内容を Web と API から同時照会して再照会すると、上流リクエストは 3 回から 1 回、再照会は約 203ms から 0.46ms に減少しました。実際の TypeSafe のレイテンシーではありません。有料 API や実際の LINE アカウントは使用しておらず、Gate 合格を意味しません。
 
 今回の変更（詐欺メッセージ分析）で確認済み：typecheck、build、200 件のテストすべて成功、`npm audit --audit-level=high` の脆弱性 0 件。ヘッドレス Chromium と隔離 provider（仮の分析器）で、右クリックメニューの「詐騙機率分析」が相手のテキストメッセージにのみ表示されること、結果ダイアログの内容とボタンが 1 つだけであること、その後のほかの確認ダイアログにはキャンセルボタンが残ることを確認しました。無効なキーで実際の TypeSafe エンドポイントを呼び出し、401 が返ることも確認しました（エンドポイントと認証方式が正しいこと）。**未確認**：有効なキーによる実際の分析結果（キーがないため）、実際の LINE アカウントでの操作。
 

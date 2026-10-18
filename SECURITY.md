@@ -127,18 +127,20 @@ approval, and a regression against any of them is treated as a vulnerability.
 | An upgrade needs **no `Origin` header** (every browser WebSocket sends one, so no web page can use this endpoint even if the token leaks into it) and `Authorization: Bearer <token>`; the `Host` header is not checked. Failures all look the same (403); more than 4 concurrent bots get 429. | `src/http/server.ts` (`authorizeApiUpgrade`), `src/ws/hub.ts` |
 | The token is 256 bits of randomness with a `linejs_` prefix. Only its SHA-256 is stored (`api-token.json`, mode `0600`, git-ignored, written via temporary file and rename); it is compared in constant time and shown **once**, only to the connection that asked for it. It is never logged or broadcast. | `src/http/apiToken.ts`, `src/ws/hub.ts`, `src/cli.ts` |
 | Regenerating or revoking the token closes every bot connection immediately. Only ordinary `/ws` connections (the web page, or the local CLI, which obtains the page cookie the same way) can create or revoke it; a bot cannot. | `src/ws/hub.ts` |
-| A bot may send only `message:send` (text only), `history:fetch`, `scam:check` (see the scam check section), `profile:get` (this account's own profile, the same one `auth:ready` carries; no LINE request), `chat:admins` and `ping`; everything else, including login, logout, read receipts, stickers and media, is `UNKNOWN_TYPE`. It can reach only the chats in `api.chats` (anything else is `UNKNOWN_CHAT`), receives only live messages (no replay, no read positions) and never receives media bytes. | `src/ws/hub.ts`, `src/ws/requests.ts` |
+| A bot may send only `message:send` (text only), `history:fetch`, `scam:check` (see the scam check section), `profile:get` (this account's own profile, the same one `auth:ready` carries; no LINE request), `chat:admins:get` and `ping`; everything else, including login, logout, read receipts, stickers and media, is `UNKNOWN_TYPE`. It can reach only the chats in `api.chats` (anything else is `UNKNOWN_CHAT`), receives only live messages (no replay, no read positions) and never receives media bytes. | `src/ws/hub.ts`, `src/ws/requests.ts` |
 | Sending is limited per connection (`limits.sendsPerSecond`, at most 5/s) and across all bots (`api.sendsPerMinute`, at most 120/min). | `src/ws/hub.ts`, `src/limit.ts` |
-| `chat:admins` is bot-only and restricted to known, allowed OpenChat rooms while signed in; other chat kinds are unsupported. It enumerates that chat's members through the adapter, returns only administrators/co-administrators to the requesting connection, and never returns partial results when pagination fails. Old-session results and failures are discarded. It shares the per-connection 10/s budget with history/profile queries; browser `/ws` rejects it. | `src/ws/hub.ts`, `src/line/provider.ts` |
+| `hello.capabilities` advertises `chat:admins` only on the bot endpoint. `chat:admins:get` is restricted to known, allowed OpenChat rooms while signed in; other chat kinds are unsupported. The adapter enumerates all chat members and returns administrators/co-administrators plus the authenticated account's `ownMemberId` from `getSquareChat.squareChatMember`, only to the requester. Both own and administrator IDs must match `/^p[A-Za-z0-9]{10,64}$/`; invalid data or incomplete pagination fails closed, never returning partial results. Old-session results and failures are discarded. Queries share the per-connection 10/s budget with history/profile; browser `/ws` rejects them. The old `chat:admins` request is not accepted. | `src/ws/hub.ts`, `src/line/provider.ts` |
+| A successful administrator query permits that bot connection to mention returned administrators who have not spoken, only in that same chat. This grant never populates the shared message cache or authorizes other sockets/pages. A new query immediately revokes the previous grant, even if rate-limited or later failing; superseded queries cannot reauthorize old members. Disconnect, logout and account changes invalidate grants and pending results. Ordinary mention permissions for senders of displayed messages are unchanged. | `src/ws/hub.ts` |
 
 ### Scam check (TypeSafe Jev, off by default)
 
 | Rule | Enforcement |
 |---|---|
 | The check exists only when `jev.token` is set in `config.yaml`; an empty or missing token disables it. The token must be printable ASCII without spaces (it goes into an HTTP header as is). | `src/config.ts` |
-| The token is used only as the `Authorization: Bearer` header to `https://api.typesafe.ai/v1/systemone`, with redirects refused. It is never sent to the page (pages only learn `scam:state { enabled }`), logged, or included in errors; a failed call logs only `SCAM_CHECK_FAILED` with the HTTP status. | `src/jev/client.ts`, `src/ws/hub.ts` |
+| The token is used only as the `Authorization: Bearer` header to `https://api.typesafe.ai/v1/systemone`, with redirects refused. It is never sent to the page (pages only learn `scam:state { enabled }`), logged, or included in errors; a failed call logs only the constant `SCAM_CHECK_FAILED`, never the upstream error. | `src/jev/client.ts`, `src/ws/hub.ts` |
 | Only an explicit request sends anything: from a page, `scam:check` is limited to 10 per minute per connection; from a bot, it is limited to the chats in `api.chats` and to 10 per minute across all bot connections together. The server sends **its own cached text** of a message it has shown, from someone other than this account, that was not taken back, decrypted and not a system message; text supplied by the client is ignored, so the endpoint cannot be used to send arbitrary text out. Nothing else (sender, chat, other messages) is sent. | `src/ws/hub.ts`, `src/ws/requests.ts` |
 | The answer is parsed fail-closed: without a probability between 0 and 1 there is no result, and an unknown scam kind is dropped. The result goes only to the connection that asked. | `src/jev/client.ts`, `src/ws/hub.ts` |
+| Within one account session, authorized checks of exactly identical text share in-flight work and successful results valid for 5 minutes after completion. The memory-only LRU holds at most 256 entries including pending requests, indexed by SHA-256 of UTF-16 text without retaining an extra plaintext copy. Failures are not cached; logout/account changes and shutdown clear the cache. Every check still consumes its original rate budget and passes message/chat authorization before cache lookup. Changed, withdrawn or evicted messages cannot receive stale results; old-session requests cannot populate a new session's cache or send results to it. | `src/ws/hub.ts` |
 
 ### Secrets and credentials
 
@@ -246,10 +248,11 @@ Be aware of these. They are not bugs, and reports that only restate them will be
    extension or a compromised browser profile can read it. Desktop notifications are off by default;
    when turned on, sender names and message previews appear in the operating system's notification
    center, outside the page.
-9. **The scam check sends message text to a third party.** With `jev.token` set, each check sends that
-   message's text to TypeSafe, subject to TypeSafe's own terms and data handling, and is billed to the
-   key. The result is a model estimate that can be wrong in both directions (and a scammer can word a
-   message to look harmless); it is advice, not a verdict.
+9. **The scam check sends message text to a third party.** With `jev.token` set, a check requiring a
+   new analysis sends that message's text to TypeSafe, subject to TypeSafe's own terms and data handling,
+   and is billed to the key. Cache hits and coalesced requests do not send it again. The result is a model
+   estimate that can be wrong in both directions (and a scammer can word a message to look harmless);
+   it is advice, not a verdict.
 
 ## 7. Hardening checklist for users
 
