@@ -1,0 +1,39 @@
+[package]
+name = "aibao-app"
+version = "1.0.0"
+edition = "2021"
+description = "AI寶 Windows 原生 App (Rust 殼 + 內嵌 LINE.js 引擎)"
+license = "Apache-2.0"
+build = "build.rs"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["wgpu"] }
+egui = "0.36"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = "0.24"
+ureq = { version = "2", features = ["json"] }
+qrcode = "0.14"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
+
+# 本機 (Linux) cargo check 用: winit 需要 x11 後端才編得過; Windows 建置不套用本節
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.36", features = ["x11"] }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.19"
+winreg = "0.52"
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  "Win32_System_Console",
+] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 2

@@ -17,6 +17,7 @@ import { resolveDataDir, dataPaths } from "./paths.mjs";
 import { createSessionVault } from "./vault.mjs";
 import { probeHttp, waitForHttp, buildChildSpec } from "./probe.mjs";
 import { ensureRuntime } from "./runtime.mjs";
+import { noBrowser } from "./nobrowser.mjs";
 
 const CORE_PORT = 3789;
 const HELPER_PORT = 3790;
@@ -53,6 +54,8 @@ function makeLog(paths) {
 // 執行期資產的解開與鏡像在 runtime.mjs: 監督者與各子行程都會呼叫 ensureRuntime,
 // 以跨行程鎖串行化並用完成標記避免重工, 避免 Windows 檔案鎖下互撞 (競態修復)。
 function openBrowser() {
+  // 原生 App 殼 (規格書 v3) 以 HWLINEHELPER_NO_BROWSER=1 啟動引擎時, 引擎只當背景服務, 不開瀏覽器。
+  if (noBrowser()) return;
   try {
     const opts = { detached: true, stdio: "ignore" };
     if (process.platform === "win32") spawn("cmd", ["/c", "start", "", CONSOLE_URL], { ...opts, windowsHide: true }).unref();
