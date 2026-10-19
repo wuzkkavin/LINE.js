@@ -1,0 +1,158 @@
+# AI寶 Windows 原生 App (Rust 殼) 雲端建置與驗證工作流程
+#
+# 使用方式: 經人工審核後, 把本檔複製到 .github/workflows/build-app.yml 才會被 GitHub Actions 執行
+# (workflow_dispatch 必須在預設分支 main 上也有一份才能以 --ref 呼叫 ai-bao)。
+#
+# 做什麼:
+#   1. build-engine: 以既有 pack 管線產出引擎 exe (SEA), 並跑 pack 測試 (含 NO_BROWSER 新測試)。
+#   2. build-app: 把引擎 exe 當 payload 嵌入 Rust 殼, cargo release 編出單一 AI寶.exe;
+#      在真 Windows runner 上跑探針 (payload 解開、引擎 headless 啟動、雙埠 200、核心 WS 登入往返、
+#      CTRL_BREAK 優雅結束、埠釋放), 再跑 GUI 冒煙 (啟動主視窗、截圖、--quit 結束序列、埠釋放),
+#      最後把 exe、探針結果、截圖與 log 存成 artifact。
+name: build-app
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-engine:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 安裝相依並建置核心與 helper
+        shell: pwsh
+        run: |
+          npm ci --include=dev
+          npm run build
+          Push-Location helper
+          npm ci
+          Pop-Location
+
+      - name: pack 測試 (含 NO_BROWSER)
+        shell: pwsh
+        working-directory: pack
+        run: |
+          npm ci
+          npm test
+
+      - name: 打包引擎 exe
+        shell: pwsh
+        working-directory: pack
+        run: |
+          node build.mjs --target win --skip-core-build
+
+      - name: 上傳引擎 exe (供下一個 job 嵌入)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aibao-engine
+          path: pack/out/AI寶.exe
+          retention-days: 1
+
+  build-app:
+    needs: build-engine
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 下載引擎 exe 並就位為 payload
+        uses: actions/download-artifact@v4
+        with:
+          name: aibao-engine
+          path: engine-dl
+
+      - name: payload 就位
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force app/payload | Out-Null
+          Copy-Item 'engine-dl/AI寶.exe' app/payload/engine.exe
+          Get-Item app/payload/engine.exe | Select-Object Length
+
+      - name: 設定 Rust 工具鏈
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 編譯 Rust 殼 (release)
+        shell: pwsh
+        working-directory: app
+        run: |
+          cargo build --release
+          New-Item -ItemType Directory -Force ../out | Out-Null
+          Copy-Item target/release/aibao-app.exe '../out/AI寶.exe'
+          Get-Item '../out/AI寶.exe' | Select-Object Length
+
+      - name: 探針 — 登入往返與結束序列實測
+        shell: pwsh
+        run: |
+          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-probe-data'
+          $env:AIBAO_PROBE_OUT = Join-Path $pwd 'probe-result.txt'
+          $exe = (Resolve-Path 'out/AI寶.exe').Path
+          $proc = Start-Process -FilePath $exe -ArgumentList '--probe-login' -Wait -PassThru -RedirectStandardOutput probe-stdout.txt -RedirectStandardError probe-stderr.txt
+          Write-Host "probe exit code: $($proc.ExitCode)"
+          if (Test-Path $env:AIBAO_PROBE_OUT) { Get-Content $env:AIBAO_PROBE_OUT }
+          if ($proc.ExitCode -ne 0) { throw "探針失敗 (exit $($proc.ExitCode)), 詳見 probe-result.txt 與 probe-stderr.txt" }
+          $result = Get-Content $env:AIBAO_PROBE_OUT -Raw
+          if ($result -notmatch 'login_roundtrip=ok') { throw '探針未確認登入往返成功' }
+          if ($result -notmatch 'ports_freed=true') { throw '探針未確認結束後埠已釋放' }
+
+      - name: GUI 冒煙 — 啟動、截圖、結束序列
+        shell: pwsh
+        run: |
+          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-gui-data'
+          $exe = (Resolve-Path 'out/AI寶.exe').Path
+          $proc = Start-Process -FilePath $exe -PassThru
+          Write-Host "app pid: $($proc.Id)"
+          $ok = $false
+          foreach ($i in 1..45) {
+            Start-Sleep -Seconds 2
+            if ($proc.HasExited) { throw "App 啟動後自行結束 (exit $($proc.ExitCode)), 請看 shell.log" }
+            try {
+              $a = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3789/' -TimeoutSec 3
+              $b = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3
+              if ($a.StatusCode -eq 200 -and $b.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+          }
+          if (-not $ok) { throw 'App 啟動後 90 秒內引擎雙埠未就緒' }
+          Start-Sleep -Seconds 5
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          $bmp.Save((Join-Path $pwd 'app-main.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+          Write-Host "screenshot saved: $((Get-Item app-main.png).Length) bytes"
+          # 以第二實例 --quit 觸發結束序列 (明確指令路徑), 等主行程自行結束
+          Start-Process -FilePath $exe -ArgumentList '--quit' -Wait
+          $exited = $proc.WaitForExit(60000)
+          Write-Host "app exited after --quit: $exited"
+          if (-not $exited) { throw 'App 在 --quit 後 60 秒內未結束' }
+          Start-Sleep -Seconds 2
+          $still = $false
+          try { Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3 | Out-Null; $still = $true } catch { }
+          if ($still) { throw '結束後 helper 埠仍有回應 (引擎未確實結束)' }
+          Write-Host 'GUI 冒煙全數通過'
+
+      - name: 上傳成品、探針結果、截圖與 log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aibao-app
+          path: |
+            out/AI寶.exe
+            probe-result.txt
+            probe-stdout.txt
+            probe-stderr.txt
+            app-main.png
+          if-no-files-found: warn
