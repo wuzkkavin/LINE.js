@@ -220,8 +220,13 @@ impl EngineManager {
             let sent = std::fs::write(&stop_file, b"stop").is_ok();
             shell::log_line(&format!("已放出停止訊號檔 ({}), 寫入={sent}", stop_file.display()));
             if sent {
-                let deadline = Instant::now() + Duration::from_secs(12);
+                let deadline = Instant::now() + Duration::from_secs(15);
                 while Instant::now() < deadline {
+                    // 競態防護 (2026-10-20 雲端第二輪探針實測): 監督者啟動初期會清一次殘留訊號檔,
+                    // 若我們的訊號寫在它清除之前會被一起清掉; 等待期間只要檔案不見就補寫, 確保送達。
+                    if !stop_file.exists() && !self.proc_exited() {
+                        let _ = std::fs::write(&stop_file, b"stop");
+                    }
                     if self.proc_exited() && !Self::ports_alive() {
                         self.state = EngineState::Stopped;
                         self.proc = None;
