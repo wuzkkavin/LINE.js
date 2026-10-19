@@ -1,0 +1,23 @@
+probe=start time=2026-10-19T17:39:27Z
+data_dir=D:\a\_temp\aibao-probe-data
+engine_embedded=true
+engine_id=d59808c5832bbdab-104749568
+engine_bytes=104749568
+extract=ok path=D:\a\_temp\aibao-probe-data\engine\d59808c5832bbdab-104749568\engine.exe
+engine_start=ok pid=1504
+core_http=200
+helper_http=200
+ports=ok
+helper_status_has_bot=true
+ws_event cookie=ok
+ws_event ws=connected
+ws_event hello=protocol:2
+ws_event auth_state=idle
+ws_event auth_start=sent
+ws_event auth_state=authenticating
+ws_event auth_qr=received(len=164)
+ws_event result=roundtrip_qr
+login_roundtrip=ok
+shutdown_path=signal_file
+ports_freed=true
+probe=done
