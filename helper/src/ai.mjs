@@ -8,18 +8,23 @@ export class AiError extends Error {
   }
 }
 
+const DEFAULT_MAX_TOKENS = 1024;
+const MAX_MAX_TOKENS = 4096;
+
 export function createAiClient({ fetchImpl = fetch, timeoutMs = 30000 } = {}) {
-  async function chat({ baseUrl, apiKey, model, messages, temperature = 0.3, maxTokens } = {}) {
-    if (!baseUrl || !model) throw new AiError("AI 設定不完整: 缺少 Base URL 或模型名稱", { code: "AI_CONFIG" });
-    if (!apiKey) throw new AiError("尚未設定這家 AI 的 API Key, 請先到設定頁填寫並儲存", { code: "AI_NO_KEY" });
-    const url = `${String(baseUrl).replace(/\/$/, "")}/chat/completions`;
+  function endpoint(baseUrl, path) {
+    return `${String(baseUrl).replace(/\/$/, "")}${path}`;
+  }
+
+  async function chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens }) {
+    const url = endpoint(baseUrl, "/chat/completions");
     const started = Date.now();
     let res;
     try {
       res = await fetchImpl(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, messages, temperature, ...(maxTokens ? { max_tokens: maxTokens } : {}) }),
+        body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens }),
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (e) {
@@ -32,19 +37,79 @@ export function createAiClient({ fetchImpl = fetch, timeoutMs = 30000 } = {}) {
       const msg = body?.error?.message ?? `HTTP ${res.status}`;
       throw new AiError(`AI 服務回應錯誤: ${msg}`, { status: res.status, code: "AI_HTTP" });
     }
-    const content = body?.choices?.[0]?.message?.content;
-    if (typeof content !== "string" || !content.trim()) throw new AiError("AI 服務回應格式不正確 (沒有回答內容)", { code: "AI_BAD_RESPONSE" });
-    return { content: content.trim(), latencyMs, model: body?.model ?? model, usage: body?.usage ?? null };
+    const choice = body?.choices?.[0];
+    const msg = choice?.message;
+    const content = typeof msg?.content === "string" ? msg.content.trim() : "";
+    // 推理模型 (如 gpt-oss) 會先把回覆額度花在 reasoning 上, content 可能為空但 reasoning 有內容
+    const reasoning = [msg?.reasoning, msg?.reasoning_content].find((v) => typeof v === "string" && v.trim()) ?? "";
+    return {
+      content,
+      reasoning,
+      finishReason: choice?.finish_reason ?? "",
+      latencyMs,
+      model: body?.model ?? model,
+      usage: body?.usage ?? null,
+      hasChoices: Array.isArray(body?.choices) && body.choices.length > 0,
+    };
+  }
+
+  async function chat({ baseUrl, apiKey, model, messages, temperature = 0.3, maxTokens } = {}) {
+    if (!baseUrl || !model) throw new AiError("AI 設定不完整: 缺少 Base URL 或模型名稱", { code: "AI_CONFIG" });
+    if (!apiKey) throw new AiError("尚未設定這家 AI 的 API Key, 請先到設定頁填寫並儲存", { code: "AI_NO_KEY" });
+    const firstTokens = maxTokens ?? DEFAULT_MAX_TOKENS;
+    const first = await chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens: firstTokens });
+    if (first.content) return { content: first.content, latencyMs: first.latencyMs, model: first.model, usage: first.usage };
+    if (!first.hasChoices) throw new AiError("AI 服務回應格式不正確 (沒有回答內容)", { code: "AI_BAD_RESPONSE" });
+    const reasoningOnly = Boolean(first.reasoning) || first.finishReason === "length";
+    if (!reasoningOnly) throw new AiError("AI 服務回應格式不正確 (沒有回答內容)", { code: "AI_BAD_RESPONSE" });
+    // 推理模型把額度都用在思考上: 自動把額度加倍重試一次, 讓回答有機會產生
+    const bigger = Math.min(firstTokens * 2, MAX_MAX_TOKENS);
+    if (bigger > firstTokens) {
+      const second = await chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens: bigger });
+      if (second.content) return { content: second.content, latencyMs: first.latencyMs + second.latencyMs, model: second.model, usage: second.usage };
+    }
+    throw new AiError("AI 把回覆額度都用在思考上, 沒有產生回答內容; 可以換一個模型, 或稍後再試一次", { code: "AI_REASONING_ONLY" });
   }
 
   async function testConnection(cfg, apiKey) {
     const started = Date.now();
     try {
-      const r = await chat({ ...cfg, apiKey, messages: [{ role: "user", content: "連線測試, 請只回覆 OK" }], maxTokens: 16, temperature: 0 });
+      // 測試額度給 512: 推理模型若只給 16, 會全花在思考上、回答為空而被誤判失敗 (2026-10-20 老吳實測)
+      const r = await chat({ ...cfg, apiKey, messages: [{ role: "user", content: "連線測試, 請只回覆 OK" }], maxTokens: 512, temperature: 0 });
       return { ok: true, latencyMs: Date.now() - started, model: r.model, message: "連線成功, 這家 AI 可以使用" };
     } catch (e) {
+      // 結構有效、有在思考, 只是沒吐出文字: 連線與 Key 都是通的, 不算失敗
+      if (e?.code === "AI_REASONING_ONLY") {
+        return { ok: true, latencyMs: Date.now() - started, model: cfg?.model, reasoningOnly: true, message: "連線成功, 這家 AI 可以使用 (這是推理模型, 測試時先把額度用在思考, 正式回答時沒問題)" };
+      }
       return { ok: false, latencyMs: Date.now() - started, error: e.message, code: e.code ?? "AI_ERROR", message: `連線失敗: ${e.message}。下一步: 確認 API Key 是否正確、模型名稱是否正確, 並檢查這台電腦能不能上網。` };
     }
   }
-  return { chat, testConnection };
+
+  // 列出這家 AI 目前可用的模型 (OpenAI 相容 /models), 讓使用者用選的, 不用打字背代號。
+  async function listModels({ baseUrl } = {}, apiKey) {
+    if (!baseUrl) return { ok: false, code: "AI_CONFIG", message: "連線設定不完整: 缺少 Base URL, 請先確認這家的連線位置" };
+    if (!apiKey) return { ok: false, code: "AI_NO_KEY", message: "還沒有 API Key: 請先在上方欄位貼上 Key (或先把 Key 儲存好), 再來抓模型清單" };
+    let res;
+    try {
+      res = await fetchImpl(endpoint(baseUrl, "/models"), {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (e) {
+      return { ok: false, code: "AI_NETWORK", message: `連不上 AI 服務: ${e?.name === "TimeoutError" ? "逾時" : (e?.message ?? e)}。下一步: 檢查這台電腦能不能上網。` };
+    }
+    let body = null;
+    try { body = await res.json(); } catch {}
+    if (!res.ok) {
+      const msg = body?.error?.message ?? `HTTP ${res.status}`;
+      return { ok: false, code: "AI_HTTP", status: res.status, message: `抓不到模型清單: AI 服務回應錯誤: ${msg}。下一步: 確認 API Key 是否正確。` };
+    }
+    const raw = Array.isArray(body?.data) ? body.data : [];
+    const ids = [...new Set(raw.map((m) => (typeof m?.id === "string" ? m.id.trim() : "")).filter(Boolean))].sort();
+    if (!ids.length) return { ok: false, code: "AI_BAD_RESPONSE", message: "AI 服務有回應, 但沒有回傳任何可用模型; 可以稍後再試, 或用選單最後的「手動輸入」填模型代號" };
+    return { ok: true, models: ids, message: `抓到了: 共 ${ids.length} 個可用模型, 請在選單裡選一個` };
+  }
+
+  return { chat, testConnection, listModels };
 }

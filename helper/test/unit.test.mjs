@@ -12,6 +12,7 @@ import { createTriggerState, evaluateTrigger, markAnswered, markTriggered } from
 import { KnowledgeBase } from "../src/kb.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, ruleFallbackJudge, PerMinuteLimiter } from "../src/scam.mjs";
 import { createConsoleServer } from "../src/server.mjs";
+import { parseApiSection, applyApiConfig, applyCoreApiConfig, readCoreApiStatus, isValidChatId } from "../src/linecfg.mjs";
 import { HelperBot } from "../src/bot.mjs";
 import { createAiClient as aiFactory } from "../src/ai.mjs";
 
@@ -173,6 +174,141 @@ test("ai: 共用 OpenAI 相容格式 chat 與 testConnection (本機 stub)", asy
   assert.equal(tc.ok, true);
   const tc2 = await ai.testConnection({ baseUrl: url, model: "stub-model" }, "");
   assert.equal(tc2.ok, false); assert.match(tc2.message, /下一步/);
+});
+
+async function modelsStubServer(handler) {
+  const server = createServer(async (req, res) => {
+    const out = handler(req);
+    res.writeHead(out.status ?? 200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(out.body));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return { server, url: `http://127.0.0.1:${server.address().port}/v1` };
+}
+
+test("ai: listModels 解析清單 (去重排序)、無 Key 錯誤 (本機 stub)", async (t) => {
+  const { server, url } = await modelsStubServer((req) => {
+    assert.ok(req.url.endsWith("/models"));
+    assert.equal(req.headers.authorization, "Bearer sk-MODELS-0000aaaa");
+    return { body: { data: [{ id: "b-model" }, { id: "a-model" }, { id: "a-model" }, { id: " " }, {}] } };
+  });
+  t.after(() => server.close());
+  const ai = createAiClient({});
+  const r = await ai.listModels({ baseUrl: url }, "sk-MODELS-0000aaaa");
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.models, ["a-model", "b-model"]);
+  assert.match(r.message, /2 個可用模型/);
+  const noKey = await ai.listModels({ baseUrl: url }, "");
+  assert.equal(noKey.ok, false); assert.equal(noKey.code, "AI_NO_KEY"); assert.match(noKey.message, /API Key/);
+});
+
+test("ai: listModels 供應商回 401 時給白話錯誤 (本機 stub)", async (t) => {
+  const { server, url } = await modelsStubServer(() => ({ status: 401, body: { error: { message: "Invalid API Key" } } }));
+  t.after(() => server.close());
+  const ai = createAiClient({});
+  const r = await ai.listModels({ baseUrl: url }, "sk-BADKEY");
+  assert.equal(r.ok, false); assert.equal(r.code, "AI_HTTP"); assert.match(r.message, /下一步/);
+});
+
+test("ai: 推理模型 reasoning-only 不誤判連線 (chat 自動加倍額度, testConnection 成功)", async (t) => {
+  const seen = [];
+  const { server, url } = await aiStubServer((body) => {
+    seen.push(body.max_tokens);
+    if (body.max_tokens < 1024) return { body: { model: body.model, choices: [{ message: { role: "assistant", content: "", reasoning: "思考中" }, finish_reason: "length" }] } };
+    return { body: { model: body.model, choices: [{ message: { role: "assistant", content: "OK" }, finish_reason: "stop" }] } };
+  });
+  t.after(() => server.close());
+  const ai = createAiClient({});
+  const tc = await ai.testConnection({ baseUrl: url, model: "reasoning-stub" }, "sk-REASON-0000aaaa");
+  assert.equal(tc.ok, true);
+  assert.ok(seen.includes(512) && seen.includes(1024), "reasoning-only 時應自動加倍額度重試");
+});
+
+test("ai: 一直 reasoning-only 時 testConnection 仍判定連通並註明推理模型", async (t) => {
+  const { server, url } = await aiStubServer((body) => ({ body: { model: body.model, choices: [{ message: { role: "assistant", content: "", reasoning: "一直在想" }, finish_reason: "length" }] } }));
+  t.after(() => server.close());
+  const ai = createAiClient({});
+  const tc = await ai.testConnection({ baseUrl: url, model: "reasoning-stub" }, "sk-REASON-0000aaaa");
+  assert.equal(tc.ok, true); assert.equal(tc.reasoningOnly, true); assert.match(tc.message, /推理模型/);
+  const chatErr = await ai.chat({ baseUrl: url, apiKey: "sk-REASON-0000aaaa", model: "reasoning-stub", messages: [{ role: "user", content: "hi" }], maxTokens: 4096 }).then(() => null, (e) => e);
+  assert.equal(chatErr?.code, "AI_REASONING_ONLY");
+});
+
+test("linecfg: config.yaml api 區塊解析與白名單寫入 (備份、驗證、防重複)", async () => {
+  const { writeFileSync, readFileSync } = await import("node:fs");
+  const dir = await tmp();
+  const sample = [
+    "server:",
+    "  port: 3789",
+    "api:",
+    "  enabled: false",
+    "  # chats:",
+    "  #   - c0123456789abcdef0123456789abcdef",
+    "  sendsPerMinute: 20",
+    "",
+  ].join("\n");
+  const gid = "c" + "a".repeat(32);
+  const parsed0 = parseApiSection(sample);
+  assert.equal(parsed0.enabled, false); assert.deepEqual(parsed0.chats, [], "註解範例不應被當成白名單");
+  const applied = applyApiConfig(sample, gid);
+  const parsed1 = parseApiSection(applied);
+  assert.equal(parsed1.enabled, true); assert.deepEqual(parsed1.chats, [gid]);
+  const applied2 = applyApiConfig(applied, gid);
+  assert.deepEqual(parseApiSection(applied2).chats, [gid], "重複加入不應重複列");
+  const gid2 = "c" + "d".repeat(32);
+  assert.deepEqual(parseApiSection(applyApiConfig(applied, gid2)).chats, [gid, gid2], "第二個群組應接在清單後面");
+  assert.equal(isValidChatId(gid), true);
+  assert.equal(isValidChatId("hello"), false);
+  writeFileSync(join(dir, "config.yaml"), sample);
+  const r = applyCoreApiConfig({ dataDir: dir, repoRoot: join(dir, "nope"), chatId: gid });
+  assert.equal(r.apiEnabled, true);
+  assert.equal(readFileSync(join(dir, "config.yaml.bak"), "utf8"), sample, "備份應為原內容");
+  const st = readCoreApiStatus({ dataDir: dir, repoRoot: join(dir, "nope") });
+  assert.equal(st.exists, true); assert.equal(st.apiEnabled, true); assert.deepEqual(st.chats, [gid]);
+  assert.throws(() => applyCoreApiConfig({ dataDir: dir, repoRoot: dir, chatId: "bad-id" }), /格式不對/);
+});
+
+test("console: /api/list-models 與 LINE 引導端點 (模型清單、Token 自動產生、白名單)", async (t) => {
+  const dir = await tmp();
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(join(dir, "config.yaml"), "api:\n  enabled: false\n");
+  const settings = new SettingsStore({ path: join(dir, "settings.json") });
+  const secrets = new MemorySecretStore();
+  const logger = new Logger({ dir: join(dir, "logs") });
+  const { server: stub, url: stubUrl } = await modelsStubServer(() => ({ body: { data: [{ id: "m2" }, { id: "m1" }] } }));
+  t.after(() => stub.close());
+  const ai = createAiClient({});
+  const kb = new KnowledgeBase({ folder: "", indexPath: join(dir, "kb.json"), logger });
+  const bot = new HelperBot({ settings, secrets, ai, kb, logger });
+  const fakeToken = "tokFAKE" + "x".repeat(30) + "wxyz";
+  const server = createConsoleServer({ settings, secrets, ai, kb, bot, logger, lineEnv: { dataDir: dir, repoRoot: join(dir, "nope"), packaged: true, generateToken: async () => fakeToken } });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const post = (p, b) => fetch(base + p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b ?? {}) }).then((r) => r.json());
+  const noKey = await post("/api/list-models", { provider: "groq", baseUrl: stubUrl });
+  assert.equal(noKey.ok, false); assert.equal(noKey.code, "AI_NO_KEY"); assert.match(noKey.message, /API Key/);
+  const list = await post("/api/list-models", { provider: "groq", apiKey: "sk-LIST-0000aaaa", baseUrl: stubUrl });
+  assert.equal(list.ok, true); assert.deepEqual(list.models, ["m1", "m2"]);
+  const st0 = await (await fetch(base + "/api/line/config-status")).json();
+  assert.equal(st0.exists, true); assert.equal(st0.apiEnabled, false);
+  const gid = "c" + "b".repeat(32);
+  const applied = await post("/api/line/config-apply", { chatId: gid });
+  assert.equal(applied.ok, true); assert.equal(applied.apiEnabled, true); assert.deepEqual(applied.chats, [gid]);
+  const badApply = await post("/api/line/config-apply", { chatId: "xyz" });
+  assert.equal(badApply.ok, false); assert.match(badApply.message, /格式不對/);
+  const gen = await post("/api/line/generate-token");
+  assert.equal(gen.ok, true); assert.equal(gen.last4, "wxyz");
+  assert.ok(!JSON.stringify(gen).includes(fakeToken), "回應不得含完整 Token");
+  assert.equal(await secrets.get(SECRET_NAMES.lineToken), fakeToken);
+  const view = await (await fetch(base + "/api/settings")).json();
+  assert.equal(view.line.set, true); assert.equal(view.line.last4, "wxyz");
+  const manualToken = "tokMANUAL" + "y".repeat(24) + "zzzz";
+  const put = await fetch(base + "/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ line: { apiKey: manualToken } }) }).then((r) => r.json());
+  assert.equal(put.ok, true);
+  assert.equal(await secrets.get(SECRET_NAMES.lineToken), manualToken);
+  const html = await (await fetch(base + "/")).text();
+  assert.ok(html.includes("取得可用模型") && html.includes("LINE 連接設定") && html.includes("自動產生 Token"), "新版介面元素應存在");
 });
 
 test("kb: 掃描、切段、BM25 搜尋附來源; 索引存資料夾外; 資料夾唯讀不被改", async () => {

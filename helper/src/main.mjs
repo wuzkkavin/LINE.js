@@ -28,7 +28,7 @@ const kb = new KnowledgeBase({ folder: settings.get().kb.folder, indexPath: join
 if (settings.get().kb.folder) kb.scan();
 
 const bot = new HelperBot({ settings, secrets, ai, kb, logger });
-const server = createConsoleServer({ settings, secrets, ai, kb, bot, logger });
+const server = createConsoleServer({ settings, secrets, ai, kb, bot, logger, lineEnv: { dataDir } });
 const port = Number(process.env.HELPER_PORT || 3790);
 await listenConsole(server, port);
 logger.info("啟動", "控制台已啟動", { url: `http://127.0.0.1:${port}`, botName: settings.get().botName || "(尚未設定)" });
