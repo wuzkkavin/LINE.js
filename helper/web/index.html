@@ -95,6 +95,35 @@ a.btn { text-decoration: none; }
   </div>
 
   <section class="card">
+    <h2>LINE 連接設定 (照著四步做)</h2>
+    <div class="hint">第一次使用要完成這四步, AI寶 才能進群組回答問題。一步一步來, 做完一步再做下一步。</div>
+    <h3>步驟一: 用次要帳號登入 LINE</h3>
+    <div class="hint">打開核心登入頁, 用手機 LINE 掃畫面上的 QR 碼, 再輸入畫面上的 PIN 碼。<strong>一定要用次要帳號登入, 不要用主帳號。</strong></div>
+    <div style="margin-top:8px"><a class="btn" href="http://127.0.0.1:3789/" target="_blank" rel="noopener"><button type="button">開啟核心登入頁</button></a></div>
+    <h3>步驟二: 把機器人加入群組, 並把群組加入白名單</h3>
+    <div class="hint">先在手機 LINE 把剛登入的次要帳號邀請進要使用 AI寶 的群組。接著打開核心頁面, 點進那個群組的聊天室, 用頁面上的「複製聊天室 ID」功能複製群組 ID, 貼到下面欄位, 按「加入白名單並啟用 API」。</div>
+    <label for="chatIdInput">群組 ID (聊天室 ID)</label>
+    <input type="text" id="chatIdInput" placeholder="範例:c0123456789abcdef0123456789abcdef" autocomplete="off">
+    <div style="margin-top:8px"><button type="button" class="ghost" id="btnWhitelist">加入白名單並啟用 API</button><span class="test-result" id="whitelistMsg"></span></div>
+    <div class="hint" id="lineCfgState">白名單狀態讀取中…</div>
+    <div class="hint">白名單改好之後, 要把 AI寶 <strong>完全關閉再重新開啟</strong>才會生效; 重開後再繼續步驟三。</div>
+    <h3>步驟三: 取得機器人 Token</h3>
+    <div class="hint">Token 是機器人連上核心的鑰匙。打包版直接按「自動產生 Token」, 產生後會自動儲存、自動重新連線, 不用再貼一次。手邊已有 Token 的話, 貼到欄位按「儲存 Token」也可以。</div>
+    <label for="lineKey">機器人 Token</label>
+    <input type="password" id="lineKey" placeholder="尚未設定" autocomplete="off">
+    <div class="hint" id="lineKeyState"></div>
+    <div style="margin-top:8px">
+      <button type="button" class="ghost" id="btnLineKeySave">儲存 Token</button>
+      <button type="button" class="ghost" id="btnGenToken">自動產生 Token</button>
+      <span class="test-result" id="lineTokenMsg"></span>
+    </div>
+    <div class="hint">注意: 重新產生 Token 會讓舊 Token 立刻失效; 用「自動產生」會一併把新 Token 存好, 不會弄丟。</div>
+    <h3>步驟四: 確認連線成功</h3>
+    <div class="hint">看本頁最上方的「LINE 連線狀態」卡片變成「已連線」就完成了。之後在群組裡打「AI寶, 你的問題?」就會回答。</div>
+    <div style="margin-top:8px"><button type="button" class="ghost" id="btnRefreshTop">重新整理狀態</button></div>
+  </section>
+
+  <section class="card">
     <h2>一般與觸發</h2>
     <div class="row">
       <div>
@@ -229,7 +258,12 @@ function providerCard(p) {
     <label class="checkline" style="margin-top:0"><input type="radio" name="aiActive" value="${p.id}"> 使用這家: <strong>${p.label}</strong></label>
     <div class="row3">
       <div><label>API Key</label><input type="password" id="key-${p.id}" placeholder="尚未設定" autocomplete="off"><div class="hint" id="keystate-${p.id}"></div></div>
-      <div><label>模型名稱</label><input type="text" id="model-${p.id}"></div>
+      <div><label>模型 (用選的, 不用打字)</label>
+        <select id="model-${p.id}"></select>
+        <input type="text" id="modelmanual-${p.id}" placeholder="模型代號 (進階手動輸入)" autocomplete="off" style="display:none; margin-top:6px">
+        <div style="margin-top:8px"><button type="button" class="ghost" id="models-${p.id}">取得可用模型</button><span class="test-result" id="modelsres-${p.id}"></span></div>
+        <div class="hint">先貼上 Key, 按「取得可用模型」, 再從選單挑一個; 選好記得按最下方「儲存全部設定」。</div>
+      </div>
       <div><label>Base URL</label><input type="text" id="base-${p.id}"></div>
     </div>
     <div style="margin-top:10px"><button type="button" class="ghost" id="test-${p.id}">測試連線</button><span class="test-result" id="testres-${p.id}"></span>
@@ -253,7 +287,10 @@ async function loadAll() {
   for (const id of PROVIDERS) {
     const p = s.ai.providers[id];
     holder.appendChild(providerCard({ id, label: p.label }));
-    $("model-" + id).value = p.model;
+    setModelOptions(id, null, p.model);
+    $("modelmanual-" + id).value = p.model;
+    $("model-" + id).onchange = () => syncManual(id);
+    $("models-" + id).onclick = () => fetchModels(id);
     $("base-" + id).value = p.baseUrl;
     $("keystate-" + id).textContent = p.set ? `已設定 (末 4 碼 ${p.last4}), 要更換直接在左邊欄位輸入新 Key` : "尚未設定, 請輸入 Key 後按儲存";
     document.querySelector(`input[name=aiActive][value=${id}]`).checked = s.ai.active === id;
@@ -261,6 +298,8 @@ async function loadAll() {
     $("test-" + id).onclick = () => testAi(id);
     $("clear-" + id).onclick = () => clearKey(id);
   }
+  $("lineKeyState").textContent = s.line?.set ? `已設定 (末 4 碼 ${s.line.last4}), 要更換直接在左邊欄位輸入新 Token 按儲存` : "尚未設定, 請先完成步驟一、二, 再回來產生 Token";
+  loadLineCfg();
   $("aiFallback").checked = !!s.ai.fallback;
   $("systemPrompt").value = s.ai.systemPrompt || "";
   $("scamEnabled").checked = !!s.scam.enabled;
@@ -286,13 +325,49 @@ async function loadAll() {
   if (b.kb) $("kbStatus").textContent = `目前狀態:${b.kb.files} 個檔案、${b.kb.chunks} 段, 上次整理:${b.kb.updatedAt || "尚未整理"}`;
   loadLog();
 }
+function setModelOptions(id, models, current) {
+  const sel = $("model-" + id);
+  const vals = [...new Set([...(models || []), ...(current ? [current] : [])])];
+  sel.innerHTML = "";
+  for (const v of vals) { const o = document.createElement("option"); o.value = v; o.textContent = v; sel.appendChild(o); }
+  const mo = document.createElement("option"); mo.value = "__manual__"; mo.textContent = "手動輸入… (進階)"; sel.appendChild(mo);
+  sel.value = current && vals.includes(current) ? current : (vals[0] ?? "__manual__");
+  syncManual(id);
+}
+function syncManual(id) {
+  const manual = $("model-" + id).value === "__manual__";
+  $("modelmanual-" + id).style.display = manual ? "" : "none";
+}
+function currentModel(id) {
+  if ($("model-" + id).value === "__manual__") return $("modelmanual-" + id).value.trim();
+  return $("model-" + id).value;
+}
+async function fetchModels(id) {
+  const btn = $("models-" + id); btn.disabled = true;
+  const res = $("modelsres-" + id); res.textContent = "抓取中…"; res.style.color = "";
+  try {
+    const r = await (await fetch("/api/list-models", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider: id, apiKey: $("key-" + id).value || undefined, baseUrl: $("base-" + id).value }) })).json();
+    if (r.ok) setModelOptions(id, r.models, currentModel(id));
+    res.textContent = r.message || "";
+    res.style.color = r.ok ? "var(--dark)" : "var(--err)";
+  } catch { res.textContent = "抓取失敗: 連不上控制台服務, 請重新整理頁面"; res.style.color = "var(--err)"; }
+  btn.disabled = false;
+}
+async function loadLineCfg() {
+  try {
+    const r = await (await fetch("/api/line/config-status")).json();
+    $("lineCfgState").textContent = r.exists
+      ? `目前狀態: 機器人 API ${r.apiEnabled ? "已啟用" : "尚未啟用"} · 白名單群組 ${r.chats.length} 個 · 設定檔位置: ${r.path} (打包版在資料目錄裡的 config.yaml)`
+      : `目前狀態: 還找不到核心設定檔 (預期位置: ${r.path})。先啟動 AI寶 一次, 讓它產生設定檔, 再回來操作。`;
+  } catch { $("lineCfgState").textContent = "白名單狀態讀取失敗, 請重新整理頁面"; }
+}
 async function loadLog() {
   try { const r = await (await fetch("/api/logs")).json(); $("logTail").textContent = r.tail || "(今天還沒有 log)"; } catch {}
 }
 async function testAi(id) {
   const btn = $("test-" + id); btn.disabled = true; $("testres-" + id).textContent = "測試中…";
   try {
-    const r = await (await fetch("/api/test-ai", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider: id, apiKey: $("key-" + id).value || undefined, model: $("model-" + id).value, baseUrl: $("base-" + id).value }) })).json();
+    const r = await (await fetch("/api/test-ai", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider: id, apiKey: $("key-" + id).value || undefined, model: currentModel(id), baseUrl: $("base-" + id).value }) })).json();
     $("testres-" + id).textContent = r.ok ? `成功 (${r.latencyMs} ms, 模型 ${r.model})` : r.message;
     $("testres-" + id).style.color = r.ok ? "var(--dark)" : "var(--err)";
   } catch (e) { $("testres-" + id).textContent = "測試失敗: 連不上控制台服務, 請重新整理頁面"; }
@@ -305,7 +380,7 @@ async function clearKey(id) {
 function collect() {
   const providers = {};
   for (const id of PROVIDERS) {
-    providers[id] = { model: $("model-" + id).value.trim(), baseUrl: $("base-" + id).value.trim() };
+    providers[id] = { model: currentModel(id), baseUrl: $("base-" + id).value.trim() };
     const k = $("key-" + id).value.trim();
     if (k) providers[id].apiKey = k;
   }
@@ -338,6 +413,41 @@ $("btnKb").onclick = async () => {
   $("kbMsg").textContent = r.message || "";
   loadAll();
 };
+$("btnWhitelist").onclick = async () => {
+  const btn = $("btnWhitelist"); btn.disabled = true;
+  const msg = $("whitelistMsg"); msg.textContent = "處理中…"; msg.style.color = "";
+  try {
+    const r = await (await fetch("/api/line/config-apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chatId: $("chatIdInput").value.trim() }) })).json();
+    msg.textContent = r.message || "";
+    msg.style.color = r.ok ? "var(--dark)" : "var(--err)";
+    if (r.ok) loadLineCfg();
+  } catch { msg.textContent = "處理失敗: 連不上控制台服務, 請重新整理頁面"; msg.style.color = "var(--err)"; }
+  btn.disabled = false;
+};
+$("btnLineKeySave").onclick = async () => {
+  const v = $("lineKey").value.trim();
+  const msg = $("lineTokenMsg");
+  if (!v) { msg.textContent = "請先把 Token 貼到欄位裡, 再按儲存"; msg.style.color = "var(--err)"; return; }
+  msg.textContent = "儲存中…"; msg.style.color = "";
+  try {
+    const r = await (await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ line: { apiKey: v } }) })).json();
+    msg.textContent = r.ok ? "已儲存 Token, 機器人會用新 Token 重新連線" : ("儲存失敗:" + (r.message || ""));
+    msg.style.color = r.ok ? "var(--dark)" : "var(--err)";
+    if (r.ok) { $("lineKey").value = ""; loadAll(); }
+  } catch { msg.textContent = "儲存失敗: 連不上控制台服務, 請重新整理頁面"; msg.style.color = "var(--err)"; }
+};
+$("btnGenToken").onclick = async () => {
+  const btn = $("btnGenToken"); btn.disabled = true;
+  const msg = $("lineTokenMsg"); msg.textContent = "產生中… (需要幾秒鐘)"; msg.style.color = "";
+  try {
+    const r = await (await fetch("/api/line/generate-token", { method: "POST" })).json();
+    msg.textContent = r.message || "";
+    msg.style.color = r.ok ? "var(--dark)" : "var(--err)";
+    if (r.ok) loadAll();
+  } catch { msg.textContent = "產生失敗: 連不上控制台服務, 請重新整理頁面"; msg.style.color = "var(--err)"; }
+  btn.disabled = false;
+};
+$("btnRefreshTop").onclick = () => loadAll();
 $("btnLogDir").onclick = async () => { const r = await (await fetch("/api/log-dir")).json(); $("logDirText").textContent = r.dir; };
 $("btnLogRefresh").onclick = loadLog;
 loadAll().catch(() => { $("saveMsg").textContent = "讀不到設定, 請確認程式有在執行, 再重新整理頁面"; });

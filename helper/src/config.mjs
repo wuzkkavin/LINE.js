@@ -3,9 +3,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { maskSecret } from "./secrets.mjs";
 
+// Groq 預設模型 (2026-10-20 改): llama-3.3-70b-versatile 已被 Groq 改為企業方案, 一般 Key 無權存取,
+// 老吳實測測試連線被拒, 故改為免費層可用的 openai/gpt-oss-120b (推理模型)。
 export const PROVIDER_DEFAULTS = {
   openai: { label: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
-  groq: { label: "Groq", baseUrl: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
+  groq: { label: "Groq", baseUrl: "https://api.groq.com/openai/v1", model: "openai/gpt-oss-120b" },
   minimax: { label: "MiniMax", baseUrl: "https://api.minimax.io/v1", model: "MiniMax-M2" },
 };
 export const SECRET_NAMES = { openai: "ai:openai", groq: "ai:groq", minimax: "ai:minimax", jev: "jev", lineToken: "line:apiToken" };
@@ -101,6 +103,8 @@ export class SettingsStore {
     }
     const jevKey = secrets ? await secrets.get(SECRET_NAMES.jev) : null;
     view.scam.jev = { ...view.scam.jev, ...maskSecret(jevKey) };
+    const lineKey = secrets ? await secrets.get(SECRET_NAMES.lineToken) : null;
+    view.line = { ...maskSecret(lineKey) };
     return view;
   }
 }

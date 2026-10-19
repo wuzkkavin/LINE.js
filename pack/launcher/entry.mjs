@@ -17,10 +17,10 @@ import { resolveDataDir, dataPaths } from "./paths.mjs";
 import { createSessionVault } from "./vault.mjs";
 import { probeHttp, waitForHttp, buildChildSpec } from "./probe.mjs";
 import { ensureRuntime } from "./runtime.mjs";
+import { hasUsableSession, planBrowserUrls, CONSOLE_URL } from "./openplan.mjs";
 
 const CORE_PORT = 3789;
 const HELPER_PORT = 3790;
-const CONSOLE_URL = `http://127.0.0.1:${HELPER_PORT}/`;
 // 本檔案會在兩種情境執行: 開發模式直接以 node 執行本 ESM 原始檔 (import.meta.url 可用),
 // 以及被 esbuild 打成 CJS 後塞進 SEA (import.meta 為空物件, 改用 CJS 的 __filename)。
 // selfPath() 統一取得本程式路徑; repoRoot 只在開發模式使用, SEA 時其值不被引用。
@@ -52,13 +52,15 @@ function makeLog(paths) {
 
 // 執行期資產的解開與鏡像在 runtime.mjs: 監督者與各子行程都會呼叫 ensureRuntime,
 // 以跨行程鎖串行化並用完成標記避免重工, 避免 Windows 檔案鎖下互撞 (競態修復)。
-function openBrowser() {
-  try {
-    const opts = { detached: true, stdio: "ignore" };
-    if (process.platform === "win32") spawn("cmd", ["/c", "start", "", CONSOLE_URL], { ...opts, windowsHide: true }).unref();
-    else if (process.platform === "darwin") spawn("open", [CONSOLE_URL], opts).unref();
-    else spawn("xdg-open", [CONSOLE_URL], opts).unref();
-  } catch { /* 開瀏覽器失敗不影響服務本身 */ }
+function openBrowser(urls = [CONSOLE_URL]) {
+  for (const url of urls) {
+    try {
+      const opts = { detached: true, stdio: "ignore" };
+      if (process.platform === "win32") spawn("cmd", ["/c", "start", "", url], { ...opts, windowsHide: true }).unref();
+      else if (process.platform === "darwin") spawn("open", [url], opts).unref();
+      else spawn("xdg-open", [url], opts).unref();
+    } catch { /* 開瀏覽器失敗不影響服務本身 */ }
+  }
 }
 
 async function roleCore(sea, paths) {
@@ -101,12 +103,15 @@ async function supervise(sea, paths) {
   } catch (e) {
     log(`session 靜置解密失敗 (${e?.code || e?.message || e}), 本次以未登入狀態啟動, 密文保留不動`);
   }
+  // 是否已有可用登入憑證, 決定要開哪些頁面 (未登入要連登入頁一起開, 見 openplan.mjs)
+  const hasSession = hasUsableSession(paths);
 
   const coreAlive = await probeHttp({ port: CORE_PORT });
   const helperAlive = await probeHttp({ port: HELPER_PORT });
   if (coreAlive && helperAlive) {
     log("核心與控制台都已在執行, 本次只開啟瀏覽器, 不重複啟動");
-    openBrowser();
+    log(hasSession ? "已登入, 只開啟控制台" : "尚未登入, 同時開啟核心登入頁與控制台");
+    openBrowser(planBrowserUrls({ hasSession }));
     return;
   }
 
@@ -164,8 +169,10 @@ async function supervise(sea, paths) {
   const coreOk = coreAlive || (await waitForHttp({ port: CORE_PORT, timeoutMs: 45000 }));
   const helperOk = helperAlive || (await waitForHttp({ port: HELPER_PORT, timeoutMs: 45000 }));
   log(`就緒檢查: 核心=${coreOk ? "OK" : "未就緒"}, 控制台=${helperOk ? "OK" : "未就緒"}`);
-  if (helperOk) openBrowser();
-  else log("控制台未就緒, 不開啟瀏覽器; 請查看 logs 目錄下的 launcher-helper.log");
+  if (helperOk) {
+    log(hasSession ? "已登入, 只開啟控制台" : "尚未登入, 同時開啟核心登入頁與控制台");
+    openBrowser(planBrowserUrls({ hasSession }));
+  } else log("控制台未就緒, 不開啟瀏覽器; 請查看 logs 目錄下的 launcher-helper.log");
 
   for (const sig of ["SIGINT", "SIGTERM", "SIGBREAK"]) process.on(sig, () => void shutdown(sig));
   await new Promise(() => { /* 監督者保持存活, 直到 shutdown() 結束行程 */ });
