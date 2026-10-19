@@ -1,6 +1,6 @@
 // 探針模式 (--probe-login): 在雲端 Windows runner 上以正式程式碼路徑驗證 —
 // payload 解開 → 引擎 headless 啟動 → 雙埠回應 → 核心 WS 登入往返 (cookie/hello/auth:state/auth:start→auth:qr)
-// → CTRL_BREAK 優雅結束 → 埠釋放。結果寫成 key=value 行: 同時印出並寫入 AIBAO_PROBE_OUT 指定的結果檔。
+// → 停止訊號檔優雅結束 → 埠釋放。結果寫成 key=value 行: 同時印出並寫入 AIBAO_PROBE_OUT 指定的結果檔。
 // 全程不碰真帳號: 只送 auth:start 取得一組未被掃描的 QR (沒有手機掃描就不會登入任何帳號)。
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -81,7 +81,7 @@ pub fn run_probe() -> i32 {
     rec(format!(
         "shutdown_path={}",
         match outcome {
-            StopOutcome::CtrlBreak => "ctrl_break",
+            StopOutcome::GracefulSignal => "signal_file",
             StopOutcome::JobTerminate => "job_terminate",
             StopOutcome::AlreadyStopped => "already_stopped",
             StopOutcome::External => "external",

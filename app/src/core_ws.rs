@@ -114,20 +114,26 @@ pub fn spawn_login_thread(state: SharedLogin, commands: Receiver<WsCommand>, rep
     });
 }
 
+/// 建立 WS 連線: 必須用 ClientRequestBuilder, 它會自動帶 Sec-WebSocket-Key 等握手標頭;
+/// 2026-10-20 雲端探針實測: 用手組 http::Request 會缺 sec-websocket-key 被核心拒絕。
+fn connect_ws(cookie: &str) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, String> {
+    let req = tungstenite::client::ClientRequestBuilder::new(
+        format!("ws://127.0.0.1:{CORE_PORT}/ws").parse().map_err(|e| format!("WS 位址錯誤: {e:?}"))?,
+    )
+    .with_header("Host", format!("127.0.0.1:{CORE_PORT}"))
+    .with_header("Origin", format!("http://127.0.0.1:{CORE_PORT}"))
+    .with_header("Cookie", cookie.to_string());
+    let (socket, _resp) = tungstenite::connect(req).map_err(|e| format!("WS 連線被拒: {e}"))?;
+    Ok(socket)
+}
+
 fn run_connection(
     state: &SharedLogin,
     commands: &Receiver<WsCommand>,
     poke: &dyn Fn(&SharedLogin),
 ) -> Result<(), String> {
     let cookie = fetch_cookie()?;
-    let request = tungstenite::http::Request::builder()
-        .uri(format!("ws://127.0.0.1:{CORE_PORT}/ws"))
-        .header("Host", format!("127.0.0.1:{CORE_PORT}"))
-        .header("Origin", format!("http://127.0.0.1:{CORE_PORT}"))
-        .header("Cookie", cookie)
-        .body(())
-        .map_err(|e| format!("WS 請求組裝失敗: {e}"))?;
-    let (mut socket, _resp) = tungstenite::connect(request).map_err(|e| format!("WS 連線被拒: {e}"))?;
+    let mut socket = connect_ws(&cookie)?;
     // 設定讀取逾時, 讓主迴圈能定期檢查指令與登入逾時
     match socket.get_mut() {
         tungstenite::stream::MaybeTlsStream::Plain(stream) => {
@@ -315,20 +321,7 @@ pub fn probe_login_roundtrip(do_start: bool, timeout: Duration) -> Vec<String> {
             return events;
         }
     };
-    let request = match tungstenite::http::Request::builder()
-        .uri(format!("ws://127.0.0.1:{CORE_PORT}/ws"))
-        .header("Host", format!("127.0.0.1:{CORE_PORT}"))
-        .header("Origin", format!("http://127.0.0.1:{CORE_PORT}"))
-        .header("Cookie", cookie)
-        .body(())
-    {
-        Ok(r) => r,
-        Err(e) => {
-            events.push(format!("ws_request=fail:{e}"));
-            return events;
-        }
-    };
-    let (mut socket, _) = match tungstenite::connect(request) {
+    let mut socket = match connect_ws(&cookie) {
         Ok(s) => {
             events.push("ws=connected".to_string());
             s

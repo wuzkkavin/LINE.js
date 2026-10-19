@@ -18,6 +18,7 @@ import { createSessionVault } from "./vault.mjs";
 import { probeHttp, waitForHttp, buildChildSpec } from "./probe.mjs";
 import { ensureRuntime } from "./runtime.mjs";
 import { noBrowser } from "./nobrowser.mjs";
+import { clearStopRequest, consumeStopRequest } from "./stopfile.mjs";
 import { hasUsableSession, planBrowserUrls, CONSOLE_URL } from "./openplan.mjs";
 
 const CORE_PORT = 3789;
@@ -178,6 +179,13 @@ async function supervise(sea, paths) {
   } else log("控制台未就緒, 不開啟瀏覽器; 請查看 logs 目錄下的 launcher-helper.log");
 
   for (const sig of ["SIGINT", "SIGTERM", "SIGBREAK"]) process.on(sig, () => void shutdown(sig));
+  // 原生 App 殼的停止通道 (規格書 v3 風險 2 退路): CREATE_NO_WINDOW 下主控台事件送不到,
+  // 改由殼在資料目錄放 stop-request 訊號檔, 監督者輪詢到就走同一條 shutdown() 優雅關閉。
+  clearStopRequest(paths);
+  const stopWatcher = setInterval(() => {
+    if (consumeStopRequest(paths)) void shutdown("stop-request");
+  }, 500);
+  stopWatcher.unref();
   await new Promise(() => { /* 監督者保持存活, 直到 shutdown() 結束行程 */ });
 }
 

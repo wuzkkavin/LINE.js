@@ -10,7 +10,6 @@ mod win_impl {
     use std::path::{Path, PathBuf};
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-    use windows::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
         JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -154,12 +153,6 @@ mod win_impl {
             }
         }
         Ok(())
-    }
-
-    /// 對監督者行程群組送 CTRL_BREAK: 監督者 (entry.mjs) 有處理 SIGBREAK 優雅關閉
-    /// (結束子行程並把 session 以 DPAPI 加密封存)。送達性依規格書 v3 風險 2, 由探針在雲端 Windows 實測。
-    pub fn send_ctrl_break(pid: u32) -> bool {
-        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid).is_ok() }
     }
 
     // ---- 單一實例: 具名互斥鎖 + 具名事件通知既有實例 ----

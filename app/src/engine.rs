@@ -26,8 +26,8 @@ pub enum EngineState {
 
 #[derive(Debug)]
 pub enum StopOutcome {
-    /// 監督者收到 CTRL_BREAK 後自行優雅退出 (session 有機會完成 DPAPI 封存)
-    CtrlBreak,
+    /// 監督者經停止訊號檔 (stop-request) 自行優雅退出 (session 有機會完成 DPAPI 封存)
+    GracefulSignal,
     /// 逾時未退, 以 Job Object 整樹清除 (兜底)
     JobTerminate,
     /// 本來就沒在跑
@@ -205,7 +205,9 @@ impl EngineManager {
         }
     }
 
-    /// 結束序列 (規格書 v3 第 7 節): 先 CTRL_BREAK 優雅關閉 (等 10 秒), 逾時以 Job Object 兜底。
+    /// 結束序列 (規格書 v3 第 7 節): 先以停止訊號檔請監督者優雅關閉 (等 12 秒), 逾時以 Job Object 兜底。
+    /// 為什麼不用 CTRL_BREAK: CREATE_NO_WINDOW 的行程沒有主控台, 控制事件送不到
+    /// (2026-10-20 雲端探針實測 GenerateConsoleCtrlEvent 失敗) — 規格書 v3 風險 2 的定案退路。
     pub fn stop(&mut self) -> StopOutcome {
         match self.state {
             EngineState::ExternalRunning => return StopOutcome::External,
@@ -214,19 +216,19 @@ impl EngineManager {
         }
         #[cfg(windows)]
         {
-            let pid = self.pid.unwrap_or(0);
-            let sent = pid != 0 && crate::platform::send_ctrl_break(pid);
-            shell::log_line(&format!("已送出結束訊號 (CTRL_BREAK) 給引擎監督者 pid={pid}, 送達={sent}"));
+            let stop_file = shell::data_dir().join("stop-request");
+            let sent = std::fs::write(&stop_file, b"stop").is_ok();
+            shell::log_line(&format!("已放出停止訊號檔 ({}), 寫入={sent}", stop_file.display()));
             if sent {
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + Duration::from_secs(12);
                 while Instant::now() < deadline {
                     if self.proc_exited() && !Self::ports_alive() {
                         self.state = EngineState::Stopped;
                         self.proc = None;
                         self.job = None;
                         self.pid = None;
-                        shell::log_line("引擎已優雅結束 (CTRL_BREAK 路徑)");
-                        return StopOutcome::CtrlBreak;
+                        shell::log_line("引擎已優雅結束 (停止訊號檔路徑)");
+                        return StopOutcome::GracefulSignal;
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
