@@ -591,7 +591,10 @@ impl eframe::App for App {
                 ];
                 for (page, label) in items {
                     let selected = self.page == page;
-                    let btn = egui::Button::new(egui::RichText::new(label).size(15.0))
+                    let text = egui::RichText::new(label)
+                        .size(15.0)
+                        .color(if selected { egui::Color32::WHITE } else { egui::Color32::from_rgb(0x33, 0x33, 0x33) });
+                    let btn = egui::Button::new(text)
                         .fill(if selected { GREEN } else { egui::Color32::TRANSPARENT })
                         .stroke(egui::Stroke::NONE);
                     let resp = ui.add_sized([152.0, 34.0], btn);

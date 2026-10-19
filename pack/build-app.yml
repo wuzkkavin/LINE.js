@@ -125,6 +125,23 @@ jobs:
           }
           if (-not $ok) { throw 'App 啟動後 90 秒內引擎雙埠未就緒' }
           Start-Sleep -Seconds 5
+          # 把主視窗移到畫面內並縮到 1000x700, 確保截圖拍得到完整視窗 (含頁尾版權宣告)
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class Win32Pos {
+            [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+          }
+          "@
+          $proc.Refresh()
+          if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
+            [Win32Pos]::SetWindowPos($proc.MainWindowHandle, [IntPtr]::Zero, 10, 10, 1000, 700, 0x0040) | Out-Null
+            [Win32Pos]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
+            Start-Sleep -Seconds 2
+          } else {
+            Write-Host '警告: 找不到主視窗 handle, 截圖可能不完整'
+          }
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
           $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
