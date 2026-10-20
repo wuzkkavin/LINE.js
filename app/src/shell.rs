@@ -75,15 +75,23 @@ pub struct ShellSettings {
     /// 2026-10-20 老吳實機: 按 X 以為關掉程式, 其實只是縮到系統匣、服務繼續跑, 誤以為結束功能壞掉)
     #[serde(default)]
     pub tray_hint_shown: bool,
+    /// 介面主題 id (theme 模組 ThemeId 的持久化字串); 舊設定檔沒有此欄位時
+    /// 以 serde default 補 forest (森林綠, 出廠預設), 不影響既有偏好。
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 fn default_true() -> bool {
     true
 }
 
+fn default_theme() -> String {
+    "forest".to_string()
+}
+
 impl Default for ShellSettings {
     fn default() -> Self {
-        Self { show_window_on_start: true, tray_hint_shown: false }
+        Self { show_window_on_start: true, tray_hint_shown: false, theme: default_theme() }
     }
 }
 

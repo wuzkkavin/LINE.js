@@ -9,6 +9,7 @@ mod helper_api;
 mod platform;
 mod probe;
 mod shell;
+mod theme;
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
@@ -21,8 +22,9 @@ use serde_json::Value;
 
 const COPYRIGHT: &str = "©Copyright 2026 By 吳治綱 繁體中文化";
 const UPSTREAM_CREDIT: &str = "上游出處: JS-PACKAGE/LINE.js (Apache-2.0) ・ @evex/linejs (evex-dev)";
-const GREEN: egui::Color32 = egui::Color32::from_rgb(0x0c, 0x51, 0x3d);
-const LIGHT_BG: egui::Color32 = egui::Color32::from_rgb(0xf3, 0xf8, 0xf3);
+
+// 介面顏色一律走 theme 模組的 Palette (設計定稿 design/palettes.md), 不得再寫死色碼;
+// 僅 QR 碼的黑/白是功能必需 (掃描對比), 不屬主題色。
 
 const FONT_BYTES: &[u8] = include_bytes!("../../helper/assets/fonts/jf-openhuninn-2.1.ttf");
 const AVATAR_BYTES: &[u8] = include_bytes!("../../helper/assets/ai-bao-avatar.png");
@@ -36,7 +38,7 @@ enum AppSignal {
     QuitApp,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Page {
     Overview,
     LineLogin,
@@ -47,6 +49,36 @@ enum Page {
     Logs,
     AppSettings,
     About,
+}
+
+/// 側欄導覽順序與標籤 (圖示與頁面一一對應, 順序即 nav_icons 的索引)。
+const NAV_PAGES: [(Page, &str); 9] = [
+    (Page::Overview, "總覽"),
+    (Page::LineLogin, "LINE 登入"),
+    (Page::AiSettings, "AI 設定"),
+    (Page::BotSettings, "機器人與觸發"),
+    (Page::KbSettings, "知識庫"),
+    (Page::ScamSettings, "防詐騙"),
+    (Page::Logs, "紀錄"),
+    (Page::AppSettings, "程式設定"),
+    (Page::About, "關於"),
+];
+
+/// 自繪側欄圖示 (白色符號 + 透明底; LINE 登入為全彩定版)。產生方式與 SVG 源檔
+/// 見 assets/icons/ (generate_icons.py); 底色由繪製端依主題主色即時填繪,
+/// 圖示本身不帶主題色, 切主題不必換圖。
+fn nav_icon_bytes(page: Page) -> &'static [u8] {
+    match page {
+        Page::Overview => include_bytes!("../assets/icons/nav-overview-256.png"),
+        Page::LineLogin => include_bytes!("../assets/icons/nav-line-login-256.png"),
+        Page::AiSettings => include_bytes!("../assets/icons/nav-ai-settings-256.png"),
+        Page::BotSettings => include_bytes!("../assets/icons/nav-bot-256.png"),
+        Page::KbSettings => include_bytes!("../assets/icons/nav-kb-256.png"),
+        Page::ScamSettings => include_bytes!("../assets/icons/nav-scam-256.png"),
+        Page::Logs => include_bytes!("../assets/icons/nav-logs-256.png"),
+        Page::AppSettings => include_bytes!("../assets/icons/nav-app-settings-256.png"),
+        Page::About => include_bytes!("../assets/icons/nav-about-256.png"),
+    }
 }
 
 #[derive(Clone, Default)]
@@ -159,6 +191,11 @@ struct App {
     confirm_logout: bool,
     autostart_arg: bool,
     shell_settings: shell::ShellSettings,
+    /// 目前主題與其色票 (所有頁面繪製吃 palette, 不再引用全域色常數)。
+    theme_id: theme::ThemeId,
+    palette: theme::Palette,
+    /// 側欄圖示紋理, 索引與 NAV_PAGES 對齊; 解碼失敗為 None (側欄退回純文字, 已記 log)。
+    nav_icons: [Option<egui::TextureHandle>; 9],
     #[cfg(windows)]
     tray: Option<Tray>,
 }
@@ -474,10 +511,10 @@ impl App {
         shell_settings: shell::ShellSettings,
     ) -> Self {
         install_fonts(&cc.egui_ctx);
-        let mut visuals = egui::Visuals::light();
-        visuals.panel_fill = LIGHT_BG;
-        visuals.selection.bg_fill = GREEN;
-        cc.egui_ctx.set_visuals(visuals);
+        // 主題在第一幀之前就套用 (一般啟動與 --autostart 走同一條路徑):
+        // 讀已存的 ShellSettings.theme, 不會先閃一下預設森林綠再跳色。
+        let theme_id = theme::ThemeId::from_str(&shell_settings.theme);
+        theme::apply_theme(&cc.egui_ctx, theme_id);
 
         let login: SharedLogin = Arc::new(Mutex::new(LoginUi::default()));
         let (login_tx, login_rx) = std::sync::mpsc::channel::<WsCommand>();
@@ -500,6 +537,18 @@ impl App {
             let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
             cc.egui_ctx.load_texture("avatar", img, egui::TextureOptions::LINEAR)
         });
+
+        // 側欄圖示: 任一顆解碼失敗只退回該顆純文字按鈕並記 log, 不 panic、不擋啟動。
+        let mut nav_icons: [Option<egui::TextureHandle>; 9] = Default::default();
+        for (idx, (page, _)) in NAV_PAGES.iter().enumerate() {
+            nav_icons[idx] = decode_png_rgba(nav_icon_bytes(*page)).map(|(rgba, w, h)| {
+                let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                cc.egui_ctx.load_texture(format!("nav-{idx}"), img, egui::TextureOptions::LINEAR)
+            });
+            if nav_icons[idx].is_none() {
+                shell::log_line(&format!("側欄圖示載入失敗 (page={page:?}), 該顆退回純文字按鈕"));
+            }
+        }
 
         #[cfg(windows)]
         let tray = build_tray();
@@ -547,6 +596,9 @@ impl App {
             confirm_logout: false,
             autostart_arg,
             shell_settings,
+            theme_id,
+            palette: theme_id.palette(),
+            nav_icons,
             #[cfg(windows)]
             tray,
         };
@@ -772,18 +824,107 @@ impl App {
     fn helper_status(&self) -> Option<Value> {
         self.snap.lock().unwrap().status.clone()
     }
+
+    /// 切換介面主題: 即時套用並存檔, 重開沿用, 不需要重啟程式。
+    fn set_theme(&mut self, ctx: &egui::Context, id: theme::ThemeId) {
+        if id == self.theme_id {
+            return;
+        }
+        self.theme_id = id;
+        self.palette = id.palette();
+        theme::apply_theme(ctx, id);
+        self.shell_settings.theme = id.as_str().to_string();
+        self.shell_settings.save();
+        shell::log_line(&format!("介面主題切換為 {}", id.as_str()));
+        ctx.request_repaint();
+    }
+
+    /// 側欄導覽列一顆 (圖 + 文橫排): 圖示片是主色圓角方 + 白色符號, 底色由程式
+    /// 依目前主題即時填繪 (LINE 登入圖自帶全彩底除外)。選中態: 整列主色底、
+    /// 白字, 列左緣溝槽再加 3px 主色實條 (五套主題同一形狀語言, 不靠色相辨識)。
+    /// 圖示紋理缺失時退回純文字置中, 不留空位。
+    fn nav_item(&self, ui: &mut egui::Ui, idx: usize, page: Page, label: &str) -> bool {
+        let pal = self.palette;
+        let selected = self.page == page;
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(152.0, 34.0), egui::Sense::click());
+        let painter = ui.painter();
+        if selected {
+            painter.rect_filled(rect, 7.0, pal.primary);
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(rect.left() - 6.0, rect.top() + 4.0),
+                egui::pos2(rect.left() - 3.0, rect.bottom() - 4.0),
+            );
+            painter.rect_filled(bar, 1.5, pal.primary);
+        } else if resp.hovered() {
+            painter.rect_filled(rect, 7.0, theme::with_alpha(pal.primary, 26));
+        }
+        let center_y = rect.center().y;
+        let text_color = if selected { egui::Color32::WHITE } else { pal.text_main };
+        match &self.nav_icons[idx] {
+            Some(tex) => {
+                let chip = egui::Rect::from_center_size(
+                    egui::pos2(rect.left() + 18.0, center_y),
+                    egui::vec2(24.0, 24.0),
+                );
+                if page == Page::LineLogin {
+                    // LINE 登入: 全彩定版圖 (LINE 綠), 不疊主題色片; 本體含留邊,
+                    // 略放大讓視覺重量與其他顆一致。
+                    let img_rect = egui::Rect::from_center_size(chip.center(), egui::vec2(27.0, 27.0));
+                    painter.image(
+                        tex.id(),
+                        img_rect,
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    let chip_fill = if selected {
+                        theme::with_alpha(egui::Color32::WHITE, 56)
+                    } else {
+                        theme::with_alpha(pal.primary, 140) // 主色 55%
+                    };
+                    painter.rect_filled(chip, 6.0, chip_fill);
+                    painter.image(
+                        tex.id(),
+                        chip,
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+                painter.text(
+                    egui::pos2(rect.left() + 38.0, center_y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(15.0),
+                    text_color,
+                );
+            }
+            None => {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(15.0),
+                    text_color,
+                );
+            }
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        resp.clicked()
+    }
 }
 
 // ---------- 共用 UI 小工具 ----------
 
-fn card<R>(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+fn card<R>(ui: &mut egui::Ui, pal: theme::Palette, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::default()
-        .fill(egui::Color32::WHITE)
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0xd8, 0xe4, 0xd8)))
+        .fill(pal.card)
+        .stroke(egui::Stroke::new(1.0, pal.border))
         .corner_radius(10.0)
         .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(title).strong().color(GREEN).size(17.0));
+            ui.label(egui::RichText::new(title).strong().color(pal.primary).size(17.0));
             ui.add_space(6.0);
             body(ui)
         })
@@ -794,10 +935,12 @@ fn status_dot(color: egui::Color32) -> egui::RichText {
     egui::RichText::new("●").color(color).size(16.0)
 }
 
-const COLOR_OK: egui::Color32 = egui::Color32::from_rgb(0x1d, 0xa4, 0x57);
-const COLOR_WARN: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x8a, 0x00);
-const COLOR_BAD: egui::Color32 = egui::Color32::from_rgb(0xc0, 0x39, 0x2b);
-const COLOR_IDLE: egui::Color32 = egui::Color32::from_rgb(0x95, 0x9a, 0x9d);
+/// 主要動作按鈕 (每頁的主 CTA): 主題主色實心 + 白字; 次要動作維持預設描邊按鈕,
+/// 讓畫面有主次之分 (設計稿: 主要按鈕 = 主色)。
+fn primary_btn(ui: &mut egui::Ui, pal: theme::Palette, label: &str) -> egui::Response {
+    let text = egui::RichText::new(label).color(egui::Color32::WHITE);
+    ui.add(egui::Button::new(text).fill(pal.primary))
+}
 
 // ---------- eframe 主迴圈 ----------
 
@@ -885,41 +1028,29 @@ impl eframe::App for App {
         self.poll_async_results(ctx);
         self.sync_tray_status();
 
-        // 左側導覽
+        // 左側導覽 (Frame 底色換成 palette.sidebar, 與主背景分出一階;
+        // 內距比照 egui 預設 side panel (8, 2), 版面尺寸不變)
         egui::Panel::left("nav")
             .resizable(false)
             .exact_size(168.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(self.palette.sidebar)
+                    .inner_margin(egui::Margin::symmetric(8, 2)),
+            )
             .show(ui, |ui| {
                 ui.add_space(10.0);
                 ui.vertical_centered(|ui| {
                     if let Some(tex) = self.display_avatar() {
                         ui.image((tex.id(), egui::vec2(72.0, 72.0)));
                     }
-                    ui.label(egui::RichText::new("AI寶").strong().size(20.0).color(GREEN));
+                    ui.label(egui::RichText::new("AI寶").strong().size(20.0).color(self.palette.primary));
                     ui.label(egui::RichText::new("LINE 學習小幫手").size(12.0).weak());
                 });
                 ui.add_space(12.0);
-                let items: [(Page, &str); 9] = [
-                    (Page::Overview, "總覽"),
-                    (Page::LineLogin, "LINE 登入"),
-                    (Page::AiSettings, "AI 設定"),
-                    (Page::BotSettings, "機器人與觸發"),
-                    (Page::KbSettings, "知識庫"),
-                    (Page::ScamSettings, "防詐騙"),
-                    (Page::Logs, "紀錄"),
-                    (Page::AppSettings, "程式設定"),
-                    (Page::About, "關於"),
-                ];
-                for (page, label) in items {
-                    let selected = self.page == page;
-                    let text = egui::RichText::new(label)
-                        .size(15.0)
-                        .color(if selected { egui::Color32::WHITE } else { egui::Color32::from_rgb(0x33, 0x33, 0x33) });
-                    let btn = egui::Button::new(text)
-                        .fill(if selected { GREEN } else { egui::Color32::TRANSPARENT })
-                        .stroke(egui::Stroke::NONE);
-                    let resp = ui.add_sized([152.0, 34.0], btn);
-                    if resp.clicked() {
+                for idx in 0..NAV_PAGES.len() {
+                    let (page, label) = NAV_PAGES[idx];
+                    if self.nav_item(ui, idx, page, label) {
                         self.page = page;
                         if page == Page::BotSettings {
                             refresh_line_cfg_status(self);
@@ -928,7 +1059,7 @@ impl eframe::App for App {
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     if ui
-                        .button(egui::RichText::new("結束服務並關閉程式").color(COLOR_BAD))
+                        .button(egui::RichText::new("結束服務並關閉程式").color(self.palette.bad))
                         .on_hover_text("真的停止服務並關閉 AI寶 (會先跳確認)")
                         .clicked()
                     {
@@ -945,7 +1076,7 @@ impl eframe::App for App {
         // 頁尾: 版權宣告 (每一頁都要在, 規格書固定要求)
         egui::Panel::bottom("footer").show(ui, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.label(egui::RichText::new(COPYRIGHT).size(12.5).color(GREEN));
+                ui.label(egui::RichText::new(COPYRIGHT).size(12.5).color(self.palette.primary));
                 ui.separator();
                 ui.label(egui::RichText::new(UPSTREAM_CREDIT).size(12.5).weak());
             });
@@ -983,7 +1114,7 @@ impl eframe::App for App {
                             self.confirm_quit = false;
                         }
                         if ui
-                            .button(egui::RichText::new("結束服務並關閉程式").color(COLOR_BAD).strong())
+                            .button(egui::RichText::new("結束服務並關閉程式").color(self.palette.bad).strong())
                             .clicked()
                         {
                             self.begin_quit(ctx);
@@ -1005,7 +1136,7 @@ impl eframe::App for App {
                         if ui.button("取消").clicked() {
                             self.confirm_logout = false;
                         }
-                        if ui.button(egui::RichText::new("確定登出").color(COLOR_BAD)).clicked() {
+                        if ui.button(egui::RichText::new("確定登出").color(self.palette.bad)).clicked() {
                             self.confirm_logout = false;
                             let _ = self.login_tx.send(WsCommand::Logout);
                         }
@@ -1493,7 +1624,7 @@ impl App {
         let status = self.helper_status();
         ui.heading("總覽");
         ui.add_space(8.0);
-        card(ui, "服務狀態", |ui| {
+        card(ui, self.palette, "服務狀態", |ui| {
             ui.horizontal(|ui| {
                 if let Some(tex) = self.display_avatar() {
                     ui.image((tex.id(), egui::vec2(84.0, 84.0)));
@@ -1505,19 +1636,19 @@ impl App {
                     // 不得照舊顯示綠燈 (2026-10-20 實機: 引擎異常停止, 總覽卻顯示 LINE 已登入, 畫面全綠實際已死)。
                     let engine_ok = matches!(self.engine_snap.state, EngineState::Running | EngineState::ExternalRunning);
                     let engine_starting = matches!(self.engine_snap.state, EngineState::Starting);
-                    ui.label(egui::RichText::new(bot_name).size(22.0).strong().color(GREEN));
+                    ui.label(egui::RichText::new(bot_name).size(22.0).strong().color(self.palette.primary));
                     ui.horizontal(|ui| {
                         ui.label(status_dot(match self.engine_snap.state {
-                            EngineState::Running | EngineState::ExternalRunning => COLOR_OK,
-                            EngineState::Starting => COLOR_WARN,
-                            _ => COLOR_BAD,
+                            EngineState::Running | EngineState::ExternalRunning => self.palette.ok,
+                            EngineState::Starting => self.palette.warn,
+                            _ => self.palette.bad,
                         }));
                         ui.label(format!("引擎: {}", self.engine_snap.label));
                     });
                     // LINE 登入狀態 (核心 session): 只有引擎真的在跑時, 登入快照才可信
                     ui.horizontal(|ui| {
                         if !engine_ok {
-                            ui.label(status_dot(COLOR_IDLE));
+                            ui.label(status_dot(self.palette.idle));
                             ui.label(if engine_starting {
                                 "LINE: 引擎啟動中, 登入狀態尚未取得".to_string()
                             } else {
@@ -1525,10 +1656,10 @@ impl App {
                             });
                         } else {
                             ui.label(status_dot(match login.auth {
-                                AuthState::Ready => COLOR_OK,
-                                AuthState::Authenticating | AuthState::Restoring => COLOR_WARN,
-                                AuthState::Error => COLOR_BAD,
-                                _ => COLOR_IDLE,
+                                AuthState::Ready => self.palette.ok,
+                                AuthState::Authenticating | AuthState::Restoring => self.palette.warn,
+                                AuthState::Error => self.palette.bad,
+                                _ => self.palette.idle,
                             }));
                             ui.label(match login.auth {
                                 AuthState::Ready => format!(
@@ -1546,7 +1677,7 @@ impl App {
                     // 登入還在不代表機器人有連上 (換 Token 被踢線時就是登入在、機器人斷), 兩件事要分得出來。
                     ui.horizontal(|ui| {
                         if !engine_ok {
-                            ui.label(status_dot(COLOR_IDLE));
+                            ui.label(status_dot(self.palette.idle));
                             ui.label("機器人: 未連線 (引擎未執行)".to_string());
                         } else if bot.is_object() {
                             let bc = bot
@@ -1555,7 +1686,7 @@ impl App {
                                 .or_else(|| bot.get("connected").and_then(|v| v.as_bool()))
                                 .unwrap_or(false);
                             let line_state = bot.get("lineState").and_then(|v| v.as_str()).unwrap_or("");
-                            ui.label(status_dot(if bc { COLOR_OK } else { COLOR_WARN }));
+                            ui.label(status_dot(if bc { self.palette.ok } else { self.palette.warn }));
                             ui.label(if bc {
                                 "機器人: 已連線 (會回應群組訊息)".to_string()
                             } else if line_state == "未設定 Token" {
@@ -1564,7 +1695,7 @@ impl App {
                                 "機器人: 未連線, 會自動重試連線; 一直沒連上請重新啟動引擎".to_string()
                             });
                         } else {
-                            ui.label(status_dot(COLOR_IDLE));
+                            ui.label(status_dot(self.palette.idle));
                             ui.label("機器人: 狀態尚未取得…".to_string());
                         }
                     });
@@ -1592,7 +1723,7 @@ impl App {
                     self.restart_engine();
                 }
                 let repairing = self.busy.get("repair").copied().unwrap_or(false);
-                if ui.button(if repairing { "修復中…" } else { "一鍵修復" }).clicked() && !repairing {
+                if primary_btn(ui, self.palette, if repairing { "修復中…" } else { "一鍵修復" }).clicked() && !repairing {
                     self.start_repair(&ctx);
                 }
                 if ui.button("開啟 LINE 登入頁").clicked() {
@@ -1607,11 +1738,11 @@ impl App {
                 }
             }
             if let EngineState::Failed(msg) = &self.engine_snap.state {
-                ui.label(egui::RichText::new(format!("引擎異常: {msg}")).color(COLOR_BAD));
+                ui.label(egui::RichText::new(format!("引擎異常: {msg}")).color(self.palette.bad));
             }
         });
         ui.add_space(10.0);
-        card(ui, "使用方式", |ui| {
+        card(ui, self.palette, "使用方式", |ui| {
             ui.label("1. 在「LINE 登入」頁用次要帳號掃描 QR 碼登入 (只需要做一次)。");
             ui.label("2. 在「AI 設定」頁貼上 API Key、選好模型, 按儲存。");
             ui.label("3. 在「機器人與觸發」頁完成 LINE 開通 (白名單 + Token)。");
@@ -1624,7 +1755,7 @@ impl App {
         ui.add_space(8.0);
         let login = self.login_snapshot();
         if self.engine_unavailable() {
-            card(ui, "引擎尚未就緒", |ui| {
+            card(ui, self.palette, "引擎尚未就緒", |ui| {
                 ui.label(format!("目前引擎狀態: {}", self.engine_snap.label));
                 ui.label("引擎還沒啟動完成, 登入功能要等引擎就緒才能使用。");
                 if ui.button("重新啟動引擎").clicked() {
@@ -1635,9 +1766,9 @@ impl App {
         }
         match login.auth {
             AuthState::Ready => {
-                card(ui, "已登入", |ui| {
+                card(ui, self.palette, "已登入", |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(status_dot(COLOR_OK));
+                        ui.label(status_dot(self.palette.ok));
                         ui.label(
                             egui::RichText::new(format!(
                                 "已登入: {}",
@@ -1654,11 +1785,11 @@ impl App {
                 });
             }
             AuthState::Authenticating => {
-                card(ui, "登入中", |ui| {
+                card(ui, self.palette, "登入中", |ui| {
                     ui.label("請用次要帳號的 LINE, 依下面步驟完成登入:");
                     ui.label("第 1 步: 用手機 LINE 掃描這張 QR 碼 (LINE App 的「加入好友 → 行動條碼」)。");
                     if let Some(url) = &login.qr_url {
-                        draw_qr(ui, url, 240.0);
+                        draw_qr(ui, self.palette, url, 240.0);
                     } else {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -1668,12 +1799,12 @@ impl App {
                     ui.add_space(6.0);
                     ui.label("第 2 步: 掃描後, 手機會要你輸入一組 PIN 碼, 就是這一組:");
                     if let Some(pin) = &login.pin {
-                        ui.label(egui::RichText::new(pin.clone()).size(44.0).strong().color(GREEN));
+                        ui.label(egui::RichText::new(pin.clone()).size(44.0).strong().color(self.palette.primary));
                     } else {
                         ui.label(egui::RichText::new("等待產生…").size(24.0).weak());
                     }
                     if let Some(err) = &login.last_error {
-                        ui.label(egui::RichText::new(err.clone()).color(COLOR_BAD));
+                        ui.label(egui::RichText::new(err.clone()).color(self.palette.bad));
                         if ui.button("重新產生").clicked() {
                             let _ = self.login_tx.send(WsCommand::StartLogin);
                         }
@@ -1682,7 +1813,7 @@ impl App {
                 });
             }
             AuthState::Restoring => {
-                card(ui, "恢復登入中", |ui| {
+                card(ui, self.palette, "恢復登入中", |ui| {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("正在用上次保存的登入狀態自動登入, 請稍候…");
@@ -1690,7 +1821,7 @@ impl App {
                 });
             }
             _ => {
-                card(ui, "尚未登入", |ui| {
+                card(ui, self.palette, "尚未登入", |ui| {
                     if !login.connected {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -1698,12 +1829,12 @@ impl App {
                         });
                     }
                     ui.label("按下開始登入後, 這裡會出現 QR 碼, 用次要帳號的手機 LINE 掃描即可。");
-                    ui.label(egui::RichText::new("重要: 請用次要帳號, 不要用主帳號登入。").color(COLOR_WARN).strong());
+                    ui.label(egui::RichText::new("重要: 請用次要帳號, 不要用主帳號登入。").color(self.palette.warn_text).strong());
                     if let Some(err) = &login.last_error {
-                        ui.label(egui::RichText::new(err.clone()).color(COLOR_BAD));
+                        ui.label(egui::RichText::new(err.clone()).color(self.palette.bad));
                     }
                     ui.add_space(6.0);
-                    if ui.button(egui::RichText::new("開始登入").size(18.0)).clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new("開始登入").size(18.0).color(egui::Color32::WHITE)).fill(self.palette.primary)).clicked() {
                         let _ = self.login_tx.send(WsCommand::StartLogin);
                     }
                 });
@@ -1721,7 +1852,7 @@ impl App {
         for pid in pids {
             let is_active = self.form.ai_active == pid;
             let label = self.form.providers.get(&pid).map(|p| p.label.clone()).unwrap_or_else(|| pid.clone());
-            card(ui, &format!("{label}{}", if is_active { " (使用中)" } else { "" }), |ui| {
+            card(ui, self.palette, &format!("{label}{}", if is_active { " (使用中)" } else { "" }), |ui| {
                 let p = match self.form.providers.get_mut(&pid) {
                     Some(p) => p,
                     None => return,
@@ -1806,7 +1937,7 @@ impl App {
         }
         ui.horizontal(|ui| {
             let saving = self.busy.get("save").copied().unwrap_or(false);
-            if ui.button(egui::RichText::new(if saving { "儲存中…" } else { "儲存全部設定" }).size(17.0).strong()).clicked() {
+            if ui.add(egui::Button::new(egui::RichText::new(if saving { "儲存中…" } else { "儲存全部設定" }).size(17.0).strong().color(egui::Color32::WHITE)).fill(self.palette.primary)).clicked() {
                 self.save_settings(&ctx);
             }
             if let Some(m) = &self.form.save_msg {
@@ -1817,11 +1948,12 @@ impl App {
 }
 
 /// 把 QR URL 字串在本機畫成 QR 圖 (內容不上傳任何服務, 比照上游 CLI 以 qrcode 套件本機產生)。
-fn draw_qr(ui: &mut egui::Ui, content: &str, size: f32) {
+/// QR 本體固定黑/白 (掃描對比是功能必需, 不隨主題變); 只有失敗提示文字吃主題色。
+fn draw_qr(ui: &mut egui::Ui, pal: theme::Palette, content: &str, size: f32) {
     let code = match qrcode::QrCode::new(content.as_bytes()) {
         Ok(c) => c,
         Err(_) => {
-            ui.label(egui::RichText::new("QR 碼產生失敗, 請按重新產生").color(COLOR_BAD));
+            ui.label(egui::RichText::new("QR 碼產生失敗, 請按重新產生").color(pal.bad));
             return;
         }
     };
@@ -1850,7 +1982,7 @@ impl App {
         ui.heading("機器人與觸發");
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
-        card(ui, "機器人名字與觸發規則", |ui| {
+        card(ui, self.palette, "機器人名字與觸發規則", |ui| {
             ui.horizontal(|ui| {
                 ui.label("機器人主名 (在群組裡叫這個名字, 我就會回應):");
                 ui.add(egui::TextEdit::singleline(&mut self.form.bot_name).desired_width(200.0));
@@ -1879,7 +2011,7 @@ impl App {
             });
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
-                if ui.button(if saving { "儲存中…" } else { "儲存設定" }).clicked() {
+                if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存設定" }).clicked() {
                     self.save_settings(&ctx);
                 }
                 if let Some(m) = &self.form.save_msg {
@@ -1888,7 +2020,7 @@ impl App {
             });
         });
         ui.add_space(10.0);
-        card(ui, "機器人身分 (別人問我的身世時, 我照這裡回答)", |ui| {
+        card(ui, self.palette, "機器人身分 (別人問我的身世時, 我照這裡回答)", |ui| {
             ui.label(egui::RichText::new("這些是機器人的個人資料: 群組裡有人問我的年紀、生日、星座、興趣等等, 我會照這裡填的回答; 沒填的我會老實說還沒設定, 不會亂編。年紀不用填, 我會自己用出生日算。").weak());
             let mut row = |ui: &mut egui::Ui, label: &str, field: &mut String, hint: &str, width: f32| {
                 ui.horizontal(|ui| {
@@ -1911,7 +2043,7 @@ impl App {
             });
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
-                if ui.button(if saving { "儲存中…" } else { "儲存身分設定" }).clicked() {
+                if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存身分設定" }).clicked() {
                     self.save_settings(&ctx);
                 }
                 if let Some(m) = &self.form.save_msg {
@@ -1920,7 +2052,7 @@ impl App {
             });
         });
         ui.add_space(10.0);
-        card(ui, "LINE 開通 (讓機器人能在群組說話)", |ui| {
+        card(ui, self.palette, "LINE 開通 (讓機器人能在群組說話)", |ui| {
             // 步驟一: 白名單 (用選的: 先讀群組清單, 再點選加入; 貼 ID 降為進階)
             let cfg = self.line_cfg_status.lock().unwrap().clone();
             ui.label(egui::RichText::new("步驟一: 把目標群組加入白名單").strong());
@@ -1961,7 +2093,7 @@ impl App {
                         text += ")";
                         ui.label(text);
                         if whitelisted {
-                            ui.label(egui::RichText::new("已在白名單").color(COLOR_OK));
+                            ui.label(egui::RichText::new("已在白名單").color(self.palette.ok_text));
                         } else if ui.add_enabled(!busy_apply_now, egui::Button::new("加入白名單")).clicked() {
                             self.start_apply(&ctx, id.clone());
                         }
@@ -2038,7 +2170,7 @@ impl App {
                 "目前 Token: 尚未設定".to_string()
             });
             let busy_token = self.busy.get("token").copied().unwrap_or(false);
-            if ui.button(if busy_token { "產生中…" } else { "自動產生 Token 並儲存" }).clicked() && !busy_token {
+            if primary_btn(ui, self.palette, if busy_token { "產生中…" } else { "自動產生 Token 並儲存" }).clicked() && !busy_token {
                 self.busy.insert("token".into(), true);
                 let slot = self.token_slot.clone();
                 let ctx2 = ctx.clone();
@@ -2062,7 +2194,7 @@ impl App {
         ui.heading("知識庫");
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
-        card(ui, "知識庫資料夾", |ui| {
+        card(ui, self.palette, "知識庫資料夾", |ui| {
             ui.label("指定一個資料夾, AI寶 會讀取裡面的 .txt / .md / .csv 回答公司問題。資料夾內容請先自行脫敏。");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.form.show_sources, "回答時附上參考來源");
@@ -2092,14 +2224,14 @@ impl App {
                             egui::RichText::new(format!(
                                 "提醒: 這個資料夾有 {files} 個文件檔案, 數量很多, 每次掃描都會花比較久。建議另外建一個只放要給 AI 參考文件的專用資料夾, 會快很多。"
                             ))
-                            .color(COLOR_WARN),
+                            .color(self.palette.warn_text),
                         );
                     }
                 }
             }
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
-                if ui.button("儲存知識庫設定").clicked() && !saving {
+                if primary_btn(ui, self.palette, "儲存知識庫設定").clicked() && !saving {
                     self.save_settings(&ctx);
                 }
                 let busy = self.busy.get("reindex").copied().unwrap_or(false);
@@ -2127,7 +2259,7 @@ impl App {
         ui.heading("防詐騙");
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
-        card(ui, "詐騙訊息判讀", |ui| {
+        card(ui, self.palette, "詐騙訊息判讀", |ui| {
             ui.checkbox(&mut self.form.scam_enabled, "啟用防詐騙判讀");
             ui.horizontal(|ui| {
                 ui.label("判讀門檻 (0~1, 越高越嚴格):");
@@ -2146,7 +2278,7 @@ impl App {
             });
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
-                if ui.button(if saving { "儲存中…" } else { "儲存設定" }).clicked() {
+                if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存設定" }).clicked() {
                     self.save_settings(&ctx);
                 }
                 if let Some(m) = &self.form.save_msg {
@@ -2160,7 +2292,7 @@ impl App {
         ui.heading("紀錄");
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
-        card(ui, "今日紀錄", |ui| {
+        card(ui, self.palette, "今日紀錄", |ui| {
             ui.horizontal(|ui| {
                 let busy = self.busy.get("logs").copied().unwrap_or(false);
                 if ui.button(if busy { "讀取中…" } else { "重新讀取" }).clicked() && !busy {
@@ -2231,7 +2363,7 @@ impl App {
     fn page_app_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("程式設定");
         ui.add_space(8.0);
-        card(ui, "啟動行為", |ui| {
+        card(ui, self.palette, "啟動行為", |ui| {
             // 自啟動開關: 以登錄實際值為準 (Windows); 非 Windows 停用
             #[cfg(windows)]
             {
@@ -2265,7 +2397,7 @@ impl App {
                     ui.label(egui::RichText::new(format!("目前登錄: {cur}")).size(12.0).weak());
                 }
                 if let Some(m) = self.page_msg.get("autostart") {
-                    ui.label(egui::RichText::new(m.clone()).color(COLOR_BAD));
+                    ui.label(egui::RichText::new(m.clone()).color(self.palette.bad));
                 }
             }
             #[cfg(not(windows))]
@@ -2280,7 +2412,46 @@ impl App {
             }
         });
         ui.add_space(10.0);
-        card(ui, "資料與結束", |ui| {
+        card(ui, self.palette, "介面主題", |ui| {
+            ui.label("挑一個喜歡的配色, 點下去馬上生效, 不用重新啟動程式; 下次打開也會記得你的選擇。");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                for id in theme::ThemeId::ALL {
+                    let p = id.palette();
+                    let selected = id == self.theme_id;
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(88.0, 62.0), egui::Sense::click());
+                    let painter = ui.painter();
+                    if selected {
+                        painter.rect_filled(rect.shrink(1.0), 8.0, theme::with_alpha(p.primary, 22));
+                        painter.rect_stroke(rect, 8.0, egui::Stroke::new(2.0, p.primary), egui::StrokeKind::Inside);
+                    } else if resp.hovered() {
+                        painter.rect_stroke(rect, 8.0, egui::Stroke::new(1.0, self.palette.border), egui::StrokeKind::Inside);
+                    }
+                    // 色票圓: 主色大圓 + 右下點綴色小圓 (黑白主題的點綴是灰階, 一樣畫得出來)
+                    let center = egui::pos2(rect.center().x, rect.top() + 21.0);
+                    painter.circle_filled(center, 13.0, p.primary);
+                    painter.circle_stroke(center, 13.0, egui::Stroke::new(1.0, self.palette.border));
+                    let dot = egui::pos2(center.x + 10.0, center.y + 9.0);
+                    painter.circle_filled(dot, 6.5, p.accent);
+                    painter.circle_stroke(dot, 6.5, egui::Stroke::new(1.0, self.palette.border));
+                    painter.text(
+                        egui::pos2(rect.center().x, rect.bottom() - 11.0),
+                        egui::Align2::CENTER_CENTER,
+                        id.label(),
+                        egui::FontId::proportional(13.5),
+                        if selected { p.primary } else { self.palette.text_main },
+                    );
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        self.set_theme(ctx, id);
+                    }
+                }
+            });
+        });
+        ui.add_space(10.0);
+        card(ui, self.palette, "資料與結束", |ui| {
             ui.label(format!("資料目錄: {}", shell::data_dir().display()));
             ui.horizontal(|ui| {
                 if ui.button("開啟資料目錄").clicked() {
@@ -2292,7 +2463,7 @@ impl App {
             });
             ui.add_space(6.0);
             ui.label("要真的結束 AI寶 (停止回覆群組訊息), 請按下面這個按鈕; 平常關視窗只是縮到系統匣, 服務會繼續。");
-            if ui.button(egui::RichText::new("結束服務並關閉程式").color(COLOR_BAD).strong()).clicked() {
+            if ui.button(egui::RichText::new("結束服務並關閉程式").color(self.palette.bad).strong()).clicked() {
                 self.confirm_quit = true;
             }
             let _ = ctx;
@@ -2302,7 +2473,7 @@ impl App {
     fn page_about(&mut self, ui: &mut egui::Ui) {
         ui.heading("關於 AI寶");
         ui.add_space(8.0);
-        card(ui, "AI寶 — 華葳集成 LINE 學習小幫手", |ui| {
+        card(ui, self.palette, "AI寶 — 華葳集成 LINE 學習小幫手", |ui| {
             ui.horizontal(|ui| {
                 if let Some(tex) = &self.avatar_tex {
                     ui.image((tex.id(), egui::vec2(96.0, 96.0)));
@@ -2318,7 +2489,7 @@ impl App {
                 });
             });
             ui.add_space(8.0);
-            ui.label(egui::RichText::new(COPYRIGHT).size(16.0).strong().color(GREEN));
+            ui.label(egui::RichText::new(COPYRIGHT).size(16.0).strong().color(self.palette.primary));
             ui.label(UPSTREAM_CREDIT);
             ui.add_space(6.0);
             ui.label("機密保存方式: API Key 存放在 Windows 認證管理員; LINE 登入狀態以 DPAPI 加密後存放在本機資料目錄, 只綁這台電腦的這個使用者帳號。");
