@@ -109,6 +109,7 @@ jobs:
           if ($result -notmatch 'helper_list_models_route=ok') { throw '探針未確認 /api/list-models 路由存在 (實機曾發生 404)' }
           if ($result -notmatch 'helper_test_ai_route=ok') { throw '探針未確認 /api/test-ai 路由存在且邏輯有跑' }
           if ($result -notmatch 'helper_line_chats_route=ok') { throw '探針未確認 /api/line/chats 路由存在且未登入定案正確' }
+          if ($result -notmatch 'helper_line_whitelist_route=ok') { throw '探針未確認 /api/line/whitelist 路由存在且回逐筆清單' }
           if ($result -notmatch 'helper_status_identity=True') { throw '探針未確認 helper 身分標記' }
 
       - name: GUI 冒煙 — 啟動、截圖、結束序列
@@ -301,28 +302,34 @@ jobs:
           Build-EngineAt '4a54c35f92d05540745522e27cd3b47b0889e9de' 'gen0-engine.exe'
           # gen-1: 第一代殼世代的引擎 payload (1314fb3)
           Build-EngineAt '1314fb3259d950d133d0b1bba642b7a168f33323' 'gen1-engine.exe'
-          # gen-2 殼: 第二代 App 本體 (8ca33d1), 內嵌它自己的引擎
-          git checkout '8ca33d15ea3be900d774e21e90a3c6f0a1fc87ab'
-          if ($LASTEXITCODE -ne 0) { throw 'checkout gen-2 ref 失敗' }
-          npm ci --include=dev
-          npm run build
-          Push-Location helper
-          npm ci
-          Pop-Location
-          Push-Location pack
-          npm ci
-          Remove-Item -Recurse -Force out -ErrorAction SilentlyContinue
-          node build.mjs --target win --skip-core-build
-          Pop-Location
-          New-Item -ItemType Directory -Force app/payload | Out-Null
-          Copy-Item 'pack/out/AI寶.exe' app/payload/engine.exe
-          Push-Location app
-          cargo build --release
-          Pop-Location
-          $appBuilt = Join-Path $pwd 'app/target/release/aibao-app.exe'
-          if (-not (Test-Path $appBuilt)) { throw 'gen-2 殼建置未產出 exe' }
-          Copy-Item $appBuilt (Join-Path $legacy 'app-gen2.exe')
-          Write-Host "app-gen2.exe built: $((Get-Item (Join-Path $legacy 'app-gen2.exe')).Length) bytes"
+          # gen-2 / gen-3 殼: 歷史 App 本體 (各自內嵌當代引擎)。
+          # gen-2 = 8ca33d1 (被實機抓到「結束沒清掉服務」的那代);
+          # gen-3 = a27b76c (引用續答版, 本批「探測跨界誤判 Foreign」修前的最後一版, 情境 D 紅燈用)。
+          function Build-AppAt([string]$ref, [string]$outName) {
+            git checkout $ref
+            if ($LASTEXITCODE -ne 0) { throw "checkout $ref 失敗" }
+            npm ci --include=dev
+            npm run build
+            Push-Location helper
+            npm ci
+            Pop-Location
+            Push-Location pack
+            npm ci
+            Remove-Item -Recurse -Force out -ErrorAction SilentlyContinue
+            node build.mjs --target win --skip-core-build
+            Pop-Location
+            New-Item -ItemType Directory -Force app/payload | Out-Null
+            Copy-Item 'pack/out/AI寶.exe' app/payload/engine.exe
+            Push-Location app
+            cargo build --release
+            Pop-Location
+            $appBuilt = Join-Path $pwd 'app/target/release/aibao-app.exe'
+            if (-not (Test-Path $appBuilt)) { throw "$ref 殼建置未產出 exe" }
+            Copy-Item $appBuilt (Join-Path $legacy $outName)
+            Write-Host "$outName built: $((Get-Item (Join-Path $legacy $outName)).Length) bytes"
+          }
+          Build-AppAt '8ca33d15ea3be900d774e21e90a3c6f0a1fc87ab' 'app-gen2.exe'
+          Build-AppAt 'a27b76c3062b0f91107423c5761a86dbd42bbcc4' 'app-gen3.exe'
 
       - name: 上傳舊世代產物
         uses: actions/upload-artifact@v4
@@ -332,6 +339,7 @@ jobs:
             ${{ runner.temp }}/legacy/gen0-engine.exe
             ${{ runner.temp }}/legacy/gen1-engine.exe
             ${{ runner.temp }}/legacy/app-gen2.exe
+            ${{ runner.temp }}/legacy/app-gen3.exe
           retention-days: 1
 
   # 結束殘留情境 (2026-10-20 老吳實機「關掉 App 服務還在」的加嚴驗證):
@@ -362,6 +370,7 @@ jobs:
           $gen0 = (Resolve-Path 'dl-legacy/gen0-engine.exe').Path
           $gen1 = (Resolve-Path 'dl-legacy/gen1-engine.exe').Path
           $gen2 = (Resolve-Path 'dl-legacy/app-gen2.exe').Path
+          $gen3 = (Resolve-Path 'dl-legacy/app-gen3.exe').Path
           $ev = Join-Path $pwd 'legacy-evidence'
           New-Item -ItemType Directory -Force $ev | Out-Null
 
@@ -457,7 +466,108 @@ jobs:
           @("scenario=c_new_shell_vs_gen1_residue", "app_exited=$exitedC", "ports_free=$freeC", "gen1_pids_left=$gen1Left") | Write-Host
           if (-not ($exitedC -and $freeC -and $gen1Left -eq 0)) { throw '情境C: 新殼未把 gen-1 殘留清乾淨' }
           Write-Host '情境C: 通過'
-          Write-Host '殘留情境三組全數完成'
+
+          # ---------- 情境 (d): 探測跨界 — helper 回應不完整 (模擬 KB 掃描堵塞事件迴圈) ----------
+          # 2026-10-20 老吳實機定案之三: 自家 stack 正常服務, 殼卻判 Foreign 鎖死異常停止。
+          # 機制: 舊 classify 對「body 讀不到 (逾時) 但 status 探得到」直接判 Foreign, 而 helper 被
+          # 知識庫掃描堵塞時, 一次探測正好跨在堵塞結束前後就會命中; 之後 Failed 永不重探、鎖死。
+          # stub: 3789 立刻回正常 HTML; 3790 前 7 秒只送 HTTP 標頭 + 部分 body 就 hold 住連線
+          # (讀 body 必逾時、status 探測卻成功 — 正是跨界形狀), 7 秒後改回完整正確的身分 JSON。
+          # (d-red) 舊殼 (gen-3, 修前版): 預期被判 Foreign 並在 shell.log 留下鎖死紀錄 (紅燈重現)。
+          # (d-green) 新殼: 預期探測顯示「身分未定」並重試, 身分確認後接手 (ExternalRunning),
+          #           不得出現 Foreign 定案; 之後 --quit 要能把 stub (模擬自家 stack) 清掉並結束。
+          $stubD = Join-Path $pwd 'flap-stub.ps1'
+          @'
+          $l1 = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Parse("127.0.0.1")), 3789
+          $l2 = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Parse("127.0.0.1")), 3790
+          $l1.Start(); $l2.Start()
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $html = "<!doctype html><html><head><title>LINE.js</title></head><body>stub core</body></html>"
+          $json = '{"service":"aibao-helper","version":"stub","capabilities":["list-models","line-config","token-gen"],"bot":{"connected":false,"botConnected":false,"lineState":"stub"}}'
+          $held = New-Object System.Collections.ArrayList
+          function Send-Full($client, $body, $ctype) {
+            try {
+              $s = $client.GetStream()
+              try { $buf = New-Object byte[] 4096; $client.ReceiveTimeout = 200; $null = $s.Read($buf, 0, $buf.Length) } catch { }
+              $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+              $head = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`nContent-Type: $ctype`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n")
+              $s.Write($head, 0, $head.Length); $s.Write($bytes, 0, $bytes.Length); $s.Flush()
+            } catch { }
+            try { $client.Close() } catch { }
+          }
+          function Send-Partial($client) {
+            try {
+              $s = $client.GetStream()
+              try { $buf = New-Object byte[] 4096; $client.ReceiveTimeout = 200; $null = $s.Read($buf, 0, $buf.Length) } catch { }
+              $part = [Text.Encoding]::UTF8.GetBytes('{"service":"aibao-helper","vers')
+              $head = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: 500`r`n`r`n")
+              $s.Write($head, 0, $head.Length); $s.Write($part, 0, $part.Length); $s.Flush()
+              $null = $held.Add($client)
+            } catch { }
+          }
+          while ($true) {
+            if ($l1.Pending()) { Send-Full ($l1.AcceptTcpClient()) $html "text/html; charset=utf-8" }
+            if ($l2.Pending()) {
+              $c = $l2.AcceptTcpClient()
+              if ($sw.Elapsed.TotalSeconds -lt 7) { Send-Partial $c } else { Send-Full $c $json "application/json" }
+            }
+            if ($sw.Elapsed.TotalSeconds -ge 7) { foreach ($h in @($held)) { try { $h.Close() } catch { } }; $held.Clear() }
+            Start-Sleep -Milliseconds 100
+          }
+          '@ | Set-Content $stubD -Encoding UTF8
+
+          Write-Host '=== 情境 (d-red): 探測跨界 × 舊殼 (gen-3) — 預期誤判 Foreign 鎖死 (紅燈重現) ==='
+          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'scenDred-data'
+          $stubProcD = Start-Process pwsh -ArgumentList '-File', $stubD -PassThru
+          Start-Sleep -Seconds 2
+          $appDred = Start-Process $gen3 -PassThru
+          $logDred = Join-Path $env:HWLINEHELPER_HOME 'logs\shell.log'
+          $lockedD = $false
+          foreach ($i in 1..20) {
+            Start-Sleep -Seconds 2
+            if ((Test-Path $logDred) -and ((Get-Content $logDred -Raw) -match '不明程式佔用')) { $lockedD = $true; break }
+          }
+          @("scenario=d_old_shell_probe_straddle", "foreign_locked=$lockedD") | Set-Content (Join-Path $ev 'legacy-d-red.txt')
+          @("scenario=d_old_shell_probe_straddle", "foreign_locked=$lockedD") | Write-Host
+          if (-not $lockedD) { throw '情境D-red: 紅燈重現失敗 — 舊殼在探測跨界下應誤判 Foreign 鎖死; 若未發生代表前提改變, 需人工複查' }
+          Write-Host '情境D-red: 紅燈重現成立 (舊殼誤判 Foreign) — 清場'
+          Kill-Image $gen3
+          if ($stubProcD -and -not $stubProcD.HasExited) { Stop-Process -Id $stubProcD.Id -Force }
+          Start-Sleep -Seconds 2
+          if (-not (Wait-PortsFree 60)) { throw '情境D-red: 清場後埠未釋放' }
+
+          Write-Host '=== 情境 (d-green): 探測跨界 × 新殼 (--autostart 冷開機路徑) — 預期身分未定重試後接手, 不得判 Foreign ==='
+          # 用 --autostart 啟動: 開機自啟動是老吳追加的正式驗收項; --autostart 與雙擊共用同一套
+          # 引擎啟動/探測邏輯 (main.rs App::new 無條件呼叫 mgr.start(), --autostart 只改視窗隱藏),
+          # 在此以自啟動路徑覆蓋「開機時系統忙碌、helper 回應慢」的冷開機時序。
+          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'scenD-data'
+          $stubProcD2 = Start-Process pwsh -ArgumentList '-File', $stubD -PassThru
+          Start-Sleep -Seconds 2
+          $appD = Start-Process $newApp -ArgumentList '--autostart' -PassThru
+          $logD = Join-Path $env:HWLINEHELPER_HOME 'logs\shell.log'
+          $adoptedD = $false; $flapSeenD = $false
+          foreach ($i in 1..45) {
+            Start-Sleep -Seconds 2
+            if (Test-Path $logD) {
+              $txt = Get-Content $logD -Raw
+              if ($txt -match '身分未定') { $flapSeenD = $true }
+              if ($txt -match '接手顯示狀態') { $adoptedD = $true; break }
+            }
+          }
+          $logDTxt = if (Test-Path $logD) { Get-Content $logD -Raw } else { '' }
+          $foreignD = $logDTxt -match '多輪確認後定案'
+          if (-not $adoptedD) { throw '情境D-green: 新殼未在時限內認出身分並接手 (ExternalRunning)' }
+          if ($foreignD) { throw '情境D-green: 新殼仍出現 Foreign 定案, 修復未生效' }
+          Write-Host "情境D-green: 已接手 (身分未定重試出現=$flapSeenD) — 驗證結束路徑"
+          Start-Process $newApp -ArgumentList '--quit' -Wait
+          $exitedD = $appD.WaitForExit(120000)
+          $freeD = Wait-PortsFree 30
+          @("scenario=d_new_shell_probe_straddle", "launch=--autostart", "flapping_seen=$flapSeenD", "foreign_locked=$foreignD", "adopted=$adoptedD", "app_exited=$exitedD", "ports_free=$freeD", "cleanup_ok=$($exitedD -and $freeD)") | Set-Content (Join-Path $ev 'legacy-d.txt')
+          @("scenario=d_new_shell_probe_straddle", "flapping_seen=$flapSeenD", "foreign_locked=$foreignD", "adopted=$adoptedD", "app_exited=$exitedD", "ports_free=$freeD") | Write-Host
+          if ($stubProcD2 -and -not $stubProcD2.HasExited) { Stop-Process -Id $stubProcD2.Id -Force }
+          if (-not ($exitedD -and $freeD)) { throw '情境D-green: 新殼結束後埠未釋放或 App 未結束' }
+          Write-Host '情境D: 通過'
+          Write-Host '殘留情境四組全數完成'
 
       - name: 上傳情境存證
         if: always()
