@@ -1,0 +1,243 @@
+# AI寶 Windows 原生 App (Rust 殼) 雲端建置與驗證工作流程
+#
+# 使用方式: 經人工審核後, 把本檔複製到 .github/workflows/build-app.yml 才會被 GitHub Actions 執行
+# (workflow_dispatch 必須在預設分支 main 上也有一份才能以 --ref 呼叫 ai-bao)。
+#
+# 做什麼:
+#   1. build-engine: 以既有 pack 管線產出引擎 exe (SEA), 並跑 pack 測試 (含 NO_BROWSER 新測試)。
+#   2. build-app: 把引擎 exe 當 payload 嵌入 Rust 殼, cargo release 編出單一 AI寶.exe;
+#      在真 Windows runner 上跑探針 (payload 解開、引擎 headless 啟動、雙埠 200、核心 WS 登入往返、
+#      CTRL_BREAK 優雅結束、埠釋放), 再跑 GUI 冒煙 (啟動主視窗、截圖、--quit 結束序列、埠釋放),
+#      最後把 exe、探針結果、截圖與 log 存成 artifact。
+name: build-app
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-engine:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 安裝相依並建置核心與 helper
+        shell: pwsh
+        run: |
+          npm ci --include=dev
+          npm run build
+          Push-Location helper
+          npm ci
+          Pop-Location
+
+      - name: pack 測試 (含 NO_BROWSER)
+        shell: pwsh
+        working-directory: pack
+        run: |
+          npm ci
+          npm test
+
+      - name: 打包引擎 exe
+        shell: pwsh
+        working-directory: pack
+        run: |
+          node build.mjs --target win --skip-core-build
+
+      - name: 上傳引擎 exe (供下一個 job 嵌入)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aibao-engine
+          path: pack/out/AI寶.exe
+          retention-days: 1
+
+  build-app:
+    needs: build-engine
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 下載引擎 exe 並就位為 payload
+        uses: actions/download-artifact@v4
+        with:
+          name: aibao-engine
+          path: engine-dl
+
+      - name: payload 就位
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force app/payload | Out-Null
+          Copy-Item 'engine-dl/AI寶.exe' app/payload/engine.exe
+          Get-Item app/payload/engine.exe | Select-Object Length
+
+      - name: 設定 Rust 工具鏈
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 編譯 Rust 殼 (release)
+        shell: pwsh
+        working-directory: app
+        run: |
+          cargo build --release
+          New-Item -ItemType Directory -Force ../out | Out-Null
+          Copy-Item target/release/aibao-app.exe '../out/AI寶.exe'
+          Get-Item '../out/AI寶.exe' | Select-Object Length
+
+      - name: 探針 — 登入往返與結束序列實測
+        shell: pwsh
+        run: |
+          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-probe-data'
+          $env:AIBAO_PROBE_OUT = Join-Path $pwd 'probe-result.txt'
+          $exe = (Resolve-Path 'out/AI寶.exe').Path
+          $proc = Start-Process -FilePath $exe -ArgumentList '--probe-login' -Wait -PassThru -RedirectStandardOutput probe-stdout.txt -RedirectStandardError probe-stderr.txt
+          Write-Host "probe exit code: $($proc.ExitCode)"
+          if (Test-Path $env:AIBAO_PROBE_OUT) { Get-Content $env:AIBAO_PROBE_OUT }
+          if ($proc.ExitCode -ne 0) { throw "探針失敗 (exit $($proc.ExitCode)), 詳見 probe-result.txt 與 probe-stderr.txt" }
+          $result = Get-Content $env:AIBAO_PROBE_OUT -Raw
+          if ($result -notmatch 'login_roundtrip=ok') { throw '探針未確認登入往返成功' }
+          if ($result -notmatch 'ports_freed=true') { throw '探針未確認結束後埠已釋放' }
+          # 端點實測斷言 (2026-10-20 實機 404 教訓): /api/status 200 不夠, 兩個 POST 端點都要實際打通
+          if ($result -notmatch 'helper_list_models_route=ok') { throw '探針未確認 /api/list-models 路由存在 (實機曾發生 404)' }
+          if ($result -notmatch 'helper_test_ai_route=ok') { throw '探針未確認 /api/test-ai 路由存在且邏輯有跑' }
+          if ($result -notmatch 'helper_status_identity=True') { throw '探針未確認 helper 身分標記' }
+
+      - name: GUI 冒煙 — 啟動、截圖、結束序列
+        shell: pwsh
+        run: |
+          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-gui-data'
+          $exe = (Resolve-Path 'out/AI寶.exe').Path
+          $proc = Start-Process -FilePath $exe -PassThru
+          Write-Host "app pid: $($proc.Id)"
+          $ok = $false
+          foreach ($i in 1..45) {
+            Start-Sleep -Seconds 2
+            if ($proc.HasExited) { throw "App 啟動後自行結束 (exit $($proc.ExitCode)), 請看 shell.log" }
+            try {
+              $a = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3789/' -TimeoutSec 3
+              $b = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3
+              if ($a.StatusCode -eq 200 -and $b.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+          }
+          if (-not $ok) { throw 'App 啟動後 90 秒內引擎雙埠未就緒' }
+          Start-Sleep -Seconds 5
+          # 把主視窗移到畫面內並縮到 1000x700, 確保截圖拍得到完整視窗 (含頁尾版權宣告)
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class Win32Pos {
+            [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+          }
+          "@
+          $proc.Refresh()
+          if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
+            [Win32Pos]::SetWindowPos($proc.MainWindowHandle, [IntPtr]::Zero, 10, 10, 1000, 700, 0x0040) | Out-Null
+            [Win32Pos]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
+            Start-Sleep -Seconds 2
+          } else {
+            Write-Host '警告: 找不到主視窗 handle, 截圖可能不完整'
+          }
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          $bmp.Save((Join-Path $pwd 'app-main.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+          Write-Host "screenshot saved: $((Get-Item app-main.png).Length) bytes"
+          # 以第二實例 --quit 觸發結束序列 (明確指令路徑), 等主行程自行結束
+          Start-Process -FilePath $exe -ArgumentList '--quit' -Wait
+          $exited = $proc.WaitForExit(60000)
+          Write-Host "app exited after --quit: $exited"
+          if (-not $exited) { throw 'App 在 --quit 後 60 秒內未結束' }
+          Start-Sleep -Seconds 2
+          $still = $false
+          try { Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3 | Out-Null; $still = $true } catch { }
+          if ($still) { throw '結束後 helper 埠仍有回應 (引擎未確實結束)' }
+          # 結束後存證: 殘留行程清單 + 雙埠探測結果寫進 artifact (2026-10-20「關掉 App 服務還在」缺失的加嚴驗證)
+          $report = @()
+          $remain = Get-Process | Where-Object { $_.ProcessName -in @('engine', 'AI寶') } | Select-Object Id, ProcessName
+          if ($remain) { $report += ($remain | Format-Table | Out-String) } else { $report += 'residual_processes=none' }
+          foreach ($p in 3789, 3790) {
+            $c = Test-NetConnection -ComputerName 127.0.0.1 -Port $p -WarningAction SilentlyContinue
+            $report += "port_${p}_tcp_connected=$($c.TcpTestSucceeded)"
+          }
+          $report | Set-Content (Join-Path $pwd 'gui-after-quit.txt')
+          $report | Write-Host
+          if ($remain) { throw '結束後仍有殘留引擎/App 行程' }
+          Write-Host 'GUI 冒煙全數通過'
+
+      - name: 外來佔用情境 — 假服務先佔雙埠, App 須偵測身分不符並提示, 且結束時不誤殺對方
+        shell: pwsh
+        run: |
+          # 用 HttpListener 當「舊版/外來服務」: /api/status 回沒有 aibao-helper 身分標記的 JSON
+          $stubScript = Join-Path $pwd 'foreign-stub.ps1'
+          @'
+          $listener = New-Object System.Net.HttpListener
+          $listener.Prefixes.Add("http://127.0.0.1:3789/")
+          $listener.Prefixes.Add("http://127.0.0.1:3790/")
+          $listener.Start()
+          while ($listener.IsListening) {
+            try { $ctx = $listener.GetContext() } catch { break }
+            try {
+              $body = [Text.Encoding]::UTF8.GetBytes('{"version":"stub-foreign","bot":null}')
+              $ctx.Response.ContentType = "application/json"
+              $ctx.Response.OutputStream.Write($body, 0, $body.Length)
+              $ctx.Response.Close()
+            } catch { }
+          }
+          '@ | Set-Content $stubScript -Encoding UTF8
+          $stubProc = Start-Process pwsh -ArgumentList '-File', $stubScript -PassThru
+          Start-Sleep -Seconds 3
+          try {
+            $s = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3
+            if ($s.Content -match 'aibao-helper') { throw 'stub 不應帶身分標記, 情境設定錯誤' }
+            Write-Host "stub 就緒: $($s.StatusCode) $($s.Content)"
+            $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-foreign-data'
+            $exe = (Resolve-Path 'out/AI寶.exe').Path
+            $proc = Start-Process -FilePath $exe -PassThru
+            $logPath = Join-Path $env:HWLINEHELPER_HOME 'logs\shell.log'
+            $found = $false
+            foreach ($i in 1..30) {
+              Start-Sleep -Seconds 2
+              if ((Test-Path $logPath) -and ((Get-Content $logPath -Raw) -match '外來程式佔用')) { $found = $true; break }
+              if ($proc.HasExited) { break }
+            }
+            if (Test-Path $logPath) { Copy-Item $logPath (Join-Path $pwd 'foreign-shell.log') }
+            if (-not $found) { throw 'App 未偵測到外來佔用 (shell.log 沒有身分不符的紀錄)' }
+            Write-Host 'App 已偵測外來佔用並留下紀錄'
+            Start-Process -FilePath $exe -ArgumentList '--quit' -Wait
+            $exited = $proc.WaitForExit(90000)
+            if (-not $exited) { throw '外來情境: App 在 --quit 後 90 秒內未結束' }
+            Write-Host 'App 已結束; 確認 stub 沒有被誤殺:'
+            $s2 = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3
+            if ($s2.StatusCode -ne 200) { throw '外來情境: stub 被誤殺 (對方行程不該被結束)' }
+            Write-Host "stub 仍存活: $($s2.StatusCode)"
+            Write-Host '外來佔用情境全數通過'
+          } finally {
+            if ($stubProc -and -not $stubProc.HasExited) { Stop-Process -Id $stubProc.Id -Force }
+          }
+
+      - name: 上傳成品、探針結果、截圖與 log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aibao-app
+          path: |
+            out/AI寶.exe
+            probe-result.txt
+            probe-stdout.txt
+            probe-stderr.txt
+            app-main.png
+            gui-after-quit.txt
+            foreign-shell.log
+          if-no-files-found: warn
