@@ -119,6 +119,10 @@ struct SettingsForm {
     scam_per_minute: u32,
     jev_enabled: bool,
     jev_model: String,
+    jev_key_input: String,
+    jev_key_configured: bool,
+    jev_key_last4: String,
+    jev_key_clear: bool,
     kb_folder: String,
     show_sources: bool,
     creator_reply: String,
@@ -1510,6 +1514,16 @@ impl App {
             .and_then(|x| x.as_str())
             .unwrap_or("jev-1.13.0")
             .to_string();
+        // Jev 金鑰比照 AI 供應商 Key 的遮罩檢視: 只拿「已設定/末 4 碼」, 明文不進表單
+        f.jev_key_configured = scam.get("jev").and_then(|j| j.get("set")).and_then(|x| x.as_bool()).unwrap_or(false);
+        f.jev_key_last4 = scam
+            .get("jev")
+            .and_then(|j| j.get("last4"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        f.jev_key_input.clear();
+        f.jev_key_clear = false;
         f.kb_folder = v.get("kb").and_then(|k| k.get("folder")).and_then(|x| x.as_str()).unwrap_or("").to_string();
         f.show_sources = v.get("showSources").and_then(|x| x.as_bool()).unwrap_or(false);
         f.creator_reply = v
@@ -1549,6 +1563,13 @@ impl App {
             }
             providers.insert(pid.clone(), pv);
         }
+        // Jev 金鑰比照 AI 供應商 Key: 有輸入才帶 apiKey; 按了「清除金鑰」送 __clear__ 讓 helper 刪機密
+        let mut jev_body = serde_json::json!({ "enabled": f.jev_enabled, "model": f.jev_model });
+        if f.jev_key_clear {
+            jev_body["apiKey"] = Value::String("__clear__".to_string());
+        } else if !f.jev_key_input.is_empty() {
+            jev_body["apiKey"] = Value::String(f.jev_key_input.clone());
+        }
         serde_json::json!({
             "botName": f.bot_name,
             "aliases": aliases,
@@ -1560,7 +1581,7 @@ impl App {
                 "enabled": f.scam_enabled,
                 "threshold": f.scam_threshold,
                 "perMinute": f.scam_per_minute,
-                "jev": { "enabled": f.jev_enabled, "model": f.jev_model }
+                "jev": jev_body
             },
             "kb": { "folder": f.kb_folder },
             "showSources": f.show_sources,
@@ -1621,6 +1642,8 @@ impl App {
                 p.key_input.clear();
             }
             self.form.line_token_input.clear();
+            self.form.jev_key_input.clear();
+            self.form.jev_key_clear = false;
         }
         // AI 測試連線 / 模型清單
         let pids: Vec<String> = self.test_slots.keys().cloned().collect();
@@ -2694,13 +2717,61 @@ impl App {
                 ui.label("每分鐘最多判讀則數:");
                 ui.add(egui::DragValue::new(&mut self.form.scam_per_minute).range(1..=60));
             });
-            ui.label("運作方式: 本機規則先預篩, 可疑訊息再送 AI 判讀; 超過門檻會在群組回覆警告。");
+            ui.label("運作方式: 本機規則先預篩, 可疑訊息再送判讀; 有啟用下方 Jev 時優先由 Jev 判讀, Jev 連不上會自動改用 AI 判讀, 不會漏掉。超過門檻會在群組回覆警告。");
             ui.add_space(6.0);
-            ui.checkbox(&mut self.form.jev_enabled, "啟用 TypeSafe Jev 判讀 (進階, 需要另外的 Jev 設定; 預設停用)");
+            ui.checkbox(&mut self.form.jev_enabled, "啟用 TypeSafe Jev 判讀 (付費服務, 需要先貼上 Jev API Key)");
+            ui.horizontal(|ui| {
+                ui.label("Jev API Key:");
+                ui.add(egui::TextEdit::singleline(&mut self.form.jev_key_input).password(true).desired_width(320.0).hint_text("貼上 TypeSafe 的 API Key"));
+            });
+            ui.horizontal(|ui| {
+                if self.form.jev_key_clear {
+                    ui.label("按「儲存設定」後會清除目前儲存的金鑰。");
+                } else if self.form.jev_key_configured {
+                    ui.label(format!("已儲存的 Key: 末 4 碼 {}", self.form.jev_key_last4));
+                    if ui.button("清除金鑰").clicked() {
+                        self.form.jev_key_clear = true;
+                        self.form.jev_key_input.clear();
+                    }
+                } else {
+                    ui.label("尚未設定 Key");
+                }
+            });
             ui.horizontal(|ui| {
                 ui.label("Jev 模型:");
                 ui.add(egui::TextEdit::singleline(&mut self.form.jev_model).desired_width(200.0));
             });
+            // Jev 誠實狀態: 只有 helper 回報真的判讀成功過才顯示「已接通」, 不用推測冒充
+            let jev_status = {
+                let snap = self.snap.lock().unwrap();
+                snap.status
+                    .as_ref()
+                    .and_then(|s| s.get("bot"))
+                    .and_then(|b| b.get("scam"))
+                    .map(|scam| {
+                        let state = scam.get("jevState").and_then(|v| v.as_str()).unwrap_or("unconfigured");
+                        let err = scam.get("jevLastError").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        (state.to_string(), err)
+                    })
+            };
+            match jev_status {
+                Some((state, err)) => {
+                    let line = match state.as_str() {
+                        "ok" => "Jev 狀態: 已接通".to_string(),
+                        "unverified" => "Jev 狀態: 已設定、尚未驗證 (等第一則判讀)".to_string(),
+                        "error" => "Jev 狀態: 連不上, 已自動改用 AI 判讀".to_string(),
+                        _ => "Jev 狀態: 尚未設定金鑰".to_string(),
+                    };
+                    ui.label(line);
+                    if state == "error" && !err.is_empty() {
+                        ui.label(egui::RichText::new(err).weak().small());
+                    }
+                }
+                None => {
+                    ui.label("Jev 狀態: 尚未取得 (等設定服務回應)");
+                }
+            }
+            ui.label(egui::RichText::new("貼上新金鑰或清除金鑰後, 要把 AI寶 完全結束再重新開啟, 核心才會載入新金鑰生效 (跟白名單改完要重開一樣)。").weak().small());
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
                 if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存設定" }).clicked() {
