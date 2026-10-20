@@ -160,7 +160,7 @@ test("e2e 假資料全流程: 觸發 (含句尾)、知識庫、防詐騙、改�
   await secrets.set(SECRET_NAMES.openai, TEST_KEY);
   await secrets.set(SECRET_NAMES.lineToken, token);
   const kb = new KnowledgeBase({ folder: kbDir, indexPath: join(dataDir, "kb-index.json"), logger });
-  kb.scan({ force: true });
+  await kb.scan({ force: true });
   const bot = new HelperBot({ settings, secrets, ai: createAiClient({}), kb, logger });
   await bot.connect();
   t.after(() => bot.disconnect());

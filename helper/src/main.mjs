@@ -26,7 +26,7 @@ for (const [envName, secretName] of [["HELPER_AI_OPENAI_KEY", SECRET_NAMES.opena
 
 const ai = createAiClient({});
 const kb = new KnowledgeBase({ folder: settings.get().kb.folder, indexPath: join(dataDir, "kb-index.json"), logger });
-if (settings.get().kb.folder) kb.scan();
+if (settings.get().kb.folder) void kb.scan(); // 背景分段掃描, 不擋控制台啟動與 bot 連線
 
 // 訊息寄件者登記簿持久化在 data 目錄: 重啟後仍認得機器人先前發過的訊息, 引用續答不中斷
 const registry = new MessageSenderRegistry({ path: join(dataDir, "message-senders.json"), logger });

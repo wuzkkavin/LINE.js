@@ -447,7 +447,7 @@ test("kb: 掃描、切段、BM25 搜尋附來源; 索引存資料夾外; 資料�
   await writeFile(join(kbDir, "不支援.pdf"), "%PDF fake");
   const before = (await stat(join(kbDir, "列印說明.txt"))).mtimeMs;
   const kb = new KnowledgeBase({ folder: kbDir, indexPath: join(root, "outside", "kb-index.json") });
-  const st = kb.scan({ force: true });
+  const st = await kb.scan({ force: true });
   assert.equal(st.files, 2);
   assert.ok(st.chunks >= 2);
   const hits = kb.search("公司彩色列印在哪裡", 3);
@@ -669,4 +669,107 @@ test("bot: 被核心踢線後自動重連; 換 Token 後以新 Token 重連; 連
   assert.equal(seenAuth[seenAuth.length - 1], "Bearer tok-NEW-2222");
   bot.disconnect();
   assert.equal(bot.status().botConnected, false);
+});
+
+test("kb: 大掃描分段讓出事件迴圈 (計時器不被長時間卡住), 掃描中狀態誠實, 完成後搜尋正確", async () => {
+  const root = await tmp();
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const kbDir = join(root, "kb"); await mkdir(kbDir);
+  const printPara = "公司影印機使用說明: 彩色列印請到四樓影印室登記, 分機 412。影印前請先確認紙張尺寸與雙面設定。\n\n";
+  const foodPara = "員工餐廳本週菜單: 週一牛肉麵, 週二排骨飯, 週三水餃, 週四咖哩飯, 週五炒米粉。素食請先登記。\n\n";
+  // 400 檔: 20 檔列印文件 + 380 檔餐廳文件 (內容有區分, BM25 idf 才有意義)
+  for (let i = 0; i < 400; i++) {
+    await writeFile(join(kbDir, `doc${i}.txt`), (i < 20 ? printPara : foodPara).repeat(160));
+  }
+  const kb = new KnowledgeBase({ folder: kbDir, indexPath: join(root, "kb-index.json") });
+  let maxLag = 0; let last = Date.now();
+  const iv = setInterval(() => { const now = Date.now(); maxLag = Math.max(maxLag, now - last - 20); last = now; }, 20);
+  const scanP = kb.scan({ force: true });
+  assert.equal(kb.status().scanning, true); // 掃描期間狀態要看得出在掃
+  const st = await scanP;
+  clearInterval(iv);
+  assert.equal(st.files, 400);
+  assert.ok(st.chunks > 4000, `片段數應 >4000, 實際 ${st.chunks}`);
+  assert.equal(st.scanning, false);
+  assert.equal(st.largeFolder, false);
+  // 舊版同步掃描會把事件迴圈整段卡死 (這批資料約 1.5 秒); 分段後 20ms 計時器的最大延遲必須遠小於全程
+  assert.ok(maxLag < 600, `事件迴圈最大延遲 ${maxLag}ms, 分段掃描不應長時間卡住`);
+  const hits = kb.search("公司彩色列印在哪裡", 3);
+  assert.ok(hits.length >= 1);
+  assert.match(hits[0].file, /^doc\d+\.txt$/);
+  assert.ok(Number(hits[0].file.slice(3, -4)) < 20, "命中的應該是列印文件");
+});
+
+test("kb: 檔案數異常多時 largeFolder 標記與檔案計數 (只提醒不阻擋)", async () => {
+  const root = await tmp();
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const kbDir = join(root, "kb"); await mkdir(kbDir);
+  for (let i = 0; i < 2100; i++) await writeFile(join(kbDir, `f${i}.txt`), "公司公告: 本週五下午全公司大掃除。");
+  const kb = new KnowledgeBase({ folder: kbDir, indexPath: join(root, "kb-index.json") });
+  assert.equal(kb.countSupportedFiles(), 2100);
+  const st = await kb.scan({ force: true });
+  assert.equal(st.files, 2100);
+  assert.equal(st.largeFolder, true);
+});
+
+test("console: 設定知識庫大資料夾時 /api/settings 立即回應 (不等掃描), 掃描期間 /api/status 照常回應", async (t) => {
+  const dir = await tmp();
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const kbDir = join(dir, "bigkb"); await mkdir(kbDir);
+  const para = "出差申請流程: 先填出差單, 經主管核准後訂票, 回來檢據核銷。\n\n";
+  for (let i = 0; i < 400; i++) await writeFile(join(kbDir, `doc${i}.txt`), para.repeat(160));
+  const settings = new SettingsStore({ path: join(dir, "settings.json") });
+  const secrets = new MemorySecretStore();
+  const logger = new Logger({ dir: join(dir, "logs") });
+  const ai = createAiClient({});
+  const kb = new KnowledgeBase({ folder: "", indexPath: join(dir, "kb.json"), logger });
+  const bot = new HelperBot({ settings, secrets, ai, kb, logger });
+  const server = createConsoleServer({ settings, secrets, ai, kb, bot, logger, lineEnv: { dataDir: dir, repoRoot: join(dir, "nope"), packaged: true } });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const t0 = Date.now();
+  const put = await fetch(base + "/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kb: { folder: kbDir } }) }).then((r) => r.json());
+  const putMs = Date.now() - t0;
+  assert.equal(put.ok, true);
+  assert.ok(putMs < 2500, `設定回應不應等掃描, 實際 ${putMs}ms`);
+  // 掃描進行中 /api/status 要照常回應, 且看得出 scanning
+  const st1 = await (await fetch(base + "/api/status")).json();
+  assert.equal(st1.bot.kb.scanning, true);
+  // 等掃描完成: 狀態自己更新成 400 檔
+  const dl = Date.now() + 15000;
+  let done = null;
+  while (Date.now() < dl) {
+    const s = await (await fetch(base + "/api/status")).json();
+    if (!s.bot.kb.scanning && s.bot.kb.files === 400) { done = s; break; }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  assert.ok(done, "掃描應在 15 秒內完成並反映在狀態");
+});
+
+test("kb: 索引重載直接還原詞頻可搜尋; 舊格式索引 (無詞頻) 先不開放搜尋, 掃描補算後恢復", async () => {
+  const root = await tmp();
+  const { mkdir, writeFile, readFile, writeFile: wf } = await import("node:fs/promises");
+  const kbDir = join(root, "kb"); await mkdir(kbDir);
+  await writeFile(join(kbDir, "列印說明.txt"), "公司彩色列印在總公司四樓影印室。彩色影印機分機 412, 列印前請先在影印室登記。A3 列印也在四樓。");
+  await writeFile(join(kbDir, "網路申請.md"), "VPN 申請流程: 填寫資訊部表單, 經主管簽核後開通。遠端連線使用公司配發帳號。");
+  const indexPath = join(root, "kb-index.json");
+  const kb1 = new KnowledgeBase({ folder: kbDir, indexPath });
+  await kb1.scan({ force: true });
+  // 模擬重新開機: 新實例從同一索引檔載入 — 詞頻有存回來, 不必重算就能搜尋
+  const kb2 = new KnowledgeBase({ folder: kbDir, indexPath });
+  assert.equal(kb2.statsStale, false);
+  const hits = kb2.search("公司彩色列印在哪裡", 3);
+  assert.ok(hits.length >= 1);
+  assert.equal(hits[0].file, "列印說明.txt");
+  // 舊格式索引 (把 tf/len 拿掉): 載入後 statsStale, 搜尋先回空 (不用半套統計), 背景掃描補算後恢復
+  const raw = JSON.parse(await readFile(indexPath, "utf8"));
+  for (const c of raw.chunks) { delete c.tf; delete c.len; }
+  await wf(indexPath, JSON.stringify(raw));
+  const kb3 = new KnowledgeBase({ folder: kbDir, indexPath });
+  assert.equal(kb3.statsStale, true);
+  assert.deepEqual(kb3.search("公司彩色列印在哪裡", 3), []);
+  await kb3.scan();
+  assert.equal(kb3.statsStale, false);
+  assert.ok(kb3.search("公司彩色列印在哪裡", 3).length >= 1);
 });

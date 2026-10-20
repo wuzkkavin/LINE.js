@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROVIDER_DEFAULTS, SECRET_NAMES } from "./config.mjs";
+import { KB_LARGE_FOLDER_FILES } from "./kb.mjs";
 import { maskSecret } from "./secrets.mjs";
 import { applyCoreApiConfig, detectPackaged, readCoreApiStatus, runCliToken } from "./linecfg.mjs";
 import { fetchCoreChannels, shapeChatList } from "./corechats.mjs";
@@ -132,10 +133,22 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         await Promise.all(keyUpdates);
         settings.update(body);
         if (lineTokenChanged) await reconnectBot().catch(() => {});
-        if (kb && typeof body?.kb?.folder === "string") { kb.setFolder(body.kb.folder); kb.scan(); }
+        // 知識庫掃描改在背景跑: 大資料夾掃描要很久, 設定回應不能等它 (舊版同步掃描把這支 API
+        // 卡住 100+ 秒, App 端直接逾時跳 Network Error — 2026-10-20 實機定案之二)。
+        let kbNotice = "";
+        if (kb && typeof body?.kb?.folder === "string") {
+          kb.setFolder(body.kb.folder);
+          void kb.scan();
+          if (body.kb.folder) {
+            const n = kb.countSupportedFiles();
+            if (n > KB_LARGE_FOLDER_FILES) {
+              kbNotice = `提醒: 這個知識庫資料夾有 ${n} 個文件檔案, 數量非常多 — 建立索引會在背景花比較久的時間 (不影響其他功能), 之後每次重整也會久。建議另外建一個只放要給 AI 參考文件的專用資料夾, 會快很多。`;
+            }
+          }
+        }
         const s = settings.get();
         logger?.info("設定", "設定已更新", { botName: s.botName, aiActive: s.ai.active, triggerMode: s.triggerMode });
-        return json(res, 200, { ok: true, settings: await settings.publicView(secrets), message: "已儲存, 馬上生效 (不用重開程式)" });
+        return json(res, 200, { ok: true, settings: await settings.publicView(secrets), kbNotice, message: "已儲存, 馬上生效 (不用重開程式)" + (kbNotice ? ` ${kbNotice}` : "") });
       }
       if (req.method === "POST" && path === "/api/test-ai") {
         const body = await readBody(req);
@@ -224,7 +237,14 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
       }
       if (req.method === "POST" && path === "/api/kb/reindex") {
         if (!kb) return json(res, 400, { ok: false, message: "知識庫尚未啟用" });
-        const st = kb.scan({ force: true });
+        // 掃描是非阻塞分段進行: 小資料夾很快就好, 等它完成再回結果 (行為同舊版);
+        // 大資料夾超過等待上限就先回「背景整理中」, /api/status 會持續反映進度, 不把這支 API 掛住。
+        const scanP = kb.scan({ force: true });
+        const finished = await Promise.race([scanP.then(() => true), new Promise((r) => setTimeout(() => r(false), 15000))]);
+        const st = kb.status();
+        if (!finished) {
+          return json(res, 200, { ok: true, status: st, scanning: true, message: "檔案很多, 正在背景整理索引 (不會卡住其他功能); 整理完成後, 知識庫狀態會自動更新。" });
+        }
         return json(res, 200, { ok: true, status: st, message: st.ready ? `整理完成: ${st.files} 個檔案、${st.chunks} 段` : "資料夾裡沒有可讀的 .txt/.md/.csv 檔案, 請確認資料夾路徑與檔案格式" });
       }
       if (req.method === "GET" && path === "/api/logs") {
