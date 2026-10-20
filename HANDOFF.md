@@ -89,6 +89,20 @@
 - 本機截圖存證 ~/workspace/.shot3/（before-whitelist/before-panel、after-whitelist/after-panel/after-ai/after-chat、web-whitelist/web-ai）；CI 存證 app-chat.png（未登入占位，run 下載於 ~/workspace/ci-downloads/ui-batch/）。
 - **未驗證（待老吳實機）**：聊天室畫面頁的真 WebView2 渲染（需登入狀態）、切頁/最小化/縮到系統匣不殘影、WebView2 缺失機器的白話提示；活動面板展開點擊在開發機 Xvfb 的合成輸入下無法觸發（巢狀捲動區；展開渲染已另以種子狀態截圖驗證、點擊本體為標準 Button，與白名單按鈕同元件）。
 
+## 6.6 Jev 真接通批（2026-10-21，第二批審計定案「Jev 假接」後，老吳拍板 A 案真接通並購買 TypeSafe 額度；程式先備妥，他貼 Key 即用。ai-bao commits：helper 5c77e63、app a1ce1c2）
+
+- **先說清楚的界線**：核心（上游）的 Jev 本來就是真整合，但金鑰只認核心 config.yaml 的 `jev.token`，且核心只在啟動時讀一次設定。所以本批的接法是「helper 把金鑰受控寫入核心設定」，寫入後**要把 AI寶 完全結束再重新開啟才會生效**（與白名單改完要重開同一慣例）；沒有、也不需要改任何上游檔案。
+- **helper/src/jev.mjs（新）**：`syncJevCoreConfig` 在設定存檔（server PUT /api/settings）與 helper 啟動時各跑一次：Jev 啟用且存有金鑰 → 把 token（雙引號跳脫寫入，避免 # 等字元被 YAML 誤解）與 model 寫入 config.yaml 的 jev 區段；停用或金鑰清除 → token 清空。寫入規格比照 linecfg：只動 jev 區段的行編輯、寫前 .bak 備份、寫後重讀驗證、驗證不過自動還原；已一致就不寫檔。**格式紅線**：寫入前先以與核心 src/config.ts 完全相同的規則驗 token（可列印 ASCII 無空白、1–512）與 model 格式，不符就拒寫並記白話錯誤——寫錯格式進去，核心下次啟動會直接判定設定無效而開不起來。log 只記末 4 碼，金鑰明文不入 log。
+- **bot 判讀改走 Jev**：新 `judgeMessage(m)` 取代舊 judge 的自動掃描路徑——Jev 啟用＋有金鑰＋格式正確時，送核心 WS `scam:check`（沿用既有 requestId/pending 機制，逾時 20 秒）；`scam:result` 的 probability 直接對照既有 threshold 語義，tactic.kind 以 `JEV_TACTIC_LABELS` 對照中文手法名（與核心 README 對照一致）。任一失敗以 `classifyJevError` 分類成白話原因（UNAVAILABLE＝核心尚未啟用 Jev、FAILED、UNKNOWN_CHAT、INVALID_REQUEST、RATE_LIMITED、TIMEOUT、NOT_CONNECTED、BAD_RESULT），記 warn log 後**自動退回既有 AI 判讀**（judgeWithAi，含規則備援），防詐騙不會因 Jev 故障整段失效。每分鐘閘門沿用既有 scamLimiter（核心端機器人合計上限同為 10/分）。舊的「假資料版尚未接 Jev API」警告字串已隨 judge() 一併移除。
+- **誠實狀態**：bot 新增 jevState 四態（unconfigured／unverified／ok／error）＋jevLastOkAt＋jevLastError，彙入 status().scam。`refreshJevState`（啟動＋存檔後呼叫）以「啟用＋金鑰末 4 碼＋模型」為指紋，指紋一變就回 unverified；**只有真的收到 scam:result 才進 ok**，不准用推測顯示已接通。貼了 Key 但沒重開 App 時，第一則判讀會收到 UNAVAILABLE → 狀態 error 並附「核心尚未啟用 Jev…請把 AI寶 完全結束再重新開啟」的原因，這是預期行為、不是故障，且判讀已自動由 AI 頂上。
+- **影子比試**：Jev 判讀成功時，以同一則訊息文字另跑一次 AI 判讀（`shadowAiJudge`，fire-and-forget、不影響任何回覆），log 以「Jev 與 AI 同場比試 （影子紀錄， 不影響判讀結果）」同行記 jev/ai 兩邊分數＋手法＋used=jev，供日後彙整成對照表、裁示長期由誰當家；影子失敗靜默略過。
+- **手動判讀**：同事自貼的判讀文字不在核心訊息快取裡，Jev 協定判讀不了 → `judgeForManual` 一律走 AI 並在 log 記原因；只有目標就是訊息本則時才走 judgeMessage。
+- **App 防詐騙頁**：補上 Jev API Key 欄位（密碼遮罩輸入、已儲存顯示「末 4 碼 xxxx」＋「清除金鑰」按鈕（送 __clear__）、collect_settings_body 比照 AI 供應商的 apiKey 帶法）；勾選文案改為「啟用 TypeSafe Jev 判讀 （付費服務， 需要先貼上 Jev API Key）」；新增 Jev 狀態行（讀 status 的 jevState 顯示四態白話，error 時附原因弱字小行）與「貼上新金鑰或清除金鑰後要重開才生效」的弱字提示；「運作方式」說明同步更新。web 控制台原本就有 Jev Key 欄位（密碼欄＋末 4 碼顯示），行為核對一致、本批未改 web。
+- **測試**：helper 新增 test/jev.test.mjs 5 項——寫入單元（只動 jev 區段、含 #/: 的金鑰來回讀寫、清除、無區塊時檔尾新增、格式檢查、失敗分類對照）、同步流程（啟用寫入、停用清除、冪等不重寫、格式不符拒寫且檔案不被污染、log 無金鑰明文）、端到端（真核心 dist hub＋假 Jev 分析器：Jev 0.93 映射門檻與手法並警告、影子 AI 0.95 同行入 log、狀態 unverified→ok；無分析器時 UNAVAILABLE→退回 AI 且狀態 error 附白話原因；手動判讀走 AI、Jev 未啟用時分析器零呼叫且無影子）。helper 69/69（Windows 與 Ubuntu 兩 repo 各自實跑，舊 64 項零倒退）、pack 51/51（Ubuntu）、cargo check 三目標（Linux／windows-gnu／windows-msvc）＋cargo test 2/2。
+- **本機實證**：真 helper 啟動後 PUT 設定帶假金鑰 → 當場寫入暫存 config.yaml（引號與縮排正確）、/api/status 的 jevState=unverified；Ubuntu tar 隔離 HOME 冒煙：雙埠 200、PUT 後真 config.yaml（~/.local/share/HwLineHelper/）寫入 token、jevState=unverified、SIGTERM 後雙埠釋放無殘留。本機截圖存證 ~/workspace/.shot4/（before-scam＝舊頁只有模型格子、無 Key 欄位；after-scam＝新頁含 Key 欄位、已儲存末 4 碼＋清除金鑰、狀態行「已設定、尚未驗證（等第一則判讀）」），兩張皆親自檢視。
+- **交付**：build-app run 39500664638 四 job 全 success（探針全 ok：engine 105,043,456 bytes、login_roundtrip=ok、shutdown_path=signal_file、ports_freed=true）。成品 AI寶-App.exe 127,991,808 bytes、MD5 290fca68e343ac289eb3818f4f9bbcf7，Drive 同 id 1BWJiznBeMoeQbIaS7jxbKagiNBcnrmfX 原地換新（回讀大小＋MD5 一致、trashed=false）、Release aibao-app-v1 資產 AI-Bao-App.exe 同步（sha256 c9f68432b87f2eed29f50857a665001c8ce4acaac0c999537eb255c2f878aa4b 回讀一致），run artifacts 3 件已刪。Ubuntu：helper 同步 commit 4a84de8，tar 重打 48,902,393 bytes、MD5 709428139d8cb0b27bf662ac6f666313，Drive live id 1IvByfNnuZmZQ_yCvDekwOCFHEGxnQ1pT 原地換新（回讀一致）。
+- **未驗證（待老吳實機）**：真 TypeSafe 帳號/真金鑰的實際判讀（他買好額度→在 App 防詐騙頁貼 Key→完全結束再重開 AI寶→第一則可疑訊息判讀成功後 jevState 才會轉「已接通」）；中文詐騙樣本在 Jev 的實際表現（影子比試 log 正是為此累積對照資料）；App「清除金鑰」的真機流程；WebView2/真機手感等前批未驗證項不變。
+
 ## 7. 操作手冊（常用指令）
 
 - 上游測試：Repo 根目錄 npm ci --include=dev；npm run typecheck；npm test（207 項，約 1 分鐘）。
