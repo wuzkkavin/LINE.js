@@ -13,6 +13,7 @@ import { KnowledgeBase } from "../src/kb.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, ruleFallbackJudge, PerMinuteLimiter } from "../src/scam.mjs";
 import { createConsoleServer } from "../src/server.mjs";
 import { parseApiSection, applyApiConfig, applyCoreApiConfig, readCoreApiStatus, isValidChatId } from "../src/linecfg.mjs";
+import { MessageSenderRegistry } from "../src/msgregistry.mjs";
 import { HelperBot } from "../src/bot.mjs";
 import { coreEndpoints, fetchCoreChannels, shapeChatList } from "../src/corechats.mjs";
 import { WebSocketServer } from "ws";
@@ -138,6 +139,86 @@ test("trigger: 名字位置不限 (句首/句中/句尾) 標準模式; 問題正
   // 句尾閒聊同樣不觸發
   v = evaluateTrigger({ text: "今天 AI寶 好像怪怪的", senderId: "u5", selfId: "me", settings: triggerSettings(), state: st });
   assert.equal(v.triggered, false);
+});
+
+test("trigger: 引用機器人自己的訊息 = 續答觸發 (不需名字、略過意圖判定)", () => {
+  const st = createTriggerState();
+  // 引用自己 + 追問沒有問句提示詞: 標準模式靠名字規則不會觸發, 靠引用要觸發
+  let v = evaluateTrigger({ text: "那 Word 呢", senderId: "u1", selfId: "me", settings: triggerSettings(), state: st, quotedSelf: true });
+  assert.equal(v.triggered, true); assert.equal(v.reason, "quote"); assert.equal(v.question, "那 Word 呢");
+  // 同一則不帶引用: 不觸發 (對照)
+  v = evaluateTrigger({ text: "那 Word 呢", senderId: "u1", selfId: "me", settings: triggerSettings(), state: st });
+  assert.equal(v.triggered, false); assert.equal(v.reason, "no_name");
+  // 嚴格模式下引用續答也觸發 (略過句首判定)
+  v = evaluateTrigger({ text: "原來如此, 那如果是橫向的呢", senderId: "u2", selfId: "me", settings: triggerSettings({ triggerMode: "strict" }), state: st, quotedSelf: true });
+  assert.equal(v.triggered, true);
+  // 引用自己 + 文字含名但非問句: 引用路徑優先, 不被 not_question 擋下
+  v = evaluateTrigger({ text: "AI寶 然後呢就這樣放著", senderId: "u3", selfId: "me", settings: triggerSettings(), state: st, quotedSelf: true });
+  assert.equal(v.triggered, true);
+});
+
+test("trigger: 引用別人的訊息不算觸發; 引用但文字為空不觸發", () => {
+  const st = createTriggerState();
+  // quotedSelf=false 就是引用別人: 回到名字規則
+  let v = evaluateTrigger({ text: "這段說得有道理", senderId: "u1", selfId: "me", settings: triggerSettings(), state: st, quotedSelf: false });
+  assert.equal(v.triggered, false); assert.equal(v.reason, "no_name");
+  // 引用自己但只剩標點/空白: 清理後沒內容, 不觸發
+  v = evaluateTrigger({ text: "  ", senderId: "u2", selfId: "me", settings: triggerSettings(), state: st, quotedSelf: true });
+  assert.equal(v.triggered, false); assert.equal(v.reason, "empty");
+  v = evaluateTrigger({ text: "。", senderId: "u2", selfId: "me", settings: triggerSettings(), state: st, quotedSelf: true });
+  assert.equal(v.triggered, false);
+  // 引用自己也擋不住自己人檢查: 機器人自己發的訊息永遠忽略
+  v = evaluateTrigger({ text: "那 Word 呢", senderId: "me", selfId: "me", settings: triggerSettings(), state: st, quotedSelf: true });
+  assert.equal(v.triggered, false); assert.equal(v.reason, "self");
+});
+
+test("trigger: 引用續答仍受冷卻與每日上限", () => {
+  const st = createTriggerState();
+  const now = new Date();
+  let v = evaluateTrigger({ text: "AI寶,問題一？", senderId: "u1", selfId: "me", settings: triggerSettings(), state: st, now });
+  assert.equal(v.triggered, true);
+  markTriggered(st, "u1", now); markAnswered(st, now);
+  // 冷卻中: 就算是引用自己的回答追問, 也不觸發
+  v = evaluateTrigger({ text: "那問題二呢", senderId: "u1", selfId: "me", settings: triggerSettings(), state: st, now: new Date(now.getTime() + 5000), quotedSelf: true });
+  assert.equal(v.triggered, false); assert.equal(v.reason, "cooldown");
+  // 每日上限: 引用續答同樣被擋下並帶 limitReached
+  const st2 = createTriggerState();
+  markAnswered(st2, now); markAnswered(st2, now);
+  v = evaluateTrigger({ text: "再告訴我一件事", senderId: "u9", selfId: "me", settings: triggerSettings({ dailyLimit: 2 }), state: st2, now, quotedSelf: true });
+  assert.equal(v.triggered, false); assert.equal(v.reason, "daily_limit"); assert.equal(v.limitReached, true);
+});
+
+test("msgregistry: 登記/查詢/過期/上限/持久化來回", async () => {
+  let clock = 1000000;
+  const now = () => clock;
+  const dir = await mkdtemp(join(tmpdir(), "helper-registry-"));
+  const path = join(dir, "message-senders.json");
+  const reg = new MessageSenderRegistry({ path, ttlMs: 10000, maxEntries: 3, now });
+  reg.register("m1", "u-me");
+  reg.register("m2", "u-other");
+  assert.equal(reg.lookup("m1"), "u-me");
+  assert.equal(reg.lookup("m2"), "u-other");
+  assert.equal(reg.lookup("nope"), undefined);
+  // 空字串記號: 查過但查無此訊息
+  reg.register("gone", "");
+  assert.equal(reg.lookup("gone"), "");
+  // 過期: 超過 ttl 後查不到
+  clock += 11000;
+  assert.equal(reg.lookup("m1"), undefined);
+  // 上限: 只留最新 3 筆
+  const reg2 = new MessageSenderRegistry({ ttlMs: 60000, maxEntries: 3, now });
+  for (const id of ["a", "b", "c", "d"]) { reg2.register(id, "u-me"); clock += 1; }
+  assert.equal(reg2.size, 3);
+  assert.equal(reg2.lookup("a"), undefined);
+  assert.equal(reg2.lookup("d"), "u-me");
+  // 持久化: flush 後新實例讀得回來
+  reg.register("keep", "u-me");
+  reg.flush();
+  const reg3 = new MessageSenderRegistry({ path, ttlMs: 10000, maxEntries: 3, now });
+  assert.equal(reg3.lookup("keep"), "u-me");
+  const raw = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(raw.version, 1);
+  assert.ok(Array.isArray(raw.entries));
 });
 
 test("trigger: 冷卻與每日上限", () => {

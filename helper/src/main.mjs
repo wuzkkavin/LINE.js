@@ -7,6 +7,7 @@ import { SettingsStore, SECRET_NAMES } from "./config.mjs";
 import { createAiClient } from "./ai.mjs";
 import { KnowledgeBase } from "./kb.mjs";
 import { HelperBot } from "./bot.mjs";
+import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { createConsoleServer, listenConsole } from "./server.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -27,7 +28,9 @@ const ai = createAiClient({});
 const kb = new KnowledgeBase({ folder: settings.get().kb.folder, indexPath: join(dataDir, "kb-index.json"), logger });
 if (settings.get().kb.folder) kb.scan();
 
-const bot = new HelperBot({ settings, secrets, ai, kb, logger });
+// 訊息寄件者登記簿持久化在 data 目錄: 重啟後仍認得機器人先前發過的訊息, 引用續答不中斷
+const registry = new MessageSenderRegistry({ path: join(dataDir, "message-senders.json"), logger });
+const bot = new HelperBot({ settings, secrets, ai, kb, logger, registry });
 const server = createConsoleServer({ settings, secrets, ai, kb, bot, logger, lineEnv: { dataDir } });
 const port = Number(process.env.HELPER_PORT || 3790);
 await listenConsole(server, port);

@@ -321,7 +321,7 @@ async function loadAll() {
   $("stLine").innerHTML = b.connected ? '<span class="pill">已連線</span>' : '<span class="pill off">未連線</span>';
   $("stSelf").textContent = b.selfName ? `登入帳號:${b.selfName} (${b.lineState || ""})` : (b.lineState || "");
   $("stName").textContent = b.botName || "(尚未設定名字)";
-  $("stMode").textContent = "觸發方式:" + ({ loose: "寬鬆", standard: "標準", strict: "嚴格" })[s.triggerMode] + " · 在群組打到名字就會回應";
+  $("stMode").textContent = "觸發方式:" + ({ loose: "寬鬆", standard: "標準", strict: "嚴格" })[s.triggerMode] + " · 在群組打到名字, 或引用機器人的回答追問, 就會回應";
   const ap = s.ai.providers[s.ai.active];
   $("stAi").textContent = ap ? ap.label : s.ai.active;
   $("stAiModel").textContent = ap ? ap.model : "";

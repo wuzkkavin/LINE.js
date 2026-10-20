@@ -2,6 +2,7 @@
 // 名字一律取自設定 (botName / aliases), 本檔不寫死任何名字。
 import WebSocket from "ws";
 import { evaluateTrigger, markAnswered, markTriggered, createTriggerState } from "./trigger.mjs";
+import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, scamVerdictText, scamWarningText, PerMinuteLimiter } from "./scam.mjs";
 import { SECRET_NAMES } from "./config.mjs";
 
@@ -19,12 +20,14 @@ export function kbMissText() {
 }
 
 export class HelperBot {
-  constructor({ settings, secrets, ai, kb, logger } = {}) {
+  constructor({ settings, secrets, ai, kb, logger, registry } = {}) {
     this.settings = settings; // SettingsStore
     this.secrets = secrets;
     this.ai = ai;
     this.kb = kb;
     this.logger = logger;
+    // 訊息寄件者登記簿: 認定被引用的訊息是不是機器人自己發的 (引用續答觸發用)
+    this.registry = registry ?? new MessageSenderRegistry({ logger });
     this.triggerState = createTriggerState();
     this.scamLimiter = new PerMinuteLimiter(10);
     this.memory = new Map(); // chatId -> [{role, content}]
@@ -103,7 +106,7 @@ export class HelperBot {
       ws.on("message", (data) => this.onFrame(data).catch((e) => this.logger?.error("機器人", "處理訊息失敗", { error: String(e?.message ?? e) })));
     });
   }
-  disconnect() { try { this.ws?.close(); } catch {} this.ws = null; this.connected = false; }
+  disconnect() { try { this.ws?.close(); } catch {} this.ws = null; this.connected = false; this.registry.flush(); }
 
   sendFrame(obj) { if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj)); }
   async paceSend() {
@@ -123,6 +126,45 @@ export class HelperBot {
     });
   }
 
+  // 向核心要一頁歷史訊息 (機器人 API 有開放 history:fetch); 只用在認定被引用訊息的寄件者。
+  async fetchHistoryPage(chatId, before) {
+    return new Promise((resolve, reject) => {
+      const requestId = `h${++this.reqSeq}-${Date.now()}`;
+      const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error("history timeout")); }, 10000);
+      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
+      this.sendFrame({ type: "history:fetch", requestId, chatId, limit: 100, ...(before ? { before } : {}) });
+    });
+  }
+
+  // 被引用的訊息是不是機器人自己發的:
+  // 先查登記簿 (收到的影格與自己的 sent 影格都有登記); 查不到才向核心要歷史補查 (最多 2 頁),
+  // 歷史裡每則訊息都帶 senderId, 順便整頁補登記。查無此訊息時在登記簿留空字串記號, 避免每次引用都重查。
+  async isQuotedSelf(m) {
+    if (!m.replyTo || !this.selfId) return false;
+    const known = this.registry.lookup(m.replyTo);
+    if (known !== undefined) return known === this.selfId;
+    if (!this.connected) return false;
+    try {
+      let cursor;
+      for (let page = 0; page < 2; page++) {
+        const frame = await this.fetchHistoryPage(m.channelId, cursor);
+        const messages = Array.isArray(frame.messages) ? frame.messages : [];
+        for (const hm of messages) {
+          if (hm.messageId && hm.senderId) this.registry.register(hm.messageId, hm.senderId, hm.channelId ?? m.channelId);
+        }
+        const hit = messages.find((x) => x.messageId === m.replyTo);
+        if (hit) return hit.senderId === this.selfId;
+        if (!frame.hasMore || !frame.cursor) break;
+        cursor = frame.cursor;
+      }
+      this.registry.register(m.replyTo, "", m.channelId ?? "");
+      return false;
+    } catch (e) {
+      this.logger?.warn("觸發判斷", "引用訊息寄件者補查失敗, 本次不以引用觸發", { id: m.messageId, error: String(e?.message ?? e) });
+      return false;
+    }
+  }
+
   async onFrame(data) {
     let frame;
     try { frame = JSON.parse(data.toString()); } catch { return; }
@@ -133,14 +175,16 @@ export class HelperBot {
       return;
     }
     if (frame.type === "auth:state") { if (frame.state) this.lineState = frame.state; return; }
-    if (frame.type === "sent" && frame.requestId && this.pending.has(frame.requestId)) {
-      this.pending.get(frame.requestId).resolve(frame);
-      this.pending.delete(frame.requestId);
-      return;
+    // 自己送出的訊息: 核心在 sent 影格回新訊息的 messageId, 立刻登記為機器人本人,
+    // 之後有人引用這則回答, 登記簿就認得出來 (引用續答觸發的認定主路徑)。
+    if (frame.type === "sent" && frame.messageId && this.selfId) {
+      this.registry.register(frame.messageId, this.selfId, "");
     }
-    if (frame.type === "error" && frame.requestId && this.pending.has(frame.requestId)) {
-      this.pending.get(frame.requestId).reject(new Error(frame.code ?? "SEND_FAILED"));
+    if (frame.requestId && this.pending.has(frame.requestId)) {
+      const p = this.pending.get(frame.requestId);
       this.pending.delete(frame.requestId);
+      if (frame.type === "error") p.reject(new Error(frame.code ?? "SEND_FAILED"));
+      else p.resolve(frame); // sent / history 都走這裡
       return;
     }
     if (frame.type === "message") await this.onMessage(frame.message);
@@ -152,6 +196,8 @@ export class HelperBot {
     this.rollStats();
     this.logger?.info("訊息接收", "收到訊息", { id: m.messageId, chat: m.channelId, sender: m.senderId, len: m.text.length });
     this.logger?.logText("訊息接收", "訊息", m.text);
+    // 每則看到的訊息都登記寄件者 (含機器人自己的): 之後被引用時才認得出來源
+    if (m.messageId && m.senderId) this.registry.register(m.messageId, m.senderId, m.channelId ?? "");
     if (m.senderId === this.selfId) { this.logger?.debugLog("觸發判斷", "忽略自己發的訊息", { id: m.messageId }); return; }
     // 兩件事並行評估: 防詐騙自動掃描 + 名字觸發; 先處理觸發問答, 詐騙警告獨立進行
     const triggerPromise = this.handleTrigger(m, s);
@@ -183,8 +229,10 @@ export class HelperBot {
   }
 
   async handleTrigger(m, s) {
-    const verdict = evaluateTrigger({ text: m.text, senderId: m.senderId, selfId: this.selfId, settings: s, state: this.triggerState });
-    this.logger?.info("觸發判斷", verdict.triggered ? "命中觸發" : "未觸發", { id: m.messageId, reason: verdict.reason, name: verdict.matchedName || "" });
+    // 引用續答: 引用的是機器人自己的訊息時, 視同被名字觸發 (認定方式見 isQuotedSelf)
+    const quotedSelf = m.replyTo ? await this.isQuotedSelf(m) : false;
+    const verdict = evaluateTrigger({ text: m.text, senderId: m.senderId, selfId: this.selfId, settings: s, state: this.triggerState, quotedSelf });
+    this.logger?.info("觸發判斷", verdict.triggered ? "命中觸發" : "未觸發", { id: m.messageId, reason: verdict.reason, name: verdict.matchedName || "", quote: m.replyTo ? (quotedSelf ? "self" : "other") : "" });
     if (!verdict.triggered) {
       if (verdict.limitReached) {
         const last = this.triggerState.limitNoticeByUser.get(m.senderId) ?? 0;

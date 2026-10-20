@@ -16,33 +16,47 @@ export function namesOf(settings) {
 }
 
 // 回傳 { triggered, reason, question, matchedName, limitReached }
-// reason 代碼: self / no_name / name_only / not_question / not_at_start / cooldown / daily_limit / ok
-export function evaluateTrigger({ text, senderId, selfId, settings, state, now = new Date() }) {
+// reason 代碼: self / no_name / name_only / not_question / not_at_start / cooldown / daily_limit / ok / quote
+// quotedSelf: 本則訊息引用 (reply) 的是機器人自己發的訊息 — 使用者已明確指向機器人, 視同名字觸發:
+// 不要求文字含名、略過寬嚴的意圖/句首判定; 但冷卻與每日上限照舊, 文字為空仍不觸發。
+export function evaluateTrigger({ text, senderId, selfId, settings, state, now = new Date(), quotedSelf = false }) {
   const base = { triggered: false, question: "", matchedName: "" };
   if (selfId && senderId === selfId) return { ...base, reason: "self" };
   if (typeof text !== "string" || !text.trim()) return { ...base, reason: "empty" };
   const names = namesOf(settings);
   const matchedName = names.find((n) => text.includes(n)) ?? "";
-  if (!matchedName) return { ...base, reason: "no_name" };
-  // 問題 = 去掉名字與開頭標點後的剩餘文字 (名字在句中時, 取名字前後較長的一段)
-  const idx = text.indexOf(matchedName);
+  if (!matchedName && !quotedSelf) return { ...base, reason: "no_name" };
   const clean = (s) => s.replace(LEADING_PUNCT, "").replace(/[\s,，、:：;；]+$/, "").trim();
-  const before = clean(text.slice(0, idx));
-  const after = clean(text.slice(idx + matchedName.length));
-  const question = after.length >= before.length ? after : before;
-  if (!question) return { ...base, triggered: true, reason: "name_only", matchedName, question: "" };
-  const mode = settings.triggerMode ?? "standard";
-  if (mode === "strict" && idx !== text.search(/\S/)) return { ...base, reason: "not_at_start", matchedName };
-  if (mode === "standard") {
-    const looksLikeAsk = QUESTION_HINTS.some((h) => question.includes(h));
-    if (!looksLikeAsk) return { ...base, reason: "not_question", matchedName, question };
+  let question;
+  let idx = -1;
+  if (matchedName) {
+    // 問題 = 去掉名字與開頭標點後的剩餘文字 (名字在句中時, 取名字前後較長的一段)
+    idx = text.indexOf(matchedName);
+    const before = clean(text.slice(0, idx));
+    const after = clean(text.slice(idx + matchedName.length));
+    question = after.length >= before.length ? after : before;
+  } else {
+    // 引用續答: 沒有名字可去掉, 整段文字就是追問內容
+    question = clean(text);
+  }
+  if (!question) {
+    if (matchedName) return { ...base, triggered: true, reason: "name_only", matchedName, question: "" };
+    return { ...base, reason: "empty" };
+  }
+  if (!quotedSelf) {
+    const mode = settings.triggerMode ?? "standard";
+    if (mode === "strict" && idx !== text.search(/\S/)) return { ...base, reason: "not_at_start", matchedName };
+    if (mode === "standard") {
+      const looksLikeAsk = QUESTION_HINTS.some((h) => question.includes(h));
+      if (!looksLikeAsk) return { ...base, reason: "not_question", matchedName, question };
+    }
   }
   rollDaily(state, now);
   const last = state.lastByUser.get(senderId) ?? 0;
   const cooldownMs = (settings.cooldownSec ?? 20) * 1000;
   if (now.getTime() - last < cooldownMs) return { ...base, reason: "cooldown", matchedName, question };
   if (state.daily.count >= (settings.dailyLimit ?? 100)) return { ...base, reason: "daily_limit", matchedName, question, limitReached: true };
-  return { triggered: true, reason: "ok", matchedName, question };
+  return { triggered: true, reason: quotedSelf && !matchedName ? "quote" : "ok", matchedName, question };
 }
 
 export function markTriggered(state, senderId, now = new Date()) {

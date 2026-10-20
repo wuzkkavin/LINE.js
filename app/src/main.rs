@@ -1436,7 +1436,7 @@ impl App {
                 ui.label("別名 (可多個, 用逗號分開):");
                 ui.add(egui::TextEdit::singleline(&mut self.form.aliases_text).desired_width(280.0));
             });
-            ui.label("群組裡有人在訊息中提到這個名字 (含問句或請求), AI寶 就會回應。");
+            ui.label("群組裡有人在訊息中提到這個名字 (含問句或請求), 或引用機器人自己的回答再追問, 機器人就會回應。");
             ui.horizontal(|ui| {
                 ui.label("觸發寬嚴:");
                 for (val, label) in [("relaxed", "寬鬆"), ("standard", "標準"), ("strict", "嚴格")] {
