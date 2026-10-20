@@ -234,6 +234,50 @@ test("ai: 一直 reasoning-only 時 testConnection 仍判定連通並註明推�
   assert.equal(chatErr?.code, "AI_REASONING_ONLY");
 });
 
+test("ai: Groq 形狀 (message 無 reasoning 欄位、證據在 usage.reasoning_tokens、finish=stop) 不誤判", async (t) => {
+  // 2026-10-20 老吳實機: Groq 的 gpt-oss 回應長這樣 — content 空、finish_reason=stop,
+  // 推理證據只在 usage.completion_tokens_details.reasoning_tokens。舊邏輯只看 message 欄位與 finish=length, 直接誤判「沒有回答內容」。
+  const seen = [];
+  const { server, url } = await aiStubServer((body) => {
+    seen.push(body);
+    if (body.max_tokens < 1024) {
+      return { body: { model: body.model, choices: [{ message: { role: "assistant", content: "" }, finish_reason: "stop" }], usage: { prompt_tokens: 12, completion_tokens: 200, completion_tokens_details: { reasoning_tokens: 200 } } } };
+    }
+    return { body: { model: body.model, choices: [{ message: { role: "assistant", content: "OK" }, finish_reason: "stop" }], usage: { prompt_tokens: 12, completion_tokens: 210, completion_tokens_details: { reasoning_tokens: 205 } } } };
+  });
+  t.after(() => server.close());
+  const ai = createAiClient({});
+  const tc = await ai.testConnection({ baseUrl: url, model: "openai/gpt-oss-120b" }, "sk-GROQ-0000bbbb");
+  assert.equal(tc.ok, true, "Groq 形狀的推理回應應判定連通");
+  assert.ok(seen.length >= 2, "content 為空但有推理 token 證據時應加倍額度重試");
+  assert.ok(seen.every((b) => b.reasoning_effort === "low"), "gpt-oss 系列每次呼叫都要帶 reasoning_effort=low");
+});
+
+test("ai: Groq 形狀一直回空 (silent empty) 時 testConnection 仍判定連通", async (t) => {
+  const { server, url } = await aiStubServer((body) => ({ body: { model: body.model, choices: [{ message: { role: "assistant", content: "" }, finish_reason: "stop" }], usage: { prompt_tokens: 12, completion_tokens: 180, completion_tokens_details: { reasoning_tokens: 180 } } } }));
+  t.after(() => server.close());
+  const ai = createAiClient({});
+  const tc = await ai.testConnection({ baseUrl: url, model: "openai/gpt-oss-120b" }, "sk-GROQ-0000bbbb");
+  assert.equal(tc.ok, true);
+  assert.equal(tc.reasoningOnly, true);
+  const chatErr = await ai.chat({ baseUrl: url, apiKey: "sk-GROQ-0000bbbb", model: "openai/gpt-oss-120b", messages: [{ role: "user", content: "hi" }] }).then(() => null, (e) => e);
+  assert.equal(chatErr?.code, "AI_REASONING_ONLY", "正式 chat 沒內容仍要報錯, 不能把空回答當成功");
+});
+
+test("ai: 非 gpt-oss 模型不送 reasoning_effort; 無 usage 的空回應仍判格式不正確", async (t) => {
+  const seen = [];
+  const { server, url } = await aiStubServer((body) => {
+    seen.push(body);
+    return { body: { model: body.model, choices: [{ message: { role: "assistant", content: "" }, finish_reason: "stop" }] } };
+  });
+  t.after(() => server.close());
+  const ai = createAiClient({});
+  const tc = await ai.testConnection({ baseUrl: url, model: "llama-3.3-70b-versatile" }, "sk-GROQ-0000cccc");
+  assert.equal(tc.ok, false, "沒有任何完成證據的空回應不能判定連通");
+  assert.match(tc.message, /沒有回答內容/);
+  assert.ok(seen.every((b) => !("reasoning_effort" in b)), "非 gpt-oss 模型不得送 Groq 專屬參數");
+});
+
 test("linecfg: config.yaml api 區塊解析與白名單寫入 (備份、驗證、防重複)", async () => {
   const { writeFileSync, readFileSync } = await import("node:fs");
   const dir = await tmp();
@@ -369,6 +413,9 @@ test("console: 設定 API 遮罩、頁面有粉圓字體與動態標題, 診斷�
   assert.ok(!JSON.stringify(view).includes("sk-CONSOLE-KEY-5555qrst"));
   assert.equal(view.ai.providers.openai.last4, "qrst");
   assert.equal(view.botName, "AI寶");
+  const status = await (await fetch(base + "/api/status")).json();
+  assert.equal(status.service, "aibao-helper", "/api/status 必須帶身分標記, 原生 App 靠它分辨 3790 上的是新版還是舊版 helper");
+  assert.ok(status.capabilities.includes("list-models"));
   const zipRes = await fetch(base + "/api/diagnostic");
   const zipBuf = Buffer.from(await zipRes.arrayBuffer());
   assert.equal(zipBuf.subarray(0, 2).toString(), "PK");

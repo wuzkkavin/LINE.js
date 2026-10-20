@@ -93,7 +93,9 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         return res.end(font);
       }
       if (req.method === "GET" && path === "/api/status") {
-        return json(res, 200, { version, bot: bot ? bot.status() : null, serverTime: new Date().toISOString() });
+        // service/capabilities 是身分標記: 原生 App 用它分辨 3790 上的是不是新版 helper,
+        // 避免把還在跑的舊版 AI寶.exe (無 list-models、舊測試邏輯) 誤認成自己的服務 (2026-10-20 老吳實機踩到)。
+        return json(res, 200, { service: "aibao-helper", version, capabilities: ["list-models", "line-config", "token-gen"], bot: bot ? bot.status() : null, serverTime: new Date().toISOString() });
       }
       if (req.method === "GET" && path === "/api/settings") {
         return json(res, 200, await settings.publicView(secrets));

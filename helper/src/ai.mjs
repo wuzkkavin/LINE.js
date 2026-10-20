@@ -16,7 +16,7 @@ export function createAiClient({ fetchImpl = fetch, timeoutMs = 30000 } = {}) {
     return `${String(baseUrl).replace(/\/$/, "")}${path}`;
   }
 
-  async function chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens }) {
+  async function chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens, reasoningEffort }) {
     const url = endpoint(baseUrl, "/chat/completions");
     const started = Date.now();
     let res;
@@ -24,7 +24,8 @@ export function createAiClient({ fetchImpl = fetch, timeoutMs = 30000 } = {}) {
       res = await fetchImpl(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens }),
+        // reasoning_effort 只在呼叫端判定為 gpt-oss 系列時才帶 (Groq 專屬參數, 其他供應商送了可能被拒)
+        body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens, ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}) }),
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (e) {
@@ -42,9 +43,15 @@ export function createAiClient({ fetchImpl = fetch, timeoutMs = 30000 } = {}) {
     const content = typeof msg?.content === "string" ? msg.content.trim() : "";
     // 推理模型 (如 gpt-oss) 會先把回覆額度花在 reasoning 上, content 可能為空但 reasoning 有內容
     const reasoning = [msg?.reasoning, msg?.reasoning_content].find((v) => typeof v === "string" && v.trim()) ?? "";
+    // Groq 的 gpt-oss 回應 message 裡沒有 reasoning 欄位, 推理證據在 usage.completion_tokens_details.reasoning_tokens
+    // (2026-10-20 老吳實機: 只看 message 欄位會漏判, 測試連線被誤判「沒有回答內容」)
+    const reasoningTokens = Number(body?.usage?.completion_tokens_details?.reasoning_tokens ?? 0) || 0;
+    const completionTokens = Number(body?.usage?.completion_tokens ?? 0) || 0;
     return {
       content,
       reasoning,
+      reasoningTokens,
+      completionTokens,
       finishReason: choice?.finish_reason ?? "",
       latencyMs,
       model: body?.model ?? model,
@@ -57,15 +64,23 @@ export function createAiClient({ fetchImpl = fetch, timeoutMs = 30000 } = {}) {
     if (!baseUrl || !model) throw new AiError("AI 設定不完整: 缺少 Base URL 或模型名稱", { code: "AI_CONFIG" });
     if (!apiKey) throw new AiError("尚未設定這家 AI 的 API Key, 請先到設定頁填寫並儲存", { code: "AI_NO_KEY" });
     const firstTokens = maxTokens ?? DEFAULT_MAX_TOKENS;
-    const first = await chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens: firstTokens });
+    // gpt-oss 系列是推理模型: 帶 reasoning_effort=low, 降低「silent empty generation」
+    // (finish_reason=stop 卻吐空內容) 的機率 (Groq 實測解法); 只對 gpt-oss 送, 避免其他供應商拒收未知參數
+    const reasoningEffort = /gpt-oss/i.test(model) ? "low" : undefined;
+    const first = await chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens: firstTokens, reasoningEffort });
     if (first.content) return { content: first.content, latencyMs: first.latencyMs, model: first.model, usage: first.usage };
     if (!first.hasChoices) throw new AiError("AI 服務回應格式不正確 (沒有回答內容)", { code: "AI_BAD_RESPONSE" });
-    const reasoningOnly = Boolean(first.reasoning) || first.finishReason === "length";
-    if (!reasoningOnly) throw new AiError("AI 服務回應格式不正確 (沒有回答內容)", { code: "AI_BAD_RESPONSE" });
+    // 「模型確實有在工作」的證據: reasoning 文字、被額度截斷 (length)、usage 裡的推理 token 數、
+    // 或任何 completion token 數 (gpt-oss 的 silent empty 是 finish=stop + content 空, 但 token 數不為零)。
+    // 完全沒有這些證據 (連 usage 都沒有) 才是真的格式不正確。
+    const reasoningEvidence = Boolean(first.reasoning) || first.finishReason === "length" || first.reasoningTokens > 0;
+    if (!reasoningEvidence && first.completionTokens <= 0) {
+      throw new AiError("AI 服務回應格式不正確 (沒有回答內容)", { code: "AI_BAD_RESPONSE" });
+    }
     // 推理模型把額度都用在思考上: 自動把額度加倍重試一次, 讓回答有機會產生
     const bigger = Math.min(firstTokens * 2, MAX_MAX_TOKENS);
     if (bigger > firstTokens) {
-      const second = await chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens: bigger });
+      const second = await chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens: bigger, reasoningEffort });
       if (second.content) return { content: second.content, latencyMs: first.latencyMs + second.latencyMs, model: second.model, usage: second.usage };
     }
     throw new AiError("AI 把回覆額度都用在思考上, 沒有產生回答內容; 可以換一個模型, 或稍後再試一次", { code: "AI_REASONING_ONLY" });
