@@ -69,6 +69,9 @@ pub fn run_probe() -> i32 {
         // 身分標記也要在 (新版 helper 才有; App 靠它分辨新舊服務)
         let has_identity = text.contains("\"service\":\"aibao-helper\"") || text.contains("\"service\": \"aibao-helper\"");
         rec(format!("helper_status_identity={has_identity}"));
+        // 機器人連線狀態欄位 (botConnected): 總覽靠它把「LINE 已登入」與「機器人已連線」分開顯示
+        let has_bot_connected = text.contains("\"botConnected\"");
+        rec(format!("helper_status_bot_connected_field={has_bot_connected}"));
     }
     // 4b) payload 端點實測: 實際 POST /api/list-models 與 /api/test-ai, 用回應內容證明路由存在。
     // list-models 不給 Key → 正確行為是 HTTP 200 + {ok:false, code:"AI_NO_KEY"}; 若回 404 就是路由不在 (實機踩過)。

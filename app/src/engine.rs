@@ -13,6 +13,38 @@ pub const ENGINE_ID: &str = env!("AIBAO_ENGINE_ID");
 pub const CORE_PORT: u16 = 3789;
 pub const HELPER_PORT: u16 = 3790;
 
+/// 佔用者明細: 逐埠列出 listen 行程的 PID 與映像名稱 (取得到才列), 附在 Foreign 說明後面 —
+/// 只說「不明程式」使用者無從辨認 (2026-10-20 補充要求): 有了 PID 與程式名, 就能在工作管理員對上號,
+/// 也能分辨到底是自家 stack 還在跑、還是真的外來程式 (例如其他工具遺留的 node 服務)。
+fn occupant_detail() -> String {
+    #[cfg(windows)]
+    {
+        let mut parts: Vec<String> = Vec::new();
+        for port in [CORE_PORT, HELPER_PORT] {
+            let pids = crate::platform::listening_pids(port);
+            if pids.is_empty() {
+                parts.push(format!("埠 {port}: 查不到 listen 行程"));
+                continue;
+            }
+            let descs: Vec<String> = pids
+                .iter()
+                .map(|pid| {
+                    let name = crate::platform::process_image_path(*pid)
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                        .unwrap_or_else(|| "名稱未知".to_string());
+                    format!("行程 {pid} ({name})")
+                })
+                .collect();
+            parts.push(format!("埠 {port}: {}", descs.join("、")));
+        }
+        format!("佔用者: {}", parts.join("; "))
+    }
+    #[cfg(not(windows))]
+    {
+        "佔用者: 此平台無法取得行程資訊".to_string()
+    }
+}
+
 /// 埠被外來程式佔用時的白話訊息 (顯示在主視窗狀態區, 要讓使用者知道下一步怎麼做)。
 /// 注意分界: 「不認識的程式」才是 Foreign; 舊版 AI寶 (無身分標記的自家舊世代) 歸 Legacy, 由殼收編並負責結束, 不走這段訊息。
 pub const FOREIGN_PORT_MESSAGE: &str = "連接埠被不明程式佔用了: 在這台電腦上回應的不是 AI寶 的服務 (任何世代都不是)。AI寶 先不啟動、也不會去動對方的程式。請先關閉佔用連接埠 3789 或 3790 的程式 (可以在工作管理員查看), 再重新開啟 AI寶。";
@@ -30,8 +62,32 @@ enum SvcClass {
     Current,
     /// 舊世代 AI寶 (核心仍是 LINE.js 網頁; helper /api/status 是舊形狀 {version, bot, serverTime} 無身分標記)
     Legacy,
-    /// 不明程式 (有回應但形狀不符任何世代)
+    /// 不明程式 (有完整回應但形狀不符任何世代)
     Foreign,
+    /// 身分未定: 埠上有回應 (HTTP 狀態探得到) 但 body 讀不完整 — 服務可能正在退場或啟動中。
+    /// 這是「重開撞到自己上一代還在退場」的競態窗口 (2026-10-20 老吳實機定案之三):
+    /// 不可直接判 Foreign, 必須等待重探讓對方退場完成或啟動完成後再定案。
+    Flapping,
+}
+
+/// 單一埠探測的原始結果: 先分「完全無回應 / 回應不完整 / 有完整 body」三層, 再依 body 形狀分類。
+enum PortProbe {
+    NoResponse,
+    Incomplete,
+    Body(String),
+}
+
+fn probe_port(port: u16, path: &str) -> PortProbe {
+    match http_get_text(port, path) {
+        Some(text) => PortProbe::Body(text),
+        None => {
+            if http_status(port, path).is_some() {
+                PortProbe::Incomplete
+            } else {
+                PortProbe::NoResponse
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +126,12 @@ pub struct EngineManager {
     #[cfg(not(windows))]
     proc: Option<std::process::Child>,
     started_at: Option<Instant>,
+    /// Starting 期間 helper 被判 Foreign 的連續次數 (要連續成立才鎖 Failed, 防啟動窗口的短暫異常形狀)
+    starting_foreign_strikes: u8,
+    /// Failed/ExternalRunning 狀態校正重探的節流時間點 (服務實際狀態變了, 殼要跟著改, 不鎖死舊判定)
+    recovery_probe_at: Option<Instant>,
+    /// 接手的引擎連續無回應次數 (達 2 次才改判已停止, 防單次探測抖動)
+    external_gone_strikes: u8,
 }
 
 impl Default for EngineManager {
@@ -87,6 +149,9 @@ impl EngineManager {
             job: None,
             proc: None,
             started_at: None,
+            starting_foreign_strikes: 0,
+            recovery_probe_at: None,
+            external_gone_strikes: 0,
         }
     }
 
@@ -145,8 +210,8 @@ impl EngineManager {
     /// 分類核心埠 (3789): 現行與舊世代的核心都是 LINE.js 網頁 (GET / 回 HTML);
     /// 回 JSON 或其他形狀的是不明程式; 連不上是 None。
     fn classify_core() -> SvcClass {
-        match http_get_text(CORE_PORT, "/") {
-            Some(text) => {
+        match probe_port(CORE_PORT, "/") {
+            PortProbe::Body(text) => {
                 let head: String = text.chars().take(512).collect::<String>().to_lowercase();
                 if head.contains("<html") || head.contains("<!doctype") {
                     SvcClass::Current
@@ -154,13 +219,8 @@ impl EngineManager {
                     SvcClass::Foreign
                 }
             }
-            None => {
-                if http_status(CORE_PORT, "/").is_some() {
-                    SvcClass::Foreign
-                } else {
-                    SvcClass::None
-                }
-            }
+            PortProbe::Incomplete => SvcClass::Flapping,
+            PortProbe::NoResponse => SvcClass::None,
         }
     }
 
@@ -168,8 +228,8 @@ impl EngineManager {
     /// 目前世代: {service:"aibao-helper", capabilities, bot, ...}; 舊世代 (4a54c35 網頁版與 1314fb3 第一代殼同形):
     /// {version, bot, serverTime} 無 service 欄位。有回應但兩種形狀都不是 (例如 CI 的 stub 只有 {version, bot}、缺 serverTime) → Foreign。
     fn classify_helper() -> SvcClass {
-        match http_get_text(HELPER_PORT, "/api/status") {
-            Some(text) => {
+        match probe_port(HELPER_PORT, "/api/status") {
+            PortProbe::Body(text) => {
                 let v: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(_) => return SvcClass::Foreign,
@@ -182,19 +242,52 @@ impl EngineManager {
                 }
                 SvcClass::Foreign
             }
-            None => {
-                if http_status(HELPER_PORT, "/api/status").is_some() {
-                    SvcClass::Foreign
-                } else {
-                    SvcClass::None
-                }
-            }
+            PortProbe::Incomplete => SvcClass::Flapping,
+            PortProbe::NoResponse => SvcClass::None,
         }
     }
 
     /// 同時分類兩埠, 回傳 (核心, helper)。
     fn probe_classes() -> (SvcClass, SvcClass) {
         (Self::classify_core(), Self::classify_helper())
+    }
+
+    /// 啟動前專用的身分確認 (多輪重探): 單輪探測可能正好撞上自家引擎「正在退場/正在啟動」的窗口 —
+    /// 對方還在 listen、能回 HTTP 狀態, 但 body 送不完整 (Flapping); 舊版在這種窗口把 body 讀不到
+    /// 直接判 Foreign, 於是「結束後立刻重開」被誤判成不明程式佔埠並鎖死異常停止 (2026-10-20 實機)。
+    /// 定案規則: 任一輪乾淨 (無 Foreign、無 Flapping) 立即定案; Foreign 必須連續兩輪都由完整 body
+    /// 證據成立才定案; 輪次耗盡仍 Flapping 時, 視為「持續有回應卻永遠無法辨識」→ 改判 Foreign
+    /// (真外來程式的特徵; 自家引擎的退場/啟動窗口會在輪次內自己結束)。
+    fn probe_classes_confirmed(max_rounds: u32, wait: Duration) -> (SvcClass, SvcClass) {
+        let mut last = Self::probe_classes();
+        let mut foreign_strikes = 0u32;
+        for round in 1..=max_rounds {
+            let (c, h) = last;
+            let has_foreign = c == SvcClass::Foreign || h == SvcClass::Foreign;
+            let has_flap = c == SvcClass::Flapping || h == SvcClass::Flapping;
+            if !has_foreign && !has_flap {
+                return last;
+            }
+            if has_foreign {
+                foreign_strikes += 1;
+                if foreign_strikes >= 2 {
+                    return last;
+                }
+            } else {
+                foreign_strikes = 0;
+            }
+            if round == max_rounds {
+                break;
+            }
+            shell::log_line(&format!(
+                "埠上服務身分未定 (核心={c:?}, helper={h:?}; 可能正在退場或啟動中), 等待後重探 (下一輪 {}/{max_rounds})",
+                round + 1
+            ));
+            std::thread::sleep(wait);
+            last = Self::probe_classes();
+        }
+        let settle = |c: SvcClass| if c == SvcClass::Flapping { SvcClass::Foreign } else { c };
+        (settle(last.0), settle(last.1))
     }
 
     /// 啟動引擎。冪等: 已在跑就直接回報目前狀態。
@@ -208,11 +301,13 @@ impl EngineManager {
         // Current (目前世代, 例如另一個新版 AI寶 或新版網頁版啟的): 收編為 ExternalRunning, 只顯示狀態, 結束時走 stop() 的收編路徑。
         // Legacy (舊世代 AI寶): 不能直接收編來用 — 舊 helper 沒有目前世代的端點 (list-models 等), 收編等於重演 404 陷阱;
         // 正確收編是先把舊殘留清乾淨 (與 stop() 同一條強制清除路徑), 再啟動目前世代引擎, 使用者打開新版 App 就是要用新版。
-        let (core_cls, helper_cls) = Self::probe_classes();
+        // 身分判定走多輪確認: 避免撞上自家上一代引擎退場窗口 (Flapping) 被誤判 Foreign 鎖死。
+        let (core_cls, helper_cls) = Self::probe_classes_confirmed(4, Duration::from_millis(700));
         if core_cls == SvcClass::Foreign || helper_cls == SvcClass::Foreign {
-            let msg = FOREIGN_PORT_MESSAGE.to_string();
+            let detail = occupant_detail();
+            let msg = format!("{FOREIGN_PORT_MESSAGE}\n{detail}");
             self.state = EngineState::Failed(msg.clone());
-            shell::log_line("偵測到連接埠被不明程式佔用 (世代分類=Foreign), 已擋下並提示使用者");
+            shell::log_line(&format!("偵測到連接埠被不明程式佔用 (世代分類=Foreign, 多輪確認後定案), 已擋下並提示使用者。{detail}"));
             return Err(msg);
         }
         let any_alive = core_cls != SvcClass::None || helper_cls != SvcClass::None;
@@ -272,9 +367,10 @@ impl EngineManager {
                     // 監督者結束但埠還在: 依世代分類標示 — 不明程式 (Foreign) 明確標示;
                     // 其餘是 AI寶 某世代的服務還活著 (例如被別的實例接手), 收編為 ExternalRunning 顯示狀態。
                     if Self::any_service_alive() {
-                        let (core_cls, helper_cls) = Self::probe_classes();
+                        // 一樣走多輪確認: 監督者剛退場的瞬間最容易撞上退場窗口的 Flapping/跨界誤判
+                        let (core_cls, helper_cls) = Self::probe_classes_confirmed(2, Duration::from_millis(600));
                         if core_cls == SvcClass::Foreign || helper_cls == SvcClass::Foreign {
-                            self.state = EngineState::Failed(FOREIGN_PORT_MESSAGE.to_string());
+                            self.state = EngineState::Failed(format!("{FOREIGN_PORT_MESSAGE}\n{}", occupant_detail()));
                         } else {
                             self.state = EngineState::ExternalRunning;
                         }
@@ -290,12 +386,20 @@ impl EngineManager {
                     let helper_cls = Self::classify_helper();
                     if core_up && helper_cls == SvcClass::Current {
                         self.state = EngineState::Running;
+                        self.starting_foreign_strikes = 0;
                         shell::log_line("引擎就緒: 核心 3789 與 helper 3790 皆回應 (身分驗證通過)");
                     } else if helper_cls == SvcClass::Foreign {
-                        // 雙埠有回應但 3790 不是 AI寶 的服務: 自己的 helper 綁埠失敗, 埠被不明程式佔用
-                        self.state = EngineState::Failed(FOREIGN_PORT_MESSAGE.to_string());
-                        shell::log_line("引擎啟動時發現連接埠被不明程式佔用 (世代分類=Foreign)");
-                        return;
+                        // 自己的 helper 還在啟動窗口時, 3790 可能短暫是別的東西在退場 (或回應形狀未定);
+                        // 連續 3 次探測都由完整 body 證明是 Foreign 才定案, 不因單次命中就鎖死。
+                        self.starting_foreign_strikes += 1;
+                        if self.starting_foreign_strikes >= 3 {
+                            let detail = occupant_detail();
+                            self.state = EngineState::Failed(format!("{FOREIGN_PORT_MESSAGE}\n{detail}"));
+                            shell::log_line(&format!("引擎啟動時發現連接埠被不明程式佔用 (世代分類=Foreign, 連續探測確認)。{detail}"));
+                            return;
+                        }
+                    } else {
+                        self.starting_foreign_strikes = 0;
                     }
                 }
                 if self.state == EngineState::Starting {
@@ -303,6 +407,40 @@ impl EngineManager {
                         if t.elapsed() > Duration::from_secs(90) {
                             self.state = EngineState::Failed("引擎啟動逾時 (90 秒未就緒), 請看紀錄頁的 launcher 記錄".to_string());
                         }
+                    }
+                }
+            }
+            EngineState::Failed(_) | EngineState::ExternalRunning => {
+                // 狀態校正: Failed 多半是啟動當下的判定 (例如撞上上一代退場窗口被判 Foreign),
+                // 但服務的實際狀態會變 — 引擎後來自己起來了 (或接手的引擎已退場), 殼必須跟著改,
+                // 不得鎖死在舊判定 (2026-10-20 實機: 殼顯示異常停止, helper 其實已在跑)。
+                // 只在殼手上沒有自己的行程時做 (有行程的狀態由 Starting/Running 分支負責), 每 4 秒一輪。
+                if self.proc.is_some() {
+                    return;
+                }
+                let due = self.recovery_probe_at.map(|t| t.elapsed() >= Duration::from_secs(4)).unwrap_or(true);
+                if !due {
+                    return;
+                }
+                self.recovery_probe_at = Some(Instant::now());
+                let (core_cls, helper_cls) = Self::probe_classes();
+                let current_alive = helper_cls == SvcClass::Current
+                    && matches!(core_cls, SvcClass::Current | SvcClass::None);
+                let all_gone = core_cls == SvcClass::None && helper_cls == SvcClass::None;
+                if matches!(self.state, EngineState::Failed(_)) && current_alive {
+                    self.state = EngineState::ExternalRunning;
+                    shell::log_line("狀態校正: 先前判定已過時 — 目前世代引擎實際在執行, 改為接手顯示狀態 (執行中)");
+                } else if matches!(self.state, EngineState::ExternalRunning) {
+                    if all_gone {
+                        self.external_gone_strikes += 1;
+                        if self.external_gone_strikes >= 2 {
+                            self.external_gone_strikes = 0;
+                            self.state = EngineState::Stopped;
+                            self.pid = None;
+                            shell::log_line("狀態校正: 接手的引擎已不在執行 (雙埠連續無回應), 狀態改為已停止");
+                        }
+                    } else {
+                        self.external_gone_strikes = 0;
                     }
                 }
             }
@@ -339,8 +477,17 @@ impl EngineManager {
     /// Failed 狀態 (多半是啟動時就被 Foreign 擋下) 一律走本函式完整分類判定 — 舊版沒有專屬分支、落進「自己引擎」區塊,
     /// 又在逾時後謊報成功直接關窗, 是老吳實機「結束了但服務還在」的定案根因之二。
     pub fn stop(&mut self) -> StopOutcome {
-        // 先逐埠分類現況 (Failed / External / 任何狀態都一樣辦理, 不依 state 猜)
-        let (core_cls, helper_cls) = Self::probe_classes();
+        // 先逐埠分類現況 (Failed / External / 任何狀態都一樣辦理, 不依 state 猜)。
+        // Flapping (回應不完整) 先等 1.5 秒重探一次: 服務可能正在退場, 不能把退場中的自家服務
+        // 當成不明程式擋下; 重探後仍 Flapping 就當作自家服務走正常結束流程 (階段 1 訊號+等待會處理)。
+        let (mut core_cls, mut helper_cls) = Self::probe_classes();
+        if core_cls == SvcClass::Flapping || helper_cls == SvcClass::Flapping {
+            std::thread::sleep(Duration::from_millis(1500));
+            let again = Self::probe_classes();
+            core_cls = if again.0 == SvcClass::Flapping { SvcClass::Current } else { again.0 };
+            helper_cls = if again.1 == SvcClass::Flapping { SvcClass::Current } else { again.1 };
+            shell::log_line("結束前探測: 埠上服務回應不完整 (可能正在退場), 已重探並依自家服務流程處理");
+        }
         if core_cls == SvcClass::None && helper_cls == SvcClass::None {
             return self.finish_stopped(StopOutcome::AlreadyStopped, "結束檢查: 雙埠皆無服務, 本來就沒在跑");
         }
@@ -505,7 +652,21 @@ impl EngineManager {
             } else if pids.is_empty() {
                 format!("埠 {port}: {cls:?} (查不到 listen 行程)")
             } else {
-                format!("埠 {port}: {cls:?} (行程 {})", pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
+                let descs: Vec<String> = pids
+                    .iter()
+                    .map(|pid| {
+                        #[cfg(windows)]
+                        let name = crate::platform::process_image_path(*pid)
+                            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
+                        #[cfg(not(windows))]
+                        let name: Option<String> = None;
+                        match name {
+                            Some(n) => format!("{pid} ({n})"),
+                            None => pid.to_string(),
+                        }
+                    })
+                    .collect();
+                format!("埠 {port}: {cls:?} (行程 {})", descs.join(", "))
             }
         };
         format!("{}; {}", fmt(CORE_PORT, core_cls), fmt(HELPER_PORT, helper_cls))
