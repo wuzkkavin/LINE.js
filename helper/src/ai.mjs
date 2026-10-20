@@ -103,7 +103,7 @@ export function createAiClient({ fetchImpl = fetch, timeoutMs = DEFAULT_CHAT_TIM
     try {
       first = await chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens: firstTokens, reasoningEffort, timeoutMs: callTimeoutMs });
     } catch (e) { logDetail("AI 呼叫失敗 (原始細節)", e); throw e; }
-    if (first.content) return { content: first.content, latencyMs: first.latencyMs, model: first.model, usage: first.usage };
+    if (first.content) return { content: first.content, latencyMs: first.latencyMs, model: first.model, usage: first.usage, finishReason: first.finishReason };
     if (!first.hasChoices) throw new AiError("AI 服務回應格式不正確 (沒有回答內容)", { code: "AI_BAD_RESPONSE" });
     // 「模型確實有在工作」的證據: reasoning 文字、被額度截斷 (length)、usage 裡的推理 token 數、
     // 或任何 completion token 數 (gpt-oss 的 silent empty 是 finish=stop + content 空, 但 token 數不為零)。
@@ -116,7 +116,7 @@ export function createAiClient({ fetchImpl = fetch, timeoutMs = DEFAULT_CHAT_TIM
     const bigger = Math.min(firstTokens * 2, MAX_MAX_TOKENS);
     if (bigger > firstTokens) {
       const second = await chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens: bigger, reasoningEffort, timeoutMs: callTimeoutMs }).catch((e) => { logDetail("AI 呼叫失敗 (原始細節)", e); throw e; });
-      if (second.content) return { content: second.content, latencyMs: first.latencyMs + second.latencyMs, model: second.model, usage: second.usage };
+      if (second.content) return { content: second.content, latencyMs: first.latencyMs + second.latencyMs, model: second.model, usage: second.usage, finishReason: second.finishReason };
     }
     throw new AiError("AI 把回覆額度都用在思考上, 沒有產生回答內容; 可以換一個模型, 或稍後再試一次", { code: "AI_REASONING_ONLY" });
   }

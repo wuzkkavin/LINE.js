@@ -19,6 +19,48 @@ export function kbMissText() {
   return "這個問題我在公司的知識庫裡查不到，所以不敢亂答。建議你問一下資訊部同事，或請管理員把相關文件放進知識庫資料夾，我下次就能回答了。";
 }
 
+// --- 長回答交付 (2026-10-20 驗收修復, 老吳新規格) ---
+// 群組回答的 AI 回覆額度: ai.mjs 的通用預設只有 1024 tokens, 中文一字約一 token,
+// 稍長的條列回答就會被 finish_reason=length 切在半句 (實機長篇自我介紹即此症)。
+// 群組問答改用 4096 (ai.mjs 的額度上限同為 4096), 一般長答覆足夠完整。
+export const ANSWER_MAX_TOKENS = 4096;
+// 一則文字訊息可送的字數上限: 核心 message:send 的 textMaxLength 預設 8000 字
+// (核心 src/config.ts 與 config.example.yaml), 超過會被核心直接拒收 (INVALID_REQUEST),
+// 以前就是整則回答默默消失。超過這個字數改走文字檔交付 (老吳 2026-10-20 新規格)。
+export const TEXT_SEND_LIMIT = 8000;
+// 文字檔的位元組上限: 核心機器人檔案影格的上限同值 (核心 src/ws/requests.ts MAX_BOT_FILE_BYTES),
+// 要留在 WS 影格大小 (frameMaxBytes 256KB, base64 後約 175KB) 的安全範圍內。
+export const FILE_SEND_MAX_BYTES = 128 * 1024;
+
+// 回答檔名: AI寶回答-<日期>-<主題>.txt; 主題取問題前幾個字, 去掉檔名不允許的字元與空白。
+export function answerFilename(question, now = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
+  const topic = String(question ?? "").replace(/[\\/:*?"<>|\s]+/g, "").slice(0, 10);
+  return topic ? `AI寶回答-${date}-${topic}.txt` : `AI寶回答-${date}.txt`;
+}
+
+// 超長文字分段 (文字檔也送不出去時的最後手段): 優先在段落/換行邊界切, 每段不超過 limit 字;
+// 真的必須硬切時以 Unicode 字元為單位, 不切斷代理對 (surrogate pair)。
+export function splitLongText(text, limit = TEXT_SEND_LIMIT) {
+  const chunks = [];
+  let rest = String(text ?? "");
+  while (rest.length > limit) {
+    const window = rest.slice(0, limit);
+    let cut = Math.max(window.lastIndexOf("\n\n"), window.lastIndexOf("\n"));
+    if (cut < Math.floor(limit * 0.5)) cut = -1; // 換行點太靠前就不採用, 改硬切
+    if (cut <= 0) {
+      cut = limit;
+      const code = rest.charCodeAt(cut - 1);
+      if (code >= 0xd800 && code <= 0xdbff) cut -= 1; // 不切斷代理對 (emoji 等)
+    }
+    chunks.push(rest.slice(0, cut).trimEnd());
+    rest = rest.slice(cut).trimStart();
+  }
+  if (rest) chunks.push(rest);
+  return chunks.filter((c) => c.length);
+}
+
 // --- 創造者意圖判定 (修復批次一, 第 2 項) ---
 // 命中就直接回 settings.creatorReply, 不呼叫 AI。判定分兩層, 目的是降低誤觸:
 // 1. 「版權 / copyright」是強訊號: 在跟機器人的對話裡問版權, 幾乎就是問機器人本身, 直接命中。
@@ -152,7 +194,7 @@ export class HelperBot {
     if (key) this.logger?.addSecret(key);
     return { cfg, key };
   }
-  async chatWithAi(messages, { temperature = 0.3 } = {}) {
+  async chatWithAi(messages, { temperature = 0.3, maxTokens } = {}) {
     const s = this.cfg();
     const order = [s.ai.active, ...Object.keys(s.ai.providers).filter((p) => p !== s.ai.active)];
     const tries = s.ai.fallback ? order : [s.ai.active];
@@ -161,8 +203,14 @@ export class HelperBot {
       try {
         const { cfg, key } = await this.providerWithKey(pid);
         const started = Date.now();
-        const r = await this.ai.chat({ baseUrl: cfg.baseUrl, model: cfg.model, apiKey: key, messages, temperature });
-        this.logger?.info("AI", "AI 回答完成", { provider: pid, model: cfg.model, ms: Date.now() - started, chars: r.content.length });
+        const r = await this.ai.chat({ baseUrl: cfg.baseUrl, model: cfg.model, apiKey: key, messages, temperature, ...(maxTokens ? { maxTokens } : {}) });
+        this.logger?.info("AI", "AI 回答完成", { provider: pid, model: cfg.model, ms: Date.now() - started, chars: r.content.length, finishReason: r.finishReason ?? "" });
+        // finish_reason=length = 回答被 AI 的回覆額度硬生生切斷 (舊預設 1024 tokens, 中文長答覆很容易撞到,
+        // 2026-10-20 實機的長篇自我介紹就是停在半句)。額度已加大 (ANSWER_MAX_TOKENS), 真的還撞到要在
+        // log 留下明確紀錄, 不能讓截斷無聲無息混進群組。
+        if (r.finishReason === "length") {
+          this.logger?.warn("AI", "AI 回答達到回覆額度上限, 內容可能被截斷", { provider: pid, model: cfg.model, chars: r.content.length, maxTokens: maxTokens ?? null });
+        }
         return { ...r, provider: pid };
       } catch (e) {
         lastErr = e;
@@ -304,6 +352,48 @@ export class HelperBot {
       this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject });
       this.sendFrame({ type: "message:send", requestId, chatId, text, ...(replyTo ? { replyTo } : {}) });
     });
+  }
+
+  // 送文字檔進聊天室 (核心 message:send 的 file 承載; 核心經 LineProvider 以 OBS 上傳送出 FILE 訊息)。
+  // 回核心的 sent 影格走既有 pending 機制; 上傳比純文字慢, 逾時給 30 秒。
+  async sendFile(chatId, filename, bytes) {
+    await this.paceSend();
+    return new Promise((resolve, reject) => {
+      const requestId = `h${++this.reqSeq}-${Date.now()}`;
+      const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error("send file timeout")); }, 30000);
+      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
+      this.sendFrame({ type: "message:send", requestId, chatId, file: { filename, dataBase64: Buffer.from(bytes).toString("base64") } });
+    });
+  }
+
+  // 回答交付: 放得進一則文字訊息就直接送; 超過字數上限改送文字檔 (老吳新規格),
+  // 先有一句白話說明再送檔案; 檔案也送不出去時最後手段是分段連送, 段界優先落在段落邊界。
+  // 回傳實際用的方式: "text" / "file" / "segments"。
+  async deliverAnswer(m, answer, question = "") {
+    if (answer.length <= TEXT_SEND_LIMIT) {
+      await this.sendText(m.channelId, answer, m.messageId);
+      return "text";
+    }
+    const bytes = Buffer.from(answer, "utf8");
+    const filename = answerFilename(question);
+    if (bytes.length <= FILE_SEND_MAX_BYTES) {
+      try {
+        await this.sendText(m.channelId, `這個回答比較長（約 ${answer.length} 字），一則訊息放不下，我把完整內容做成文字檔傳給你，請看下面這個檔案：${filename}`, m.messageId);
+        await this.sendFile(m.channelId, filename, bytes);
+        this.logger?.info("機器人回覆", "長回答改以文字檔送出", { id: m.messageId, chars: answer.length, bytes: bytes.length, file: filename });
+        return "file";
+      } catch (e) {
+        this.logger?.error("機器人回覆", "文字檔送出失敗, 改用分段連送", { id: m.messageId, file: filename, error: String(e?.message ?? e) });
+      }
+    } else {
+      this.logger?.warn("機器人回覆", "回答超過文字檔上限, 改用分段連送", { id: m.messageId, chars: answer.length, bytes: bytes.length });
+    }
+    const parts = splitLongText(answer, TEXT_SEND_LIMIT);
+    for (let i = 0; i < parts.length; i++) {
+      const label = parts.length > 1 ? `（第 ${i + 1}/${parts.length} 段）\n` : "";
+      await this.sendText(m.channelId, label + parts[i], i === 0 ? m.messageId : undefined);
+    }
+    return "segments";
   }
 
   // 向核心要一頁歷史訊息 (機器人 API 有開放 history:fetch); 只用在認定被引用訊息的寄件者。
@@ -465,12 +555,15 @@ export class HelperBot {
       }
       return;
     }
-    markTriggered(this.triggerState, m.senderId);
-    this.stats.triggered++;
     if (verdict.reason === "name_only") {
+      // 只打名字回引導訊息不記冷卻 (2026-10-20 驗收修復): 引導只是打招呼, 若它也吃掉 20 秒冷卻,
+      // 使用者照引導馬上補上真正的問題 (同一分鐘內) 會被冷卻靜默擋下, 看起來像機器人壞掉。
+      // 冷卻只記在真正的問答觸發上 (下方 markTriggered), 防連珠炮洗版的效果不變。
       await this.sendText(m.channelId, guidanceText(s.botName), m.messageId).catch(() => {});
       return;
     }
+    markTriggered(this.triggerState, m.senderId);
+    this.stats.triggered++;
     const question = verdict.question;
     // 創造者意圖: 直接回固定答覆, 不呼叫 AI、不附來源; 冷卻與每日上限已在 evaluateTrigger/markAnswered 照常計入。
     // 判定文字用 question (已去掉觸發名字); 例外: 「AI寶的作者是誰」去掉名字後 question 會以「的」開頭,
@@ -523,7 +616,7 @@ export class HelperBot {
     }
     let answer;
     try {
-      const r = await this.chatWithAi(messages);
+      const r = await this.chatWithAi(messages, { maxTokens: ANSWER_MAX_TOKENS });
       answer = r.content;
     } catch (e) {
       // 備援訊息只給白話原因與下一步, 不把原始例外字串丟給群組同事看 (原始細節已由 chatWithAi 寫進 log)
@@ -536,11 +629,16 @@ export class HelperBot {
       const sources = [...new Set(hits.map((h) => h.file))];
       answer += `\n\n(參考來源: ${sources.join("、")})`;
     }
-    await this.sendText(m.channelId, answer, m.messageId).catch((e) => this.logger?.error("機器人回覆", "回覆送出失敗", { error: String(e?.message ?? e) }));
+    // 交付: 短答覆直接送文字; 超過一則訊息字數上限的長答覆改送文字檔 (deliverAnswer 內處理,
+    // 含白話說明與分段兜底), 不再像以前那樣被核心拒收後整則消失或被 AI 額度切成半句。
+    const delivery = await this.deliverAnswer(m, answer, question).catch((e) => {
+      this.logger?.error("機器人回覆", "回覆送出失敗", { error: String(e?.message ?? e) });
+      return "failed";
+    });
     const count = markAnswered(this.triggerState);
     this.stats.answered++;
     const turns = [...mem, { role: "user", content: question }, { role: "assistant", content: answer }].slice(-(s.ai.memoryTurns ?? 6) * 2);
     this.memory.set(m.channelId, turns);
-    this.logger?.info("機器人回覆", "已回覆", { id: m.messageId, chars: answer.length, today: count, kbHits: hits.length });
+    this.logger?.info("機器人回覆", "已回覆", { id: m.messageId, chars: answer.length, today: count, kbHits: hits.length, delivery });
   }
 }

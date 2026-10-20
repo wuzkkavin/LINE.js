@@ -14,7 +14,7 @@ import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, ruleFallb
 import { createConsoleServer } from "../src/server.mjs";
 import { parseApiSection, applyApiConfig, applyCoreApiConfig, readCoreApiStatus, isValidChatId } from "../src/linecfg.mjs";
 import { MessageSenderRegistry } from "../src/msgregistry.mjs";
-import { HelperBot, isCreatorIntent, calculateAge, buildPersonaSection, QUOTE_HISTORY_PAGES } from "../src/bot.mjs";
+import { HelperBot, isCreatorIntent, calculateAge, buildPersonaSection, QUOTE_HISTORY_PAGES, answerFilename, splitLongText, TEXT_SEND_LIMIT } from "../src/bot.mjs";
 import { coreEndpoints, fetchCoreChannels, shapeChatList } from "../src/corechats.mjs";
 import { WebSocketServer } from "ws";
 import { createAiClient as aiFactory } from "../src/ai.mjs";
@@ -172,20 +172,48 @@ test("trigger: 引用別人的訊息不算觸發; 引用但文字為空不觸發
   assert.equal(v.triggered, false); assert.equal(v.reason, "self");
 });
 
-test("trigger: 引用續答仍受冷卻與每日上限", () => {
+test("trigger: 引用續答不被冷卻擋下, 但仍受每日上限 (2026-10-20 驗收修復改版)", () => {
+  // 改版說明: 舊版斷言「引用續答仍受冷卻」, 實機驗收證明這會讓使用者在機器人回答完的
+  // 幾秒內引用追問只得到沉默 (與壞掉無異)。新語義: 引用續答跳過冷卻檢查, 每日上限照擋;
+  // 名字觸發的冷卻不變 (見下一個測試), 且引用觸發後 bot 仍會 markTriggered 刷新冷卻起點。
   const st = createTriggerState();
   const now = new Date();
   let v = evaluateTrigger({ text: "AI寶,問題一？", senderId: "u1", selfId: "me", settings: triggerSettings(), state: st, now });
   assert.equal(v.triggered, true);
   markTriggered(st, "u1", now); markAnswered(st, now);
-  // 冷卻中: 就算是引用自己的回答追問, 也不觸發
+  // 冷卻中 (5 秒後): 引用自己的回答追問 → 照常觸發 (reason quote)
   v = evaluateTrigger({ text: "那問題二呢", senderId: "u1", selfId: "me", settings: triggerSettings(), state: st, now: new Date(now.getTime() + 5000), quotedSelf: true });
+  assert.equal(v.triggered, true); assert.equal(v.reason, "quote");
+  // 對照: 同一時刻用名字再問 → 仍被冷卻擋下
+  v = evaluateTrigger({ text: "AI寶,問題二？", senderId: "u1", selfId: "me", settings: triggerSettings(), state: st, now: new Date(now.getTime() + 5000) });
   assert.equal(v.triggered, false); assert.equal(v.reason, "cooldown");
   // 每日上限: 引用續答同樣被擋下並帶 limitReached
   const st2 = createTriggerState();
   markAnswered(st2, now); markAnswered(st2, now);
   v = evaluateTrigger({ text: "再告訴我一件事", senderId: "u9", selfId: "me", settings: triggerSettings({ dailyLimit: 2 }), state: st2, now, quotedSelf: true });
   assert.equal(v.triggered, false); assert.equal(v.reason, "daily_limit"); assert.equal(v.limitReached, true);
+});
+
+test("bot: 長回答交付工具 — 檔名格式與分段邊界 (不切半句/不切斷代理對)", () => {
+  const d = new Date(2026, 9, 20, 21, 28, 0);
+  assert.equal(answerFilename("Excel 怎麼凍結窗格?", d), "AI寶回答-20261020-Excel怎麼凍結窗.txt");
+  assert.equal(answerFilename("  ", d), "AI寶回答-20261020.txt");
+  assert.equal(answerFilename("a/b:c*d?e", d), "AI寶回答-20261020-abcde.txt");
+  // 短文不分段
+  assert.deepEqual(splitLongText("短短的回答", 8000), ["短短的回答"]);
+  // 超過上限: 在段落邊界切, 每段 <= 上限, 內容不遺失 (去掉段界空白後可還原)
+  const para = "段落甲。".repeat(100);
+  const text = [para, para, para].join("\n\n");
+  const parts = splitLongText(text, 500);
+  assert.ok(parts.length >= 2);
+  assert.ok(parts.every((p) => p.length <= 500));
+  assert.equal(parts.join("").replace(/\s/g, ""), text.replace(/\s/g, ""));
+  // 沒有換行可切時硬切, 但不切斷 emoji 的代理對
+  const emojiText = "字".repeat(499) + "🙂" + "字".repeat(600);
+  const hard = splitLongText(emojiText, 500);
+  assert.ok(hard.every((p) => p.length <= 500));
+  assert.equal(hard.join(""), emojiText);
+  assert.equal(TEXT_SEND_LIMIT, 8000);
 });
 
 test("msgregistry: 登記/查詢/過期/上限/持久化來回", async () => {
@@ -257,6 +285,15 @@ test("ai: 共用 OpenAI 相容格式 chat 與 testConnection (本機 stub)", asy
   assert.equal(tc.ok, true);
   const tc2 = await ai.testConnection({ baseUrl: url, model: "stub-model" }, "");
   assert.equal(tc2.ok, false); assert.match(tc2.message, /下一步/);
+});
+
+test("ai: chat 回傳 finishReason (length = 被額度截斷, 呼叫端據此留 log)", async (t) => {
+  const { server, url } = await aiStubServer(() => ({ body: { model: "stub-model", choices: [{ message: { role: "assistant", content: "講到一半就被切斷的長回答" }, finish_reason: "length" }], usage: { completion_tokens: 4096 } } }));
+  t.after(() => server.close());
+  const ai = createAiClient({});
+  const r = await ai.chat({ baseUrl: url, apiKey: "sk-x", model: "stub-model", messages: [{ role: "user", content: "hi" }], maxTokens: 4096 });
+  assert.equal(r.finishReason, "length");
+  assert.equal(r.content, "講到一半就被切斷的長回答");
 });
 
 async function modelsStubServer(handler) {

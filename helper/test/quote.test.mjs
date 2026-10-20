@@ -31,6 +31,7 @@ const TEST_KEY = "sk-TESTKEY-quote-000000abcd";
 class FakeProvider {
   calls = [];
   sentMessages = []; // sendText 回傳的完整訊息 (含 messageId), 供測試引用
+  fileSends = []; // sendFile 收到的 (filename, bytes), 供長答覆測試斷言
   historyMessages = [];
   fetchHistoryCalls = 0;
   seq = 0;
@@ -65,10 +66,19 @@ class FakeProvider {
     const oldest = messages[0];
     return { messages, hasMore: start > 0, ...(start > 0 && oldest ? { cursor: `${oldest.createdAt}:${oldest.messageId}` } : {}) };
   }
-  outgoing(channel, fields) { return { messageId: `mid-${++this.seq}`, channelId: channel.channelId, channelKind: channel.kind, senderId: "u-me", senderName: "假測試帳號", contentType: "NONE", createdAt: Date.now(), ...fields }; }
+  // 送出訊息的 ID 用真實形狀: LINE 的訊息 ID 是 19 位數字字串 (舊版用 "mid-N" 這種玩具 ID,
+  // 與實機不同形, 曾讓 e2e 全綠但實機失效的落差藏在 ID 形狀裡; 改成數字字串讓所有情境同形)。
+  outgoing(channel, fields) { return { messageId: String(1790000000000000000n + BigInt(++this.seq)), channelId: channel.channelId, channelKind: channel.kind, senderId: "u-me", senderName: "假測試帳號", contentType: "NONE", createdAt: Date.now(), ...fields }; }
   async sendText(channel, text, options) {
     this.calls.push(["text", channel, text, options]);
     const msg = this.outgoing(channel, { text, ...(options?.replyTo ? { replyTo: options.replyTo } : {}) });
+    this.sentMessages.push(msg);
+    return msg;
+  }
+  async sendFile(channel, filename, bytes) {
+    this.calls.push(["file", channel, filename, bytes]);
+    this.fileSends.push({ channel, filename, bytes: Buffer.from(bytes) });
+    const msg = this.outgoing(channel, { contentType: "FILE", card: { kind: "file", name: filename, size: bytes.length } });
     this.sentMessages.push(msg);
     return msg;
   }
@@ -77,6 +87,7 @@ class FakeProvider {
   async unsendMessage() {}
   async react() {}
   texts() { return this.calls.filter((c) => c[0] === "text"); }
+  files() { return this.calls.filter((c) => c[0] === "file"); }
 }
 
 function freePort() {
@@ -108,13 +119,17 @@ async function waitFor(fn, timeout = 6000, label = "condition") {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 超過一則訊息字數上限 (8000 字) 的長回答: 23 字 * 400 = 9200 字, 供「改送文字檔」情境斷言內容完整。
+const LONG_ANSWER = "這是一段完整的長回答內容, 用來驗證改送文字檔。".repeat(400);
+
 async function startAiStub() {
   const server = createServer(async (req, res) => {
     const parts = []; for await (const c of req) parts.push(c);
     const body = JSON.parse(Buffer.concat(parts).toString("utf8") || "{}");
     const all = (body.messages ?? []).map((m) => m.content).join("\n");
     let content;
-    if (all.includes("凍結窗格")) content = "凍結窗格步驟:先選儲存格, 再到檢視按凍結窗格。";
+    if (all.includes("長篇報告")) content = LONG_ANSWER;
+    else if (all.includes("凍結窗格")) content = "凍結窗格步驟:先選儲存格, 再到檢視按凍結窗格。";
     else content = "這是 AI stub 的一般回答。";
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ model: body.model, choices: [{ message: { role: "assistant", content } }] }));
@@ -273,4 +288,141 @@ test("e2e 引用續答: 引用自己的回答觸發、引用別人不觸發、hi
   const saved = JSON.parse(await readFile(join(dataDir, "message-senders.json"), "utf8"));
   const ids = saved.entries.map((e) => e[0]);
   assert.ok(ids.includes(botAnswer.messageId), "登記簿檔案應含機器人回答的 ID");
+});
+
+// --- 以下為 2026-10-20 驗收修復新增的「與實機同形」情境 ---
+// bootWorld: 與第一個測試相同的真核心 + 真 bot 組裝, 抽出來給新情境共用;
+// settings 可覆寫 (冷卻秒數等), dataDir 可指定 (跨連線時段情境要共用同一個登記簿檔案)。
+async function bootWorld(t, { settingOverrides = {}, dataDir } = {}) {
+  const stub = await startAiStub();
+  t.after(() => stub.server.close());
+  const corePort = await freePort();
+  const coreRoot = await mkdtemp(join(tmpdir(), "helper-quote2-core-"));
+  await writeFile(join(coreRoot, "index.html"), "<!doctype html><title>core</title>");
+  const config = {
+    server: { host: "127.0.0.1", port: corePort },
+    history: { defaultLimit: 50 },
+    chat: { sendReadReceipts: true },
+    api: { enabled: true, chats: [CHAT], sendsPerMinute: 60 },
+    limits: { frameMaxBytes: 262144, textMaxLength: 8000, sendsPerSecond: 5, uploadMaxBytes: 10485760, uploadVideoMaxBytes: 52428800, uploadsPerMinute: 5 },
+  };
+  const provider = new FakeProvider();
+  const login = new LoginController(provider);
+  const store = new ChatStore(500);
+  const media = new MediaService(200 * 1024 * 1024, provider);
+  const apiTokens = new ApiTokenStore(join(coreRoot, "api-token.json"));
+  const web = createWebServer(config, coreRoot, media, apiTokens);
+  const hub = createHub({ server: web.server, authorizeUpgrade: web.authorizeUpgrade, authorizeApiUpgrade: web.authorizeApiUpgrade, apiTokens, config, login, provider, store, media, serverVersion: "e2e" });
+  await new Promise((r) => web.server.listen(corePort, "127.0.0.1", r));
+  t.after(async () => { hub.close(); web.server.closeAllConnections(); await new Promise((r) => web.server.close(r)); });
+  await login.restore();
+  const cookie = (await fetch(`http://127.0.0.1:${corePort}/`)).headers.get("set-cookie").split(";")[0];
+  const page = connectWs(corePort, { Origin: `http://127.0.0.1:${corePort}`, Cookie: cookie }, "/ws");
+  await page.opened;
+  await page.until((f) => f.type === "api:state");
+  page.socket.send(JSON.stringify({ type: "api:token:create" }));
+  const { token } = await page.until((f) => f.type === "api:token");
+  page.socket.close();
+
+  const dir = dataDir ?? await mkdtemp(join(tmpdir(), "helper-quote2-data-"));
+  const logger = new Logger({ dir: join(dir, "logs"), debug: false });
+  const settings = new SettingsStore({ path: join(dir, "settings.json"), logger });
+  settings.update({
+    botName: "AI寶", aliases: [], triggerMode: "standard", cooldownSec: 0, dailyLimit: 100,
+    lineApiUrl: `ws://127.0.0.1:${corePort}/api/ws`,
+    ai: { active: "openai", providers: { openai: { baseUrl: stub.baseUrl, model: "stub-model" } } },
+    scam: { enabled: false, threshold: 0.8, perMinute: 10 },
+    kb: { folder: "" },
+    ...settingOverrides,
+  });
+  const secrets = new MemorySecretStore();
+  await secrets.set(SECRET_NAMES.openai, TEST_KEY);
+  await secrets.set(SECRET_NAMES.lineToken, token);
+  const kb = new KnowledgeBase({ folder: "", indexPath: join(dir, "kb-index.json"), logger });
+  const makeBot = () => {
+    const registry = new MessageSenderRegistry({ path: join(dir, "message-senders.json"), logger });
+    return { bot: new HelperBot({ settings, secrets, ai: createAiClient({}), kb, logger, registry }), registry };
+  };
+  const inject = (messageId, senderId, text, replyTo) => hub.handleMessage({ messageId, channelId: CHAT, channelKind: "group", senderId, senderName: "假同事", text, contentType: "NONE", createdAt: Date.now(), ...(replyTo ? { replyTo } : {}) }, "new");
+  return { provider, hub, settings, makeBot, inject, dataDir: dir };
+}
+
+test("e2e 實機同形: 冷卻 20 秒下, 引導不吃冷卻、引用續答不被冷卻擋、名字連發仍被擋", async (t) => {
+  // 情境還原老吳 2026-10-20 21:23-21:28 的操作節奏 (同一人、同一分鐘內連續操作):
+  // 先只打名字拿到引導, 馬上問真正的問題, 再立刻引用機器人的回答追問 (不打名字)。
+  // 舊行為: 引導與引用都吃 20 秒冷卻, 後兩步會被靜默擋下, 看起來像機器人壞掉。
+  const w = await bootWorld(t, { settingOverrides: { cooldownSec: 20 } });
+  const { bot } = w.makeBot();
+  await bot.connect();
+  t.after(() => bot.disconnect());
+  await waitFor(() => bot.selfId === "u-me", 4000, "bot auth ready");
+  const texts = () => w.provider.texts();
+  const U = "u-wu";
+  const ID = (n) => String(1790000000000010000n + BigInt(n));
+
+  // 1) 只打名字 -> 引導訊息
+  w.inject(ID(1), U, "AI寶");
+  await waitFor(() => texts().find((c) => c[3]?.replyTo === ID(1)), 6000, "guidance reply");
+  // 2) 緊接著 (冷卻窗內) 問真正的問題 -> 必須回答 (引導沒有吃掉冷卻)
+  w.inject(ID(2), U, "AI寶，Excel 怎麼凍結窗格？");
+  const answer = await waitFor(() => texts().find((c) => c[2].includes("凍結窗格步驟") && c[3]?.replyTo === ID(2)), 6000, "answer after guidance");
+  const botAnswer = w.provider.sentMessages[w.provider.sentMessages.length - 1];
+  assert.match(botAnswer.messageId, /^\d{19}$/, "機器人回答 ID 應為真實形狀的 19 位數字");
+  await sleep(300); // 等 sent 影格登記
+  // 3) 立刻引用該回答追問 (不打名字) -> 冷卻窗內仍必須續答
+  w.inject(ID(3), U, "接續上文, 繼續", botAnswer.messageId);
+  await waitFor(() => texts().find((c) => c[3]?.replyTo === ID(3)), 6000, "quote follow-up inside cooldown");
+  // 4) 緊接著用名字再問一題 -> 冷卻仍然有效, 不應回答 (防連珠炮洗版不變)
+  const beforeCount = texts().length;
+  w.inject(ID(4), U, "AI寶，問題三是什麼？");
+  await sleep(1500);
+  assert.equal(texts().length, beforeCount, "冷卻窗內的名字連發仍應被擋下");
+});
+
+test("e2e 實機同形: 引用前一個連線時段的回答 (只剩磁碟登記簿、歷史查不到) 仍能續答", async (t) => {
+  // 老吳的實機形狀: 回答是機器人在先前連線時段送出的 (App 重開/引擎重啟後, 記憶體登記簿是空的),
+  // 引用當下核心歷史也補查不到那則 (已被更舊的頁面之外或歷史清空), 只剩磁碟上的登記簿認得它。
+  const dataDir = await mkdtemp(join(tmpdir(), "helper-quote-prev-"));
+  const w = await bootWorld(t, { dataDir });
+  const first = w.makeBot();
+  await first.bot.connect();
+  await waitFor(() => first.bot.selfId === "u-me", 4000, "bot1 auth ready");
+  w.inject("1790000000000020001", "u-wu", "AI寶，Excel 怎麼凍結窗格？");
+  await waitFor(() => w.provider.texts().find((c) => c[2].includes("凍結窗格步驟")), 6000, "session-1 answer");
+  const botAnswer = w.provider.sentMessages[w.provider.sentMessages.length - 1];
+  await sleep(300);
+  first.bot.disconnect(); // 正常結束: 登記簿 flush 到磁碟
+
+  // 第二個連線時段: 全新 bot 實例 (全新記憶體登記簿, 從磁碟載入), 核心歷史是空的
+  const second = w.makeBot();
+  assert.equal(second.registry.lookup(botAnswer.messageId), "u-me", "重開後應從磁碟登記簿認出先前的回答");
+  w.provider.historyMessages = [];
+  await second.bot.connect();
+  t.after(() => second.bot.disconnect());
+  await waitFor(() => second.bot.selfId === "u-me", 4000, "bot2 auth ready");
+  await waitFor(() => second.bot.historyPrefetchedChats.has(CHAT), 6000, "prefetch done");
+  const callsBefore = w.provider.fetchHistoryCalls;
+  const base = w.provider.texts().length;
+  w.inject("1790000000000020002", "u-wu", "那 Word 呢", botAnswer.messageId);
+  await waitFor(() => w.provider.texts().slice(base).find((c) => c[3]?.replyTo === "1790000000000020002"), 6000, "cross-session quote answer");
+  assert.equal(w.provider.fetchHistoryCalls, callsBefore, "磁碟登記簿命中時不應再向核心補查歷史");
+});
+
+test("e2e 長回答: 超過 8000 字改送文字檔 (白話說明 + 檔案內容完整), 不再整則消失或被拒收", async (t) => {
+  const w = await bootWorld(t);
+  const { bot } = w.makeBot();
+  await bot.connect();
+  t.after(() => bot.disconnect());
+  await waitFor(() => bot.selfId === "u-me", 4000, "bot auth ready");
+  assert.ok(LONG_ANSWER.length > 8000, "測試用的長回答必須真的超過文字上限");
+  w.inject("1790000000000030001", "u-wu", "AI寶，請給我一份長篇報告");
+  // 先有一句白話說明 (以 reply 形式), 說明裡點名檔案
+  const notice = await waitFor(() => w.provider.texts().find((c) => c[2].includes("文字檔") && c[3]?.replyTo === "1790000000000030001"), 8000, "file notice text");
+  assert.match(notice[2], /AI寶回答-\d{8}-.+\.txt/);
+  // 再送出檔案本體: 檔名同說明所述, 位元組解開就是完整回答 (一字不缺)
+  const file = await waitFor(() => w.provider.fileSends[0], 8000, "answer file sent");
+  assert.match(file.filename, /^AI寶回答-\d{8}-.+\.txt$/);
+  assert.equal(file.bytes.toString("utf8"), LONG_ANSWER, "檔案內容必須是完整回答");
+  // 長回答本體不曾以單則文字送出 (那會被核心以超過 textMaxLength 拒收)
+  assert.equal(w.provider.texts().some((c) => c[2].length > 8000), false, "不得把超長回答硬塞單則文字");
 });

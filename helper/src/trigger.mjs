@@ -18,7 +18,12 @@ export function namesOf(settings) {
 // 回傳 { triggered, reason, question, matchedName, limitReached }
 // reason 代碼: self / no_name / name_only / not_question / not_at_start / cooldown / daily_limit / ok / quote
 // quotedSelf: 本則訊息引用 (reply) 的是機器人自己發的訊息 — 使用者已明確指向機器人, 視同名字觸發:
-// 不要求文字含名、略過寬嚴的意圖/句首判定; 但冷卻與每日上限照舊, 文字為空仍不觸發。
+// 不要求文字含名、略過寬嚴的意圖/句首判定; 每日上限照舊, 文字為空仍不觸發。
+// 冷卻不擋引用續答 (2026-10-20 驗收修復): 冷卻是防「連珠炮打名字」洗版的, 但引用續答是使用者
+// 手動引用剛收到的回答再追問, 本來就是緊接著上一題的刻意操作; 若也吃 20 秒冷卻, 使用者會在
+// 機器人回答完的幾秒內引用追問卻只得到沉默, 跟功能壞掉沒兩樣 (實機 21:28 情境的機制重現,
+// 見 quote.test.mjs 的冷卻情境)。引用觸發後仍照常記冷卻時間 (markTriggered), 之後緊接著打
+// 名字連發仍然會被冷卻擋, 防洗版不變。
 export function evaluateTrigger({ text, senderId, selfId, settings, state, now = new Date(), quotedSelf = false }) {
   const base = { triggered: false, question: "", matchedName: "" };
   if (selfId && senderId === selfId) return { ...base, reason: "self" };
@@ -54,7 +59,7 @@ export function evaluateTrigger({ text, senderId, selfId, settings, state, now =
   rollDaily(state, now);
   const last = state.lastByUser.get(senderId) ?? 0;
   const cooldownMs = (settings.cooldownSec ?? 20) * 1000;
-  if (now.getTime() - last < cooldownMs) return { ...base, reason: "cooldown", matchedName, question };
+  if (!quotedSelf && now.getTime() - last < cooldownMs) return { ...base, reason: "cooldown", matchedName, question };
   if (state.daily.count >= (settings.dailyLimit ?? 100)) return { ...base, reason: "daily_limit", matchedName, question, limitReached: true };
   return { triggered: true, reason: quotedSelf && !matchedName ? "quote" : "ok", matchedName, question };
 }
