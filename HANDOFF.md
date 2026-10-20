@@ -76,6 +76,19 @@
    - 第二次同步（2026-10-18，排程漏項補做）：上游 2 提交（42a50dc 完整支援 NekoGuard 管理員擴充契約、db2a0cd 加速詐騙分析並合併重複請求）併入，main＝c72e3e0、ai-bao＝aa1dba6，合併無衝突（workflow 檔經核對與 pack 正本一致）。三套測試：上游 typecheck 通過、測試 273/273（新提交新增 hub/provider 測試）、helper 13/13、pack 33/33。雲端 run 39095534744 conclusion＝success，artifact 含 exe 與核心／控制台兩張截圖（控制台截圖介面與頭像正常），該次 artifact 已刪除。新 exe 104,722,944 bytes 已備份 Drive（id 1J1RiMfiQ8J7d-uOIgWqyBKZRkBK3LZ9G，大小核對一致），舊版 exe（id 1bpc5rjU2BapeWHGgzW2NmvDmH0V7s8p1）已移入垃圾桶。
 5. 知識庫第二版格式（pdf/docx/xlsx）與 Jev 實際串接：未排期，等老吳指示。
 
+## 6.5 UI 整理批（2026-10-21，老吳實機驗收第二批後指定；只動呈現與新設定欄位，不動引擎/觸發/防詐行為邏輯）
+
+- **白名單列式排版**（App「機器人與觸發」頁 LINE 開通卡內兩清單＋web 控制台同步）：每列左側主行＝群組名稱、副行小字＝類型（群組/聊天室/社群）・人數；右側固定欄位放動作按鈕（加入白名單／已在白名單（停用態）／移除），列間有分隔線。**畫面完全不顯示原始 chat ID**（名稱缺失顯示「未命名群組」＋「名稱與資料待讀取」）。為此 `/api/line/whitelist` 回應新增唯讀欄位 `kind`、`memberCount`（handler 本來就抓同一份快照，僅補帶欄位；寫入路徑零變更；若要退回可改由 App 端合併 /api/line/chats 資料）。
+- **活動事件顯示回答**：bot 送出回答時把全文存進既有記憶體環形緩衝（上限 2000 字截斷、`answerTruncated` 註記、不落盤、重啟清空）；`/api/bot/activity` 事件新增 `answer`/`answerTruncated`。App「LINE 登入」頁「機器人聊天情況」：已回答事件在問題下方有灰色預覽列，點開可展開/收合完整回答；未回答事件不顯示回答區。展開狀態用 egui persisted data（temp data 只有一幀生命週期，實測留不住）；預覽列用無框 Button（Label+Sense::click 在巢狀 ScrollArea 實測點不到）。
+- **機器人定位與範圍**（新設定 `ai.rolePrompt`／`ai.scopePrompt`，App「AI 設定」頁第一張卡＋web 同步）：rolePrompt 出廠預設＝舊 DEFAULT_SYSTEM_PROMPT 首句，組裝時取代寫死首句；清空儲存→自動回復預設。scopePrompt 出廠預設為電腦相關範圍文字，非空才注入獨立段落；清空＝不注入＝不限制範圍（與 rolePrompt 語意相反，勿混淆）。兩欄儲存即時生效。遷移：`SettingsStore.load()` 時存檔沒有 rolePrompt 才拆分——舊出廠全文或以出廠首句開頭者只拆首句、其餘逐字保留；全自訂者 systemPrompt 不動、rolePrompt 補預設。`SettingsStore.update()` 對 rolePrompt 空白自動回復預設。
+- **回答符號強制清理**（bot.mjs `cleanAnswerText`）：AI 回答送出前移除 ** 與 __、行首 # 標題符號、表格分隔列刪除、其餘 | 改「・」；有變更時 log 記前後字數。只作用於送進群組的文字（對話記憶存清理後版），不影響知識庫原文與 log。
+- **「聊天室畫面」頁**（左側選單新頁，在 LINE 登入正下方，含同風格自繪圖示 nav-chat）：Windows MSVC 建置以 wry 0.54 子視窗嵌入 http://127.0.0.1:3789 （WebView2）；非 MSVC 建置（本機 Linux 檢查、windows-gnu）顯示白話占位。查證：核心 `src/http/server.ts` 回應 `/` 時同回應 Set-Cookie `linejs_browser`，全新 WebView2 profile 可直接開啟使用。顯示時機由 main.rs 每幀裁決：不在本頁/未登入/最小化/縮到系統匣/任一對話框開啟時一律隱藏（原生子視窗永遠蓋在父視窗之上，殘影風險靠這個總開關防）。WebView2 建立失敗節流 15 秒並回白話訊息，不崩潰。新增相依 wry 0.54（僅 `cfg(all(windows, target_env = "msvc"))`）＋ raw-window-handle 0.6；成品體積 +361,984 bytes（127,605,248 → 127,967,232）。App 另有 `AIBAO_START_PAGE` 環境變數（chat/login/ai/bot）供 CI/截圖指定起始頁。
+- **踩坑（重要）**：egui 的 `RichText::strong()` 文字色 = `widgets.active` 的文字色，而本 App 主題把該值設成白色（給深色按鈕用），且未另指定顏色時 strong 標籤會在淺色卡片上變白字看不見（實測證據：本批截圖比對）。本批範圍內（LINE 開通卡的步驟標題、目前白名單標題、清單列名稱）已改用 `size(15.0)`＋預設文字色；**其他頁面仍有 strong 無色標籤（例如一鍵修復結果標題），全域修法（改 theme 或逐處補色）未動，待老吳裁示**。
+- **CI 教訓**：wry 路徑只在 MSVC 目標編譯，本機檢查必須跑 `cargo check --target x86_64-pc-windows-msvc`（rustup std 已裝，check 不需連結器）；只查 gnu 會漏掉 MSVC 專屬錯誤（本批首輪 CI run 39469426387 因此紅燈：`with_web_context` 在 wry 0.54 是建構子 `new_with_web_context`，非 builder 方法；修正後 run 39471177634 四 job 全 success）。
+- 測試：helper 64/64（Windows 與 Ubuntu 兩 repo 各自實跑）、cargo check（Linux／windows-gnu／windows-msvc 三目標）＋cargo test 2/2；探針全 ok、結束 residual=none。成品 AI寶-App.exe 127,967,232 bytes、MD5 f84ed201fc5b68d7e42c0113ccb16686，Drive 同 id 1BWJiznBeMoeQbIaS7jxbKagiNBcnrmfX 原地換新＋Release aibao-app-v1 同步（皆回讀核對），兩次 run 的 artifacts 共 6 件已刪。本批**未重打 Ubuntu tar**（交付從簡，老吳已知；Ubuntu repo 僅同步 helper 五檔程式碼與測試）。
+- 本機截圖存證 ~/workspace/.shot3/（before-whitelist/before-panel、after-whitelist/after-panel/after-ai/after-chat、web-whitelist/web-ai）；CI 存證 app-chat.png（未登入占位，run 下載於 ~/workspace/ci-downloads/ui-batch/）。
+- **未驗證（待老吳實機）**：聊天室畫面頁的真 WebView2 渲染（需登入狀態）、切頁/最小化/縮到系統匣不殘影、WebView2 缺失機器的白話提示；活動面板展開點擊在開發機 Xvfb 的合成輸入下無法觸發（巢狀捲動區；展開渲染已另以種子狀態截圖驗證、點擊本體為標準 Button，與白名單按鈕同元件）。
+
 ## 7. 操作手冊（常用指令）
 
 - 上游測試：Repo 根目錄 npm ci --include=dev；npm run typecheck；npm test（207 項，約 1 分鐘）。
