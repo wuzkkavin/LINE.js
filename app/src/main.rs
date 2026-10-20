@@ -20,7 +20,7 @@ use core_ws::{AuthState, LoginUi, SharedLogin, WsCommand};
 use engine::{EngineManager, EngineState, StopOutcome};
 use serde_json::Value;
 
-const COPYRIGHT: &str = "©Copyright 2026 By 吳治綱 繁體中文化";
+const COPYRIGHT: &str = "©Copyright 2026 By 吳治綱";
 const UPSTREAM_CREDIT: &str = "上游出處: JS-PACKAGE/LINE.js (Apache-2.0) ・ @evex/linejs (evex-dev)";
 
 // 介面顏色一律走 theme 模組的 Palette (設計定稿 design/palettes.md), 不得再寫死色碼;
@@ -165,6 +165,15 @@ struct App {
     wl_slot: Slot<Value>,
     whitelist: Vec<Value>,
     wl_loaded: bool,
+    // 白名單自動載入只嘗試一次 (第 5 項修復): 舊版以 !wl_loaded 為條件每幀重打,
+    // 端點失敗時 wl_loaded 永遠為 false, 60fps 無限重試把 log 灌爆、錯誤訊息疊加。
+    // 改為: 進頁自動載入一次, 失敗就停, 使用者按「重新讀取白名單」才再試。
+    wl_attempted: bool,
+    // 機器人聊天情況面板 (第 12 項): 活動端點的最近結果與上次抓取時間
+    activity_slot: Arc<Mutex<Option<serde_json::Value>>>,
+    activity: Option<serde_json::Value>,
+    activity_fetched_at: Option<std::time::Instant>,
+    activity_msg: Option<String>,
     line_cfg_status: Slot<Value>,
     reindex_slot: Slot<Value>,
     save_slot: Slot<Value>,
@@ -587,6 +596,11 @@ impl App {
             wl_slot: Arc::new(Mutex::new(None)),
             whitelist: Vec::new(),
             wl_loaded: false,
+            wl_attempted: false,
+            activity_slot: Arc::new(Mutex::new(None)),
+            activity: None,
+            activity_fetched_at: None,
+            activity_msg: None,
             line_cfg_status: Arc::new(Mutex::new(None)),
             reindex_slot: Arc::new(Mutex::new(None)),
             save_slot: Arc::new(Mutex::new(None)),
@@ -1594,6 +1608,8 @@ impl App {
             return;
         }
         self.busy.insert("chats".into(), true);
+        // 開始新一次讀取就清掉上一次的訊息: 畫面只留目前狀態, 不疊舊錯誤 (第 5 項)
+        self.page_msg.remove("chats");
         let slot = self.chats_slot.clone();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
@@ -1629,7 +1645,9 @@ impl App {
         if self.busy.get("wl").copied().unwrap_or(false) {
             return;
         }
+        self.wl_attempted = true;
         self.busy.insert("wl".into(), true);
+        self.page_msg.remove("wl");
         let slot = self.wl_slot.clone();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
@@ -1748,6 +1766,13 @@ impl App {
                         let model = bot.get("aiModel").and_then(|v| v.as_str()).unwrap_or("-");
                         let answered = bot.get("answeredToday").and_then(|v| v.as_u64()).unwrap_or(0);
                         ui.label(format!("使用中的 AI: {ai} / {model}"));
+                        // 核心版本 (第 14 項): 來自核心 hello 影格的實際回報, 未連線時顯示「—」不猜
+                        let core_ver = bot.get("coreVersion").and_then(|v| v.as_str()).unwrap_or("");
+                        ui.label(if core_ver.is_empty() {
+                            "核心 LINE.js: —".to_string()
+                        } else {
+                            format!("核心 LINE.js: v{core_ver}")
+                        });
                         ui.label(format!("今日已回答: {answered} 次"));
                         if let Some(scam) = bot.get("scam") {
                             let checked = scam.get("checkedToday").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1883,6 +1908,112 @@ impl App {
                 });
             }
         }
+        ui.add_space(10.0);
+        self.activity_panel(ui, matches!(login.auth, AuthState::Ready));
+    }
+
+    // 機器人聊天情況面板 (第 12 項): 登入卡片下方顯示機器人在群組的服務實況。
+    // 資料來自 helper 的 GET /api/bot/activity (唯讀; 問題只留前 30 字且只在 helper 記憶體)。
+    // 開頁立即抓、之後每約 4 秒自動刷新; 失敗顯示白話訊息, 不跳原始錯誤。
+    fn activity_panel(&mut self, ui: &mut egui::Ui, logged_in: bool) {
+        let ctx = ui.ctx().clone();
+        card(ui, self.palette, "機器人聊天情況", |ui| {
+            if !logged_in {
+                ui.label("登入後這裡會顯示機器人的聊天情況");
+                return;
+            }
+            // 收取背景抓取結果
+            if let Some(v) = self.activity_slot.lock().unwrap().take() {
+                self.busy.insert("activity".into(), false);
+                if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    self.activity = Some(v);
+                    self.activity_msg = None;
+                } else {
+                    let m = v.get("message").and_then(|x| x.as_str()).unwrap_or("讀取聊天情況失敗, 請稍後再試。").to_string();
+                    self.activity_msg = Some(m);
+                }
+            }
+            let busy_act = self.busy.get("activity").copied().unwrap_or(false);
+            let due = self.activity_fetched_at.map(|t| t.elapsed() > std::time::Duration::from_secs(4)).unwrap_or(true);
+            if due && !busy_act {
+                self.busy.insert("activity".into(), true);
+                self.activity_fetched_at = Some(std::time::Instant::now());
+                let slot = self.activity_slot.clone();
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || {
+                    let r = helper_api::bot_activity();
+                    *slot.lock().unwrap() = Some(match r {
+                        Ok(v) => v,
+                        Err(e) => serde_json::json!({ "ok": false, "message": e }),
+                    });
+                    ctx2.request_repaint();
+                });
+            }
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            let act = self.activity.clone();
+            let status = act.as_ref().and_then(|a| a.get("status").cloned()).unwrap_or(Value::Null);
+            if status.is_object() {
+                let bc = status.get("botConnected").and_then(|v| v.as_bool()).unwrap_or(false);
+                let ai = status.get("aiActive").and_then(|v| v.as_str()).unwrap_or("-");
+                let model = status.get("aiModel").and_then(|v| v.as_str()).unwrap_or("-");
+                let answered = status.get("answeredToday").and_then(|v| v.as_u64()).unwrap_or(0);
+                let limit = status.get("dailyLimit").and_then(|v| v.as_u64()).unwrap_or(0);
+                let scam = status.get("scam").cloned().unwrap_or(Value::Null);
+                let checked = scam.get("checkedToday").and_then(|v| v.as_u64()).unwrap_or(0);
+                let warned = scam.get("warnedToday").and_then(|v| v.as_u64()).unwrap_or(0);
+                ui.horizontal(|ui| {
+                    ui.label(status_dot(if bc { self.palette.ok } else { self.palette.warn }));
+                    ui.label(if bc { "機器人已連線" } else { "機器人未連線" });
+                    ui.separator();
+                    ui.label(format!("AI: {ai} / {model}"));
+                    ui.separator();
+                    ui.label(format!("今日已回答 {answered} / 上限 {limit}"));
+                    ui.separator();
+                    ui.label(format!("防詐騙: 檢查 {checked}、警告 {warned}"));
+                });
+            } else if self.activity_msg.is_none() {
+                ui.label("正在讀取聊天情況…");
+            }
+            if let Some(m) = &self.activity_msg {
+                ui.label(egui::RichText::new(m.clone()).color(self.palette.warn_text));
+            }
+            ui.add_space(4.0);
+            let events = act.as_ref().and_then(|a| a.get("events")).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if events.is_empty() {
+                ui.label(egui::RichText::new("目前還沒有紀錄: 有人在群組跟機器人說話後, 這裡會逐筆出現。").weak());
+            } else {
+                let max_h = ui.available_height().max(80.0);
+                egui::ScrollArea::vertical().id_salt("activity-scroll").max_height(max_h).show(ui, |ui| {
+                    for ev in &events {
+                        let time = ev.get("time").and_then(|v| v.as_str()).unwrap_or("");
+                        let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                        let (label, color) = match kind {
+                            "answered" => ("已回答", self.palette.ok),
+                            "name_only" => ("引導說明", self.palette.idle),
+                            "cooldown" => ("冷卻略過", self.palette.warn),
+                            "daily_limit" => ("每日上限擋下", self.palette.warn),
+                            "scam_warned" => ("防詐騙警告", self.palette.bad),
+                            "ai_busy" => ("AI 忙線", self.palette.warn),
+                            "ai_failed" => ("AI 連不上", self.palette.bad),
+                            _ => ("紀錄", self.palette.idle),
+                        };
+                        let chat = ev.get("chatName").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("(群組)");
+                        let sender = ev.get("senderName").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("(同事)");
+                        let q = ev.get("question").and_then(|v| v.as_str()).unwrap_or("");
+                        let chars = ev.get("answerChars").and_then(|v| v.as_u64());
+                        let ms = ev.get("ms").and_then(|v| v.as_u64());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new(time).weak());
+                            ui.label(egui::RichText::new(label).color(color).strong());
+                            ui.label(format!("{chat}・{sender}: {q}"));
+                            if let Some(c) = chars {
+                                ui.label(egui::RichText::new(format!("(回答 {c} 字{})", ms.map(|m| format!("・{} 毫秒", m)).unwrap_or_default())).weak());
+                            }
+                        });
+                    }
+                });
+            }
+        });
     }
 
     fn page_ai(&mut self, ui: &mut egui::Ui) {
@@ -2079,10 +2210,11 @@ impl App {
             row(ui, "婚姻狀態:", &mut self.form.persona_marital, "例: 未婚", 200.0);
             row(ui, "自我介紹:", &mut self.form.persona_intro, "一句話介紹自己", 420.0);
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("有人問「是誰創造你的 / 作者是誰 / 版權是誰的」這類問題時, 我會固定回下面這句 (不讓 AI 自由發揮):").weak());
+            ui.label(egui::RichText::new("有人問「是誰創造你的 / 作者是誰 / 版權是誰的」這類問題時, 我會固定回下面這句 (不讓 AI 自由發揮)。這句是固定答覆, 只供檢視, 不能修改:").weak());
             ui.horizontal(|ui| {
-                ui.label("創造者問答:");
-                ui.add(egui::TextEdit::singleline(&mut self.form.creator_reply).desired_width(460.0));
+                ui.label("創造者問答 (唯讀):");
+                // 唯讀 (第 4' 項): 以 add_enabled(false) 停用編輯, 值仍隨表單載入/儲存原樣往返
+                ui.add_enabled(false, egui::TextEdit::singleline(&mut self.form.creator_reply).desired_width(460.0));
             });
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
@@ -2169,7 +2301,7 @@ impl App {
             // 目前白名單 (修復項 8): 已儲存的 chats 逐筆列出與移除, 不能只給計數;
             // 名稱由 helper 對照核心快照解析, 核心讀不到時顯示 ID 並註明待讀取, 清單本身照樣列。
             ui.label(egui::RichText::new("目前白名單 (已儲存的群組)").strong());
-            if !self.wl_loaded && !self.busy.get("wl").copied().unwrap_or(false) {
+            if !self.wl_loaded && !self.wl_attempted && !self.busy.get("wl").copied().unwrap_or(false) {
                 self.spawn_whitelist_load(&ctx);
             }
             let busy_wl = self.busy.get("wl").copied().unwrap_or(false);
@@ -2527,7 +2659,17 @@ impl App {
                     if let Some(v) = status.as_ref().and_then(|s| s.get("version")).and_then(|v| v.as_str()) {
                         ui.label(format!("引擎 (helper) 版本: {v}"));
                     }
-                    ui.label(format!("核心: LINE.js (上游版本隨每日同步更新)"));
+                    let core_ver = status
+                        .as_ref()
+                        .and_then(|s| s.get("bot"))
+                        .and_then(|b| b.get("coreVersion"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    ui.label(if core_ver.is_empty() {
+                        "核心: LINE.js (尚未連線, 版號待取得)".to_string()
+                    } else {
+                        format!("核心: LINE.js v{core_ver} (上游版本隨每日同步更新)")
+                    });
                     ui.label(format!("資料目錄: {}", shell::data_dir().display()));
                 });
             });

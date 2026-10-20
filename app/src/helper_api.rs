@@ -74,13 +74,15 @@ fn with_retry(what: &str, mut f: impl FnMut() -> Result<serde_json::Value, CallE
         attempt += 1;
         match f() {
             Ok(v) => return Ok(v),
-            Err(CallErr::Status(_code, msg)) => {
+            Err(CallErr::Status(code, msg)) => {
                 if let Some(m) = msg {
                     if !m.trim().is_empty() {
                         return Ok(serde_json::json!({ "ok": false, "message": m }));
                     }
                 }
-                shell::log_line(&format!("helper API {what} 回應狀態異常 (詳見上方紀錄), 已轉白話訊息給 UI"));
+                // 狀態碼一定要進 log (第 5 項觀測性修復): 2026-10-20 實機事故時殼從未記錄狀態碼,
+                // 只剩 7.9 萬行「狀態異常」無法分辨 404/500/其他, 斷點只能靠拼湊還原。
+                shell::log_line(&format!("helper API {what} 回應狀態異常: HTTP {code} (回應無白話訊息), 已轉白話訊息給 UI"));
                 return Err(ERR_BAD_RESPONSE.to_string());
             }
             Err(CallErr::Parse(raw)) => {
@@ -112,6 +114,11 @@ pub fn put_settings(body: serde_json::Value) -> Result<serde_json::Value, String
 
 pub fn get_status() -> Result<serde_json::Value, String> {
     get_json("/api/status")
+}
+
+/// 機器人聊天情況 (第 12 項): 狀態摘要 + 最近動態 (helper 記憶體環形緩衝)
+pub fn bot_activity() -> Result<serde_json::Value, String> {
+    get_json("/api/bot/activity")
 }
 
 pub fn get_settings() -> Result<serde_json::Value, String> {

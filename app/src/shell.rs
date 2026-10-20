@@ -144,7 +144,7 @@ pub fn export_diagnostic(dest: &std::path::Path) -> Result<String, String> {
     if let Ok(rd) = std::fs::read_dir(logs_dir()) {
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_log = name.ends_with(".log") && (name.starts_with("helper-") || name == "shell.log");
+            let is_log = name.ends_with(".log") && (name.starts_with("helper-") || name == "shell.log" || name == "launcher.log");
             if !is_log {
                 continue;
             }
