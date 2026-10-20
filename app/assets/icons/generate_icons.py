@@ -141,6 +141,16 @@ SVG["nav-about"] = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024
 <rect x="478" y="486" width="68" height="168" rx="34" {W}/>
 </svg>"""
 
+# 聊天室畫面 (2026-10-21 新增頁): 視窗外框 + 標題列 + 三行對話行, 意象為「聊天視窗」。
+SVG["nav-chat"] = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+<rect x="212" y="252" width="600" height="520" rx="40" {S} stroke-width="62"/>
+<line x1="212" y1="384" x2="812" y2="384" {S} stroke-width="52"/>
+<circle cx="300" cy="318" r="24" {W}/>
+<line x1="300" y1="492" x2="664" y2="492" {S} stroke-width="48"/>
+<line x1="300" y1="592" x2="576" y2="592" {S} stroke-width="48"/>
+<line x1="300" y1="692" x2="624" y2="692" {S} stroke-width="48"/>
+</svg>"""
+
 
 def main():
     os.makedirs(SRC_DIR, exist_ok=True)

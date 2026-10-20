@@ -37,6 +37,13 @@ windows = { version = "0.58", features = [
   "Win32_System_Diagnostics_ToolHelp",
 ] }
 
+# 嵌入核心聊天畫面 (LINE 登入頁的 WebView2) 只在 Windows MSVC 建置啟用:
+# CI 正式成品就是 windows-latest 的預設 MSVC 工具鏈; webview2-com 只支援 MSVC,
+# gnu 與本機 Linux 檢查版編譯時走占位路徑 (見 src/chatview.rs), 不影響雙 target 檢查。
+[target.'cfg(all(windows, target_env = "msvc"))'.dependencies]
+wry = "0.54"
+raw-window-handle = "0.6"
+
 [build-dependencies]
 winresource = "0.1"
 

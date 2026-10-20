@@ -3,6 +3,7 @@
 // AI寶 Windows 原生 App (規格書 v3): Rust + egui 殼, 內嵌 TypeScript 引擎 (核心 + helper)。
 // 設計原則: 畫面全原生、不開瀏覽器; 設定與 AI 功能一律呼叫 helper 既有本機 API, 不重寫業務邏輯;
 // LINE 登入走核心 WS 協定 (照上游 CLI 的非瀏覽器連線方式)。
+mod chatview;
 mod core_ws;
 mod engine;
 mod helper_api;
@@ -21,6 +22,10 @@ use engine::{EngineManager, EngineState, StopOutcome};
 use serde_json::Value;
 
 const COPYRIGHT: &str = "©Copyright 2026 By 吳治綱";
+// 角色定位與回答範圍的出廠預設 (與 helper/src/config.mjs 逐字一致):
+// 設定尚未載入或舊存檔缺欄位時, AI 設定頁先以預設值顯示, 不讓欄位空白誤導。
+const DEFAULT_ROLE_PROMPT: &str = "你是華葳集成的電腦學習助理, 在公司 LINE 群組回答同事的電腦與 AI 工具操作問題。";
+const DEFAULT_SCOPE_PROMPT: &str = "你負責回答電腦與 AI 工具操作相關的問題。遇到與電腦無關的問題（例如算命、食譜、閒聊、生活瑣事），請禮貌婉拒，說明你負責的是電腦學習協助，並引導對方改問電腦相關的問題。";
 const UPSTREAM_CREDIT: &str = "上游出處: JS-PACKAGE/LINE.js (Apache-2.0) ・ @evex/linejs (evex-dev)";
 
 // 介面顏色一律走 theme 模組的 Palette (設計定稿 design/palettes.md), 不得再寫死色碼;
@@ -42,6 +47,7 @@ enum AppSignal {
 enum Page {
     Overview,
     LineLogin,
+    ChatRoom,
     AiSettings,
     BotSettings,
     KbSettings,
@@ -52,9 +58,10 @@ enum Page {
 }
 
 /// 側欄導覽順序與標籤 (圖示與頁面一一對應, 順序即 nav_icons 的索引)。
-const NAV_PAGES: [(Page, &str); 9] = [
+const NAV_PAGES: [(Page, &str); 10] = [
     (Page::Overview, "總覽"),
     (Page::LineLogin, "LINE 登入"),
+    (Page::ChatRoom, "聊天室畫面"),
     (Page::AiSettings, "AI 設定"),
     (Page::BotSettings, "機器人與觸發"),
     (Page::KbSettings, "知識庫"),
@@ -71,6 +78,7 @@ fn nav_icon_bytes(page: Page) -> &'static [u8] {
     match page {
         Page::Overview => include_bytes!("../assets/icons/nav-overview-256.png"),
         Page::LineLogin => include_bytes!("../assets/icons/nav-line-login-256.png"),
+        Page::ChatRoom => include_bytes!("../assets/icons/nav-chat-256.png"),
         Page::AiSettings => include_bytes!("../assets/icons/nav-ai-settings-256.png"),
         Page::BotSettings => include_bytes!("../assets/icons/nav-bot-256.png"),
         Page::KbSettings => include_bytes!("../assets/icons/nav-kb-256.png"),
@@ -103,6 +111,8 @@ struct SettingsForm {
     cooldown_sec: u32,
     daily_limit: u32,
     ai_active: String,
+    ai_role: String,
+    ai_scope: String,
     providers: HashMap<String, ProviderForm>,
     scam_enabled: bool,
     scam_threshold: f64,
@@ -174,6 +184,10 @@ struct App {
     activity: Option<serde_json::Value>,
     activity_fetched_at: Option<std::time::Instant>,
     activity_msg: Option<String>,
+    // 嵌入聊天畫面 (2026-10-21 新增「聊天室畫面」頁): WebView 宿主、主視窗代碼、profile 目錄
+    chatview: chatview::ChatViewHost,
+    parent_hwnd: Option<isize>,
+    webview_profile_dir: std::path::PathBuf,
     line_cfg_status: Slot<Value>,
     reindex_slot: Slot<Value>,
     save_slot: Slot<Value>,
@@ -209,7 +223,7 @@ struct App {
     theme_id: theme::ThemeId,
     palette: theme::Palette,
     /// 側欄圖示紋理, 索引與 NAV_PAGES 對齊; 解碼失敗為 None (側欄退回純文字, 已記 log)。
-    nav_icons: [Option<egui::TextureHandle>; 9],
+    nav_icons: [Option<egui::TextureHandle>; 10],
     #[cfg(windows)]
     tray: Option<Tray>,
 }
@@ -562,7 +576,7 @@ impl App {
         });
 
         // 側欄圖示: 任一顆解碼失敗只退回該顆純文字按鈕並記 log, 不 panic、不擋啟動。
-        let mut nav_icons: [Option<egui::TextureHandle>; 9] = Default::default();
+        let mut nav_icons: [Option<egui::TextureHandle>; 10] = Default::default();
         for (idx, (page, _)) in NAV_PAGES.iter().enumerate() {
             nav_icons[idx] = decode_image_rgba(nav_icon_bytes(*page)).map(|(rgba, w, h)| {
                 let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
@@ -573,6 +587,31 @@ impl App {
             }
         }
 
+        // 嵌入聊天畫面的父視窗代碼: 只在 Windows MSVC 建置取出 (其他平台嵌入不可用, 走占位)。
+        #[cfg(all(windows, target_env = "msvc"))]
+        let parent_hwnd = {
+            use raw_window_handle::HasWindowHandle as _;
+            cc.window_handle().ok().and_then(|h| match h.as_raw() {
+                raw_window_handle::RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
+                _ => None,
+            })
+        };
+        #[cfg(not(all(windows, target_env = "msvc")))]
+        let parent_hwnd: Option<isize> = None;
+
+        // 冒煙/截圖用: 以環境變數 AIBAO_START_PAGE 指定起始頁 (chat/login/ai/bot);
+        // 沒設或不認識的值一律總覽, 一般使用不受影響 (CI 截「聊天室畫面」頁靠這個)。
+        let start_page = match std::env::var("AIBAO_START_PAGE").as_deref() {
+            Ok("chat") => Page::ChatRoom,
+            Ok("login") => Page::LineLogin,
+            Ok("ai") => Page::AiSettings,
+            Ok("bot") => Page::BotSettings,
+            _ => Page::Overview,
+        };
+        if start_page != Page::Overview {
+            shell::log_line(&format!("起始頁由 AIBAO_START_PAGE 指定: {start_page:?}"));
+        }
+
         #[cfg(windows)]
         let tray = build_tray();
         let mut app = Self {
@@ -581,7 +620,7 @@ impl App {
             login,
             login_tx,
             signals,
-            page: Page::Overview,
+            page: start_page,
             snap,
             form: SettingsForm::default(),
             form_needs_load: true,
@@ -601,6 +640,9 @@ impl App {
             activity: None,
             activity_fetched_at: None,
             activity_msg: None,
+            chatview: chatview::ChatViewHost::new(),
+            parent_hwnd,
+            webview_profile_dir: shell::data_dir().join("webview2-profile"),
             line_cfg_status: Arc::new(Mutex::new(None)),
             reindex_slot: Arc::new(Mutex::new(None)),
             save_slot: Arc::new(Mutex::new(None)),
@@ -999,6 +1041,69 @@ fn primary_btn(ui: &mut egui::Ui, pal: theme::Palette, label: &str) -> egui::Res
     ui.add(egui::Button::new(text).fill(pal.primary))
 }
 
+// ---------- 群組清單共用列 (2026-10-21 版面整理) ----------
+// 讀取清單與白名單清單共用同一種列: 左側主行 = 群組名稱、副行小字 = 類型・人數;
+// 右側固定欄位 (固定寬度、靠右) 放動作按鈕或狀態標籤, 讓每列按鈕水平成一直線;
+// 列與列之間以分隔線區隔。畫面上不顯示原始 chat ID (ID 只留在 log/診斷資料)。
+
+fn chat_kind_label(kind: &str) -> &str {
+    match kind {
+        "group" => "群組",
+        "room" => "聊天室",
+        "square" => "社群",
+        _ => "聊天室",
+    }
+}
+
+/// 副行文字: 已解析 → 「類型・N 人」; 名稱未解析 → 「名稱與資料待讀取」。
+fn chat_sub_text(kind: Option<&str>, member_count: Option<i64>, resolved: bool) -> String {
+    if !resolved {
+        return "名稱與資料待讀取".to_string();
+    }
+    let k = chat_kind_label(kind.unwrap_or(""));
+    match member_count {
+        Some(n) => format!("{k}・{n} 人"),
+        None => k.to_string(),
+    }
+}
+
+/// 主行名稱: 有名稱就用名稱, 缺失或保底字樣一律顯示「未命名群組」 (不退回顯示 ID)。
+fn chat_display_name(name: Option<&str>, resolved: bool) -> String {
+    let n = name.unwrap_or("");
+    if resolved && !n.is_empty() && n != "(未命名)" {
+        n.to_string()
+    } else {
+        "未命名群組".to_string()
+    }
+}
+
+fn chat_list_row(ui: &mut egui::Ui, name: &str, sub: &str, action: impl FnOnce(&mut egui::Ui)) {
+    // 版面: 整列用右到左配置 — 動作按鈕先靠右固定, 左側剩餘空間放名稱 (主行) 與
+    // 類型/人數 (副行小字)。先前用 allocate_ui_with_layout 切左右兩塊的寫法實測會
+    // 把名稱擠掉、按鈕位置逐列漂移 (2026-10-21 本機截圖), 改用這個 egui 慣用式。
+    // 名稱不用 RichText::strong(): 本 App 主題把「啟用中」文字色設為白色 (給深色
+    // 按鈕用), 而 egui 的 strong 文字色正是取自該值 — 沒另外指定顏色時 strong
+    // 標籤會變成白字、在淺色卡片上看不見 (同卡的步驟標題也因此改用 size 強調)。
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        action(ui);
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(name).size(15.0));
+                ui.label(egui::RichText::new(sub).weak().small());
+            });
+        });
+    });
+    ui.separator();
+}
+
+/// 清單列右側的動作按鈕: 固定最小尺寸, 讓各列按鈕大小一致、水平對齊。
+fn chat_action_btn(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(label).min_size(egui::vec2(96.0, 26.0)),
+    )
+}
+
 // ---------- eframe 主迴圈 ----------
 
 impl eframe::App for App {
@@ -1139,10 +1244,26 @@ impl eframe::App for App {
             });
         });
 
+        // 嵌入聊天畫面的顯示總開關: 不在「聊天室畫面」頁、引擎未就緒、任一確認框開啟中、
+        // 或視窗已縮到系統匣時, 一律先隱藏 WebView。原生子視窗永遠畫在程式表面之上,
+        // 不先藏好就會殘留在別的頁面、或蓋住「確認結束」這類程式自己的對話框。
+        // (在本頁且條件符合時, page_chat 會在同一幀把它顯示回來。)
+        if self.page != Page::ChatRoom
+            || self.hidden
+            || self.engine_unavailable()
+            || self.confirm_quit
+            || self.confirm_logout
+            || self.show_tray_hint
+            || self.quitting
+        {
+            self.chatview.force_hide();
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| match self.page {
                 Page::Overview => self.page_overview(ui),
                 Page::LineLogin => self.page_login(ui),
+                Page::ChatRoom => self.page_chat(ui),
                 Page::AiSettings => self.page_ai(ui),
                 Page::BotSettings => self.page_bot(ui),
                 Page::KbSettings => self.page_kb(ui),
@@ -1347,6 +1468,18 @@ impl App {
         f.cooldown_sec = v.get("cooldownSec").and_then(|x| x.as_u64()).unwrap_or(20) as u32;
         f.daily_limit = v.get("dailyLimit").and_then(|x| x.as_u64()).unwrap_or(100) as u32;
         f.ai_active = v.get("ai").and_then(|a| a.get("active")).and_then(|x| x.as_str()).unwrap_or("openai").to_string();
+        f.ai_role = v
+            .get("ai")
+            .and_then(|a| a.get("rolePrompt"))
+            .and_then(|x| x.as_str())
+            .unwrap_or(DEFAULT_ROLE_PROMPT)
+            .to_string();
+        f.ai_scope = v
+            .get("ai")
+            .and_then(|a| a.get("scopePrompt"))
+            .and_then(|x| x.as_str())
+            .unwrap_or(DEFAULT_SCOPE_PROMPT)
+            .to_string();
         f.providers.clear();
         if let Some(providers) = v.get("ai").and_then(|a| a.get("providers")).and_then(|p| p.as_object()) {
             for (pid, pv) in providers {
@@ -1422,7 +1555,7 @@ impl App {
             "triggerMode": f.trigger_mode,
             "cooldownSec": f.cooldown_sec,
             "dailyLimit": f.daily_limit,
-            "ai": { "active": f.ai_active, "providers": providers },
+            "ai": { "active": f.ai_active, "providers": providers, "rolePrompt": f.ai_role, "scopePrompt": f.ai_scope },
             "scam": {
                 "enabled": f.scam_enabled,
                 "threshold": f.scam_threshold,
@@ -1911,10 +2044,11 @@ impl App {
         ui.add_space(10.0);
         self.activity_panel(ui, matches!(login.auth, AuthState::Ready));
     }
-
     // 機器人聊天情況面板 (第 12 項): 登入卡片下方顯示機器人在群組的服務實況。
     // 資料來自 helper 的 GET /api/bot/activity (唯讀; 問題只留前 30 字且只在 helper 記憶體)。
     // 開頁立即抓、之後每約 4 秒自動刷新; 失敗顯示白話訊息, 不跳原始錯誤。
+    // 2026-10-21 第 2 項: 已回答事件在問題行下方多一行回答預覽 (灰色小字, 約 40 字),
+    // 點一下展開完整回答、再點收合; 未回答的事件 (冷卻/上限/忙線/引導) 不顯示回答區。
     fn activity_panel(&mut self, ui: &mut egui::Ui, logged_in: bool) {
         let ctx = ui.ctx().clone();
         card(ui, self.palette, "機器人聊天情況", |ui| {
@@ -2010,10 +2144,108 @@ impl App {
                                 ui.label(egui::RichText::new(format!("(回答 {c} 字{})", ms.map(|m| format!("・{} 毫秒", m)).unwrap_or_default())).weak());
                             }
                         });
+                        // 回答內容 (第 2 項): 只有已回答事件才有 answer; 預覽列可點開/收合,
+                        // 展開狀態存 egui persisted data (以 時間|種類|提問者|問題 為鍵, 清單刷新不遺失;
+                        // 不用 temp data — 它只有一幀生命週期, 展開狀態留不住, 實測點了沒反應)。
+                        let answer = ev.get("answer").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                        if let Some(ans) = answer {
+                            let truncated = ev.get("answerTruncated").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let key = format!("{time}|{kind}|{sender}|{q}");
+                            let ans_id = ui.id().with(("activity-answer", key.clone()));
+                            let expanded = ui.ctx().data_mut(|d| d.get_persisted::<bool>(ans_id).unwrap_or(false));
+                            let total = ans.chars().count();
+                            let preview: String = ans.chars().take(40).collect();
+                            let preview_text = if total > 40 {
+                                format!("回答: {preview}… (點一下看全部)")
+                            } else {
+                                format!("回答: {preview}")
+                            };
+                            // 用無框按鈕當可點的預覽列: 外觀與小字標籤相同, 但點擊感應比 Label 可靠
+                            // (Label + Sense::click 在巢狀 ScrollArea 實測點不到, 2026-10-21 本機截圖驗證)。
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new(preview_text).weak().small()).frame(false))
+                                .clicked()
+                            {
+                                ui.ctx().data_mut(|d| d.insert_persisted(ans_id, !expanded));
+                            }
+                            if expanded {
+                                ui.label(egui::RichText::new(ans).small());
+                                if truncated {
+                                    ui.label(egui::RichText::new("(回答原文較長, 這裡只保存前 2000 字)").weak().small());
+                                }
+                            }
+                        }
                     }
                 });
             }
         });
+    }
+
+    // 「聊天室畫面」頁 (2026-10-21 老吳定案): 把核心的 LINE.js 聊天室網頁真嵌入內容區
+    // (chatview.rs, Windows 版 WebView2 子視窗), 占滿標題下方剩餘空間。
+    // 未登入或引擎未就緒只顯示白話占位、不載入頁面; 嵌入不可用的建置 (本機檢查版) 顯示占位說明。
+    fn page_chat(&mut self, ui: &mut egui::Ui) {
+        ui.heading("聊天室畫面");
+        ui.add_space(8.0);
+        if self.engine_unavailable() {
+            self.chatview.force_hide();
+            card(ui, self.palette, "引擎尚未就緒", |ui| {
+                ui.label(format!("目前引擎狀態: {}", self.engine_snap.label));
+                ui.label("引擎還沒啟動完成, 聊天畫面要等引擎就緒才能使用。");
+                if ui.button("重新啟動引擎").clicked() {
+                    self.restart_engine();
+                }
+            });
+            return;
+        }
+        let login = self.login_snapshot();
+        if !matches!(login.auth, AuthState::Ready) {
+            self.chatview.force_hide();
+            card(ui, self.palette, "聊天畫面", |ui| {
+                ui.label("登入後這裡會顯示聊天畫面");
+                ui.label(egui::RichText::new("請先到「LINE 登入」頁, 用次要帳號掃 QR 碼完成登入。").weak());
+            });
+            return;
+        }
+        let avail = ui.available_size();
+        let height = avail.y.max(140.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(avail.x, height), egui::Sense::hover());
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(10),
+            egui::Stroke::new(1.0, self.palette.border),
+            egui::StrokeKind::Inside,
+        );
+        if chatview::available() {
+            let minimized = ui.ctx().input(|i| i.viewport().minimized) == Some(true);
+            let want = !self.hidden
+                && !minimized
+                && !self.confirm_quit
+                && !self.confirm_logout
+                && !self.show_tray_hint
+                && !self.quitting;
+            let profile = self.webview_profile_dir.clone();
+            let ppp = ui.ctx().pixels_per_point();
+            self.chatview.sync(self.parent_hwnd, rect, ppp, want, &profile);
+            if let Some(err) = self.chatview.error() {
+                let err = err.to_string();
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    err,
+                    egui::FontId::proportional(15.0),
+                    self.palette.warn_text,
+                );
+            }
+        } else {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "聊天畫面會在 Windows 版的 AI寶 裡顯示",
+                egui::FontId::proportional(15.0),
+                self.palette.idle,
+            );
+        }
     }
 
     fn page_ai(&mut self, ui: &mut egui::Ui) {
@@ -2022,6 +2254,28 @@ impl App {
         ui.label("選一家 AI 服務、貼上 API Key、抓模型清單選一個, 測試成功後按「儲存全部設定」。");
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
+        // 第一張卡 (2026-10-21 老吳定案): 機器人定位與範圍, 兩欄都可編輯、儲存即時生效 (機器人每則訊息讀最新設定)。
+        card(ui, self.palette, "機器人定位與範圍", |ui| {
+            ui.label(egui::RichText::new("角色定位").strong());
+            ui.add(egui::TextEdit::multiline(&mut self.form.ai_role).desired_rows(2).desired_width(f32::INFINITY));
+            ui.label(egui::RichText::new("清空後儲存，會自動回復成出廠預設的角色定位。例：也可以改成「你是華葳集成的資訊小老師，專門陪同事學電腦」這類你想要的身分描述。").weak().small());
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("回答範圍").strong());
+            ui.add(egui::TextEdit::multiline(&mut self.form.ai_scope).desired_rows(4).desired_width(f32::INFINITY));
+            ui.label(egui::RichText::new("清空這個欄位＝不限制範圍，什麼問題都回答").weak().small());
+            ui.label(egui::RichText::new("例：也可以改成「離題的問題只簡短回答一句，並提醒對方你主要負責電腦學習協助」這種比較寬鬆的寫法。").weak().small());
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let saving = self.busy.get("save").copied().unwrap_or(false);
+                if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存定位與範圍" }).clicked() {
+                    self.save_settings(&ctx);
+                }
+                if let Some(m) = &self.form.save_msg {
+                    ui.label(m.clone());
+                }
+            });
+        });
+        ui.add_space(10.0);
         let pids: Vec<String> = ["openai", "groq", "minimax"].iter().map(|s| s.to_string()).collect();
         for pid in pids {
             let is_active = self.form.ai_active == pid;
@@ -2230,7 +2484,7 @@ impl App {
         card(ui, self.palette, "LINE 開通 (讓機器人能在群組說話)", |ui| {
             // 步驟一: 白名單 (用選的: 先讀群組清單, 再點選加入; 貼 ID 降為進階)
             let cfg = self.line_cfg_status.lock().unwrap().clone();
-            ui.label(egui::RichText::new("步驟一: 把目標群組加入白名單").strong());
+            ui.label(egui::RichText::new("步驟一: 把目標群組加入白名單").size(15.0));
             if let Some(c) = &cfg {
                 let enabled = c.get("apiEnabled").and_then(|v| v.as_bool()).unwrap_or(false);
                 let chats = c.get("chats").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
@@ -2254,22 +2508,19 @@ impl App {
                 let chats = self.group_chats.clone();
                 let busy_apply_now = self.busy.get("apply").copied().unwrap_or(false);
                 for c in &chats {
-                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("(未命名)").to_string();
-                    let kind = c.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                    let kind_label = match kind { "group" => "群組", "room" => "聊天室", "square" => "社群", _ => kind };
-                    let members = c.get("memberCount").and_then(|v| v.as_i64());
+                    let name = chat_display_name(c.get("name").and_then(|v| v.as_str()), true);
+                    let sub = chat_sub_text(
+                        c.get("kind").and_then(|v| v.as_str()),
+                        c.get("memberCount").and_then(|v| v.as_i64()),
+                        true,
+                    );
                     let whitelisted = c.get("whitelisted").and_then(|v| v.as_bool()).unwrap_or(false);
                     let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    ui.horizontal(|ui| {
-                        let mut text = format!("{name} ({kind_label}");
-                        if let Some(n) = members {
-                            text += &format!("・{n} 人");
-                        }
-                        text += ")";
-                        ui.label(text);
+                    chat_list_row(ui, &name, &sub, |ui| {
                         if whitelisted {
-                            ui.label(egui::RichText::new("已在白名單").color(self.palette.ok_text));
-                        } else if ui.add_enabled(!busy_apply_now, egui::Button::new("加入白名單")).clicked() {
+                            // 已在白名單: 停用態標籤 (與按鈕同尺寸同欄位, 保持每列對齊)
+                            let _ = chat_action_btn(ui, "已在白名單", false);
+                        } else if chat_action_btn(ui, "加入白名單", !busy_apply_now).clicked() {
                             self.start_apply(&ctx, id.clone());
                         }
                     });
@@ -2299,8 +2550,9 @@ impl App {
             }
             ui.add_space(8.0);
             // 目前白名單 (修復項 8): 已儲存的 chats 逐筆列出與移除, 不能只給計數;
-            // 名稱由 helper 對照核心快照解析, 核心讀不到時顯示 ID 並註明待讀取, 清單本身照樣列。
-            ui.label(egui::RichText::new("目前白名單 (已儲存的群組)").strong());
+            // 名稱/類型/人數由 helper 對照核心快照解析; 2026-10-21 版面整理: 畫面不顯示原始 ID,
+            // 名稱讀不到就顯示「未命名群組」與「名稱與資料待讀取」 (ID 只留在 log/診斷資料)。
+            ui.label(egui::RichText::new("目前白名單 (已儲存的群組)").size(15.0));
             if !self.wl_loaded && !self.wl_attempted && !self.busy.get("wl").copied().unwrap_or(false) {
                 self.spawn_whitelist_load(&ctx);
             }
@@ -2320,16 +2572,14 @@ impl App {
                 for c in &wl {
                     let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let resolved = c.get("nameResolved").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    ui.horizontal(|ui| {
-                        if resolved && !name.is_empty() {
-                            ui.label(name.clone());
-                            ui.label(egui::RichText::new(format!("({id})")).weak().small());
-                        } else {
-                            ui.label(id.clone());
-                            ui.label(egui::RichText::new("(名稱待讀取: 核心清單讀不到時先顯示代號)").weak());
-                        }
-                        if ui.add_enabled(!busy_apply_now, egui::Button::new("移除")).clicked() {
+                    let name = chat_display_name(c.get("name").and_then(|v| v.as_str()), resolved);
+                    let sub = chat_sub_text(
+                        c.get("kind").and_then(|v| v.as_str()),
+                        c.get("memberCount").and_then(|v| v.as_i64()),
+                        resolved,
+                    );
+                    chat_list_row(ui, &name, &sub, |ui| {
+                        if chat_action_btn(ui, "移除", !busy_apply_now).clicked() {
                             self.start_remove(&ctx, id.clone());
                         }
                     });
@@ -2338,7 +2588,7 @@ impl App {
             }
             ui.add_space(8.0);
             // 步驟二: Token
-            ui.label(egui::RichText::new("步驟二: 產生機器人 Token").strong());
+            ui.label(egui::RichText::new("步驟二: 產生機器人 Token").size(15.0));
             ui.label(if self.form.line_token_configured {
                 format!("目前 Token: 已設定 (末 4 碼 {})", self.form.line_token_last4)
             } else {
