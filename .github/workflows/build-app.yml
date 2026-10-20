@@ -421,9 +421,10 @@ jobs:
           function Kill-Image([string]$path) {
             Get-ImagePids $path | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
           }
-          function Get-NewEnginePids([string]$home) {
-            # 新殼自己啟動的引擎會解在 $home\engine\<戳記>\engine.exe; prev 等外來路徑不算。
-            $prefix = Join-Path $home 'engine'
+          function Get-NewEnginePids([string]$dataHome) {
+            # 新殼自己啟動的引擎會解在 $dataHome\engine\<戳記>\engine.exe; prev 等外來路徑不算。
+            # (參數不可用 $home: 那是 PowerShell 唯讀自動變數, 會直接 WriteError — CI 首跑實證。)
+            $prefix = Join-Path $dataHome 'engine'
             @(Get-Process | Where-Object { try { $_.Path -like "$prefix\*\engine.exe" } catch { $false } } | Select-Object -ExpandProperty Id)
           }
 
