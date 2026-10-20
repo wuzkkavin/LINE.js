@@ -105,6 +105,10 @@ jobs:
           $result = Get-Content $env:AIBAO_PROBE_OUT -Raw
           if ($result -notmatch 'login_roundtrip=ok') { throw '探針未確認登入往返成功' }
           if ($result -notmatch 'ports_freed=true') { throw '探針未確認結束後埠已釋放' }
+          # 端點實測斷言 (2026-10-20 實機 404 教訓): /api/status 200 不夠, 兩個 POST 端點都要實際打通
+          if ($result -notmatch 'helper_list_models_route=ok') { throw '探針未確認 /api/list-models 路由存在 (實機曾發生 404)' }
+          if ($result -notmatch 'helper_test_ai_route=ok') { throw '探針未確認 /api/test-ai 路由存在且邏輯有跑' }
+          if ($result -notmatch 'helper_status_identity=True') { throw '探針未確認 helper 身分標記' }
 
       - name: GUI 冒煙 — 啟動、截圖、結束序列
         shell: pwsh
@@ -159,7 +163,69 @@ jobs:
           $still = $false
           try { Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3 | Out-Null; $still = $true } catch { }
           if ($still) { throw '結束後 helper 埠仍有回應 (引擎未確實結束)' }
+          # 結束後存證: 殘留行程清單 + 雙埠探測結果寫進 artifact (2026-10-20「關掉 App 服務還在」缺失的加嚴驗證)
+          $report = @()
+          $remain = Get-Process | Where-Object { $_.ProcessName -in @('engine', 'AI寶') } | Select-Object Id, ProcessName
+          if ($remain) { $report += ($remain | Format-Table | Out-String) } else { $report += 'residual_processes=none' }
+          foreach ($p in 3789, 3790) {
+            $c = Test-NetConnection -ComputerName 127.0.0.1 -Port $p -WarningAction SilentlyContinue
+            $report += "port_${p}_tcp_connected=$($c.TcpTestSucceeded)"
+          }
+          $report | Set-Content (Join-Path $pwd 'gui-after-quit.txt')
+          $report | Write-Host
+          if ($remain) { throw '結束後仍有殘留引擎/App 行程' }
           Write-Host 'GUI 冒煙全數通過'
+
+      - name: 外來佔用情境 — 假服務先佔雙埠, App 須偵測身分不符並提示, 且結束時不誤殺對方
+        shell: pwsh
+        run: |
+          # 用 HttpListener 當「舊版/外來服務」: /api/status 回沒有 aibao-helper 身分標記的 JSON
+          $stubScript = Join-Path $pwd 'foreign-stub.ps1'
+          @'
+          $listener = New-Object System.Net.HttpListener
+          $listener.Prefixes.Add("http://127.0.0.1:3789/")
+          $listener.Prefixes.Add("http://127.0.0.1:3790/")
+          $listener.Start()
+          while ($listener.IsListening) {
+            try { $ctx = $listener.GetContext() } catch { break }
+            try {
+              $body = [Text.Encoding]::UTF8.GetBytes('{"version":"stub-foreign","bot":null}')
+              $ctx.Response.ContentType = "application/json"
+              $ctx.Response.OutputStream.Write($body, 0, $body.Length)
+              $ctx.Response.Close()
+            } catch { }
+          }
+          '@ | Set-Content $stubScript -Encoding UTF8
+          $stubProc = Start-Process pwsh -ArgumentList '-File', $stubScript -PassThru
+          Start-Sleep -Seconds 3
+          try {
+            $s = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3
+            if ($s.Content -match 'aibao-helper') { throw 'stub 不應帶身分標記, 情境設定錯誤' }
+            Write-Host "stub 就緒: $($s.StatusCode) $($s.Content)"
+            $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-foreign-data'
+            $exe = (Resolve-Path 'out/AI寶.exe').Path
+            $proc = Start-Process -FilePath $exe -PassThru
+            $logPath = Join-Path $env:HWLINEHELPER_HOME 'logs\shell.log'
+            $found = $false
+            foreach ($i in 1..30) {
+              Start-Sleep -Seconds 2
+              if ((Test-Path $logPath) -and ((Get-Content $logPath -Raw) -match '外來程式佔用')) { $found = $true; break }
+              if ($proc.HasExited) { break }
+            }
+            if (Test-Path $logPath) { Copy-Item $logPath (Join-Path $pwd 'foreign-shell.log') }
+            if (-not $found) { throw 'App 未偵測到外來佔用 (shell.log 沒有身分不符的紀錄)' }
+            Write-Host 'App 已偵測外來佔用並留下紀錄'
+            Start-Process -FilePath $exe -ArgumentList '--quit' -Wait
+            $exited = $proc.WaitForExit(90000)
+            if (-not $exited) { throw '外來情境: App 在 --quit 後 90 秒內未結束' }
+            Write-Host 'App 已結束; 確認 stub 沒有被誤殺:'
+            $s2 = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3
+            if ($s2.StatusCode -ne 200) { throw '外來情境: stub 被誤殺 (對方行程不該被結束)' }
+            Write-Host "stub 仍存活: $($s2.StatusCode)"
+            Write-Host '外來佔用情境全數通過'
+          } finally {
+            if ($stubProc -and -not $stubProc.HasExited) { Stop-Process -Id $stubProc.Id -Force }
+          }
 
       - name: 上傳成品、探針結果、截圖與 log
         if: always()
@@ -172,4 +238,6 @@ jobs:
             probe-stdout.txt
             probe-stderr.txt
             app-main.png
+            gui-after-quit.txt
+            foreign-shell.log
           if-no-files-found: warn
