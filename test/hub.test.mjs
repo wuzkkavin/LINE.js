@@ -106,6 +106,13 @@ class FakeProvider {
     const video = media.mime.startsWith("video/");
     return this.outgoing(channel, { messageId: "9001", contentType: video ? "VIDEO" : "IMAGE", mediaId: "msg-9001" });
   }
+  fileSends = [];
+  async sendFile(channel, filename, bytes) {
+    this.calls.push(["file", channel, filename, bytes.length]);
+    this.fileSends.push({ channel, filename, bytes: Buffer.from(bytes) });
+    if (this.sendError) throw this.sendError;
+    return this.outgoing(channel, { messageId: "9101", contentType: "FILE", card: { kind: "file", name: filename, size: bytes.length } });
+  }
   unsendError = undefined;
   async unsendMessage(channel, messageId) {
     this.calls.push(["unsend", channel, messageId]);
@@ -1780,6 +1787,48 @@ test("a bot can send text and read history in an allowed chat only", async (t) =
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(bot.frames.some((frame) => frame.type === "read"), false, "bots get no read receipts");
   assert.equal(env.provider.calls.some((call) => call[0] === "read-range"), false);
+});
+
+test("a bot can send a small .txt answer file in an allowed chat only; bad file frames are refused", async (t) => {
+  const env = await botEnv(t);
+  const bot = await env.open();
+  const ask = async (frame, match) => {
+    bot.socket.send(JSON.stringify(frame));
+    return bot.until((reply) => reply.requestId === frame.requestId && match(reply));
+  };
+  const content = Buffer.from("完整回答內容, 超過一則訊息放不下的長文。", "utf8");
+  const sent = await ask(
+    { type: "message:send", requestId: "f1", chatId: CHAT, file: { filename: "AI寶回答-20261020-主題.txt", dataBase64: content.toString("base64") } },
+    (f) => f.type === "sent",
+  );
+  assert.equal(sent.messageId, "9101");
+  assert.equal(env.provider.fileSends.length, 1);
+  assert.equal(env.provider.fileSends[0].filename, "AI寶回答-20261020-主題.txt");
+  assert.deepEqual(env.provider.fileSends[0].bytes, content, "檔案位元組必須原樣到達 provider");
+  // The chat shows the file message (pages included), with its file card.
+  const shown = env.page.frames.find((frame) => frame.type === "message" && frame.message.messageId === "9101");
+  assert.equal(shown.message.contentType, "FILE");
+  assert.deepEqual(shown.message.card, { kind: "file", name: "AI寶回答-20261020-主題.txt", size: content.length });
+  // A chat the bot was not given: same refusal as text.
+  env.hub.handleMessage({ messageId: "41", channelId: OTHER, channelKind: "group", senderId: "u1", senderName: "小明", text: "別群", contentType: "NONE", createdAt: 4 }, "new");
+  assert.equal((await ask({ type: "message:send", requestId: "f2", chatId: OTHER, file: { filename: "a.txt", dataBase64: content.toString("base64") } }, (f) => f.type === "error")).code, "UNKNOWN_CHAT");
+  // Refusals: path-like names, non-.txt, mixed payloads, broken base64.
+  // (Oversize is covered by the parseSend unit tests: this env's 1KB frame cap drops
+  // such a frame before parsing, and the production 256KB cap admits the frame but
+  // parseSend refuses the decoded size.) Sends are paced under the 5/second budget.
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  const refused = [
+    { filename: "../evil.txt", dataBase64: content.toString("base64") },
+    { filename: "a/b.txt", dataBase64: content.toString("base64") },
+    { filename: "notes.md", dataBase64: content.toString("base64") },
+    { filename: "ok.txt", dataBase64: "!!!not-base64!!!" },
+  ];
+  for (const [index, file] of refused.entries()) {
+    assert.equal((await ask({ type: "message:send", requestId: `fx${index}`, chatId: CHAT, file }, (f) => f.type === "error")).code, "INVALID_REQUEST", `refused case ${index}`);
+    await new Promise((resolve) => setTimeout(resolve, 260));
+  }
+  assert.equal((await ask({ type: "message:send", requestId: "fx9", chatId: CHAT, text: "混搭", file: { filename: "ok.txt", dataBase64: content.toString("base64") } }, (f) => f.type === "error")).code, "INVALID_REQUEST", "mixed text+file refused");
+  assert.equal(env.provider.fileSends.length, 1, "被拒的檔案一律不送達 LINE");
 });
 
 test("a bot can ask for this account's own id at any time, only while signed in", async (t) => {

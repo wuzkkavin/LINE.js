@@ -435,8 +435,9 @@ export function createHub(options: HubOptions): Hub {
     const channel = store.channelOf(request.chatId);
     if (login.state !== "ready" || !channel || (scope && !scope.has(request.chatId))) return fail(socket, "UNKNOWN_CHAT", request.requestId);
     const account = generation;
-    // Bots send text only: media goes through the browser upload, and stickers are outside their scope.
-    if (scope && request.kind !== "text") return fail(socket, "INVALID_REQUEST", request.requestId);
+    // Bots send text and small answer files: media goes through the browser upload, and
+    // stickers are outside their scope.
+    if (scope && request.kind !== "text" && request.kind !== "file") return fail(socket, "INVALID_REQUEST", request.requestId);
     const target = { channelId: request.chatId, kind: channel.kind };
     if (request.kind === "text") {
       // Cached speakers remain taggable; a bot may also tag admins it just queried in this chat.
@@ -467,6 +468,8 @@ export function createHub(options: HubOptions): Hub {
         media.dropUpload(request.uploadId);
       } else if (request.kind === "text") {
         message = await provider.sendText(target, request.text, { mentions: request.mentions, ...(request.replyTo ? { replyTo: request.replyTo } : {}) });
+      } else if (request.kind === "file") {
+        message = await provider.sendFile(target, request.filename, request.bytes);
       } else {
         message = await provider.sendSticker(target, request.packageId, request.stickerId);
       }

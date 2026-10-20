@@ -25,7 +25,18 @@ export type SendRequest = { requestId: string; chatId: string } & (
   | { kind: "text"; text: string; mentions: Mention[]; replyTo?: string }
   | { kind: "media"; uploadId: string }
   | { kind: "sticker"; packageId: number; stickerId: number }
+  | { kind: "file"; filename: string; bytes: Buffer }
 );
+
+/**
+ * Bot answer files are plain text and small by design: the cap keeps the base64 frame
+ * comfortably inside `limits.frameMaxBytes` (256KB) and is enforced again in the provider.
+ */
+export const MAX_BOT_FILE_BYTES = 128 * 1024;
+// Basename only: no path separators or control characters, and (for this frame) plain
+// text answers only — the extension is part of the contract, not a suggestion.
+const BOT_FILE_NAME = /^[^\\/:*?"<>|\u0000-\u001f]{1,114}\.txt$/;
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 function positiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
@@ -79,11 +90,21 @@ export function parseSend(frame: Record<string, unknown>, textMaxLength: number)
   const base = header(frame);
   if (!base) return { ok: false, ...(requestIdOf(frame) ? { requestId: requestIdOf(frame)! } : {}) };
   const refuse: Parsed<SendRequest> = { ok: false, requestId: base.requestId };
-  const { text, mediaId, sticker, mentions, replyTo } = frame;
+  const { text, mediaId, sticker, file, mentions, replyTo } = frame;
   // Exactly one payload: a frame that mixes kinds is ambiguous, so nothing is sent.
-  if ([text, mediaId, sticker].filter((part) => part !== undefined).length !== 1) return refuse;
+  if ([text, mediaId, sticker, file].filter((part) => part !== undefined).length !== 1) return refuse;
   // Mentions and replies decorate a text message; on anything else they make the frame ambiguous.
   if (text === undefined && (mentions !== undefined || replyTo !== undefined)) return refuse;
+  if (file !== undefined) {
+    if (!file || typeof file !== "object" || Array.isArray(file)) return refuse;
+    const { filename, dataBase64 } = file as Record<string, unknown>;
+    if (typeof filename !== "string" || !BOT_FILE_NAME.test(filename)) return refuse;
+    // Length gate before decoding: base64 inflates by 4/3, so this bounds the decoded size too.
+    if (typeof dataBase64 !== "string" || dataBase64.length === 0 || dataBase64.length > Math.ceil(MAX_BOT_FILE_BYTES / 3) * 4 || !BASE64.test(dataBase64)) return refuse;
+    const bytes = Buffer.from(dataBase64, "base64");
+    if (bytes.length === 0 || bytes.length > MAX_BOT_FILE_BYTES) return refuse;
+    return { ok: true, value: { ...base, kind: "file", filename, bytes } };
+  }
   if (text !== undefined) {
     // Length is capped before any trimming so the limit cannot be dodged with padding.
     if (typeof text !== "string" || text.length > textMaxLength || text.trim().length === 0) return refuse;

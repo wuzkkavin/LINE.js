@@ -1559,3 +1559,59 @@ test("media uploads exclude surrounding storage and retain their snapshot while 
     assert.deepEqual(received, expected);
   });
 });
+
+test("getProfile maps the account's pictureStatus to the avatar media id the shell fetches", async () => {
+  // The shell app shows the account's real avatar by fetching /media/<pictureId> from the
+  // profile in auth:ready; without this mapping the app can only ever show its brand image.
+  const base = fakeBase();
+  base.profile = { mid: ME, displayName: "我", pictureStatus: "0hAbC_def-123456" };
+  const { provider } = await activeProvider(base);
+  assert.deepEqual(provider.getProfile(), { userId: ME, displayName: "我", pictureId: "avatar-p-0hAbC_def-123456" });
+  await provider.close();
+  // No picture set on the account: no pictureId (the shell then keeps the brand image).
+  const base2 = fakeBase();
+  const { provider: provider2 } = await activeProvider(base2);
+  assert.equal(provider2.getProfile().pictureId, undefined);
+  await provider2.close();
+});
+
+test("sendFile uploads a .txt through OBS and returns a FILE message with its card; E2EE chats use the encrypted upload", async () => {
+  const bytes = Buffer.from("完整回答, 做成文字檔。", "utf8");
+  // Plain path: the OBS upload creates the message; its object id is the message id.
+  const seen = [];
+  const base = fakeBase();
+  base.obs = {
+    async uploadObjTalk(chat, type, blob, oid, filename) {
+      seen.push({ chat, type, filename, bytes: Buffer.from(await blob.arrayBuffer()) });
+      return { objId: "9100" };
+    },
+  };
+  const { provider } = await activeProvider(base);
+  const message = await provider.sendFile({ channelId: GROUP_A, kind: "group" }, "AI寶回答-20261020.txt", bytes);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].type, "file");
+  assert.equal(seen[0].filename, "AI寶回答-20261020.txt");
+  assert.deepEqual(seen[0].bytes, bytes);
+  assert.equal(message.messageId, "9100");
+  assert.equal(message.contentType, "FILE");
+  assert.deepEqual(message.card, { kind: "file", name: "AI寶回答-20261020.txt", size: bytes.length, fileId: "file-9100" });
+  await provider.close();
+
+  // E2EE path: plain upload rejected -> encrypted upload, which returns the message itself.
+  const base2 = fakeBase();
+  let e2eeSeen;
+  base2.obs = {
+    async uploadObjTalk() { throw new Error("E2EE required"); },
+    async uploadMediaByE2EE(options) {
+      e2eeSeen = options;
+      return { id: "9200", to: GROUP_A, from: "u-me", toType: "GROUP", contentType: "FILE", contentMetadata: { FILE_NAME: options.filename, FILE_SIZE: "3" }, createdTime: "1700000000000" };
+    },
+  };
+  const { provider: provider2 } = await activeProvider(base2);
+  const encrypted = await provider2.sendFile({ channelId: GROUP_A, kind: "group" }, "AI寶回答-20261020.txt", bytes);
+  assert.equal(e2eeSeen.oType, "file");
+  assert.equal(e2eeSeen.filename, "AI寶回答-20261020.txt");
+  assert.equal(encrypted.messageId, "9200");
+  assert.equal(encrypted.contentType, "FILE");
+  await provider2.close();
+});

@@ -65,6 +65,36 @@ test("a reply names a numeric message id and only decorates text", () => {
   assert.equal(parseSend({ requestId: "r1", chatId: CHAT, sticker: { packageId: 1, stickerId: 1 }, replyTo: "5" }, 100).ok, false);
 });
 
+test("a bot answer file needs a plain .txt basename and bounded strict base64", () => {
+  const send = (file) => parseSend({ requestId: "r1", chatId: CHAT, file }, 100);
+  const good = send({ filename: "AI寶回答-20261020-凍結窗格.txt", dataBase64: Buffer.from("完整內容", "utf8").toString("base64") });
+  assert.equal(good.ok, true);
+  assert.equal(good.value.kind, "file");
+  assert.equal(good.value.filename, "AI寶回答-20261020-凍結窗格.txt");
+  assert.deepEqual(good.value.bytes, Buffer.from("完整內容", "utf8"));
+  const refused = [
+    { filename: "../x.txt", dataBase64: "QQ==" },
+    { filename: "a/b.txt", dataBase64: "QQ==" },
+    { filename: "a\\b.txt", dataBase64: "QQ==" },
+    { filename: "x.md", dataBase64: "QQ==" },
+    { filename: "x.txt ", dataBase64: "QQ==" },
+    { filename: "", dataBase64: "QQ==" },
+    { filename: "x.txt", dataBase64: "" },
+    { filename: "x.txt", dataBase64: "not base64!" },
+    { filename: "x.txt", dataBase64: "QQ== " },
+    { filename: "x.txt", dataBase64: Buffer.alloc(128 * 1024 + 1).toString("base64") },
+    { filename: "x.txt" },
+    { dataBase64: "QQ==" },
+    "x.txt",
+    null,
+  ];
+  for (const file of refused) assert.equal(send(file).ok, false, JSON.stringify(file)?.slice(0, 60));
+  // Exactly at the cap is accepted; mixing payloads is not.
+  assert.equal(send({ filename: "x.txt", dataBase64: Buffer.alloc(128 * 1024).toString("base64") }).ok, true);
+  assert.equal(parseSend({ requestId: "r1", chatId: CHAT, text: "hi", file: { filename: "x.txt", dataBase64: "QQ==" } }, 100).ok, false, "text+file mixed");
+  assert.equal(parseSend({ requestId: "r1", chatId: CHAT, file: { filename: "x.txt", dataBase64: "QQ==" }, replyTo: "5" }, 100).ok, false, "replies only decorate text");
+});
+
 test("text is length-capped before trimming and may not be blank; the original text is preserved", () => {
   const send = (text) => parseSend({ requestId: "r1", chatId: CHAT, text }, 8);
   assert.equal(send("12345678").ok, true);

@@ -76,6 +76,8 @@ export interface LineProvider {
   sendSticker(channel: ChannelRef, packageId: number, stickerId: number): Promise<Message>;
   /** The returned message is what the browser should show now: LINE sends no live event for our own sends. */
   sendMedia(channel: ChannelRef, media: MediaBytes): Promise<Message>;
+  /** Sends one small file (the bot's long answers as .txt) into the chat; same no-live-event contract as sendMedia. */
+  sendFile(channel: ChannelRef, filename: string, bytes: Buffer): Promise<Message>;
   /** Takes back one of this account's messages for everyone (LINE decides whether it still may). */
   unsendMessage(channel: ChannelRef, messageId: string): Promise<void>;
   /** Sets (or, with undefined, removes) this account's reaction to a message. */
@@ -1174,6 +1176,45 @@ export class EvexLineProvider implements LineProvider {
     } else {
       await client.base.talk.cancelReaction({ cancelReactionRequest: { reqSeq, messageId: BigInt(messageId) } });
     }
+  }
+
+  /**
+   * Sends a small file into the chat (the helper bot's over-long answers, delivered as .txt).
+   * Same shape as sendMedia: a plain OBS upload creates the message server-side; E2EE chats
+   * reject plain uploads, so those fall back to the encrypted upload, which returns the message.
+   */
+  async sendFile(channel: ChannelRef, filename: string, bytes: Buffer): Promise<Message> {
+    const client = this.requireClient();
+    const me = this.getProfile();
+    // Blob snapshots ArrayBuffer views itself; shared backing stores still need an ordinary copy.
+    const part = bytes.buffer instanceof ArrayBuffer
+      ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+      : new Uint8Array(bytes);
+    const blob = new Blob([part], { type: "text/plain" });
+    try {
+      const uploaded = await client.base.obs.uploadObjTalk(channel.channelId, "file", blob, undefined, filename);
+      if (this.client !== client) throw new Error("NOT_AUTHENTICATED");
+      if (uploaded.objId) return this.outgoingFile(channel, me, uploaded.objId, filename, bytes.length);
+    } catch {
+      // Fall through: end-to-end encrypted chats reject plain uploads.
+    }
+    if (this.client !== client) throw new Error("NOT_AUTHENTICATED");
+    if (channel.kind === "square" || !(channel.channelId.startsWith("u") || channel.channelId.startsWith("c"))) {
+      throw new Error("MEDIA_SEND_FAILED");
+    }
+    const message = await client.base.obs.uploadMediaByE2EE({ data: blob, oType: "file", to: channel.channelId, filename });
+    if (this.client !== client) throw new Error("NOT_AUTHENTICATED");
+    return this.talkToMessage({ ...message, to: channel.channelId, from: me.userId }, me.userId);
+  }
+
+  /** A plain upload's object id is the id of the message LINE created for it; files carry their name/size as the card. */
+  private outgoingFile(channel: ChannelRef, me: Profile, id: string, filename: string, size: number): Message {
+    const toType = { user: "USER", room: "ROOM", group: "GROUP", square: "SQUARE_CHAT" }[channel.kind];
+    const raw = { id, to: channel.channelId, from: me.userId, toType, contentType: "FILE", contentMetadata: { FILE_NAME: filename, FILE_SIZE: String(size) }, createdTime: String(Date.now()) } as unknown as LineMessage;
+    if (channel.kind !== "square") return this.talkToMessage(raw, me.userId);
+    const message = this.squareToMessage({ message: raw } as LineSquareMessage, me.displayName);
+    this.rememberSquareMessage(message);
+    return message;
   }
 
   /** A plain upload's object id is the id of the message LINE created for it. */

@@ -53,7 +53,7 @@ export type ClientFrame =
   | { type: "history:fetch"; requestId: string; chatId: string; limit?: number; before?: string }
   /** Bot API only; restricted to known OpenChats in `api.chats`. */
   | { type: "chat:admins:get"; requestId: string; chatId: string }
-  | { type: "message:send"; requestId: string; chatId: string; text?: string; mentions?: Mention[]; mediaId?: string; sticker?: { packageId: number; stickerId: number } }
+  | { type: "message:send"; requestId: string; chatId: string; text?: string; mentions?: Mention[]; mediaId?: string; sticker?: { packageId: number; stickerId: number }; file?: { filename: string; dataBase64: string } }
   | { type: "chat:read"; chatId: string; messageId: string }
   /** Take back one of this account's own messages (pages only; bots cannot). */
   | { type: "message:unsend"; requestId: string; chatId: string; messageId: string }
