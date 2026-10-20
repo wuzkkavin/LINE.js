@@ -1,10 +1,50 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 // Browser code without DOM or page state: imported from source (Node ≥ 22 strips types).
-import { dayLabel, formatBytes, listTime, previewOf, scamSummary } from "../web/format.ts";
+import { dayLabel, formatBytes, formatTime, listTime, previewOf, scamSummary } from "../web/format.ts";
 
 const at = (y, m, d, h = 12, min = 0) => new Date(y, m - 1, d, h, min).getTime();
 const NOW = at(2026, 10, 10, 9);
+
+test("message clocks use two-digit local hours and minutes, including midnight and the last minute", () => {
+  assert.equal(formatTime(at(2026, 10, 10, 0, 0)), "00:00");
+  assert.equal(formatTime(at(2026, 10, 10, 0, 5)), "00:05");
+  assert.equal(formatTime(at(2026, 10, 10, 9, 7)), "09:07");
+  assert.equal(formatTime(at(2026, 10, 10, 23, 59) + 59_999), "23:59");
+});
+
+test("message clocks retain Invalid Date for invalid timestamps", () => {
+  for (const timestamp of [NaN, Infinity, -Infinity, 8_640_000_000_000_001]) {
+    assert.equal(formatTime(timestamp), "Invalid Date");
+  }
+});
+
+test("message clocks follow timezone changes and DST transitions without changing the test runner timezone", () => {
+  const fixtures = [
+    { zone: "UTC", times: ["2026-03-08T06:59:00Z"], expected: ["06:59"] },
+    { zone: "Asia/Taipei", times: ["2026-03-08T06:59:00Z"], expected: ["14:59"] },
+    {
+      zone: "America/New_York",
+      times: ["2026-03-08T06:59:00Z", "2026-03-08T07:00:00Z", "2026-11-01T05:59:00Z", "2026-11-01T06:00:00Z"],
+      expected: ["01:59", "03:00", "01:59", "01:00"],
+    },
+    { zone: "UTC", times: ["2026-03-08T07:00:00Z"], expected: ["07:00"] },
+  ];
+  const source = `
+    import { formatTime } from ${JSON.stringify(new URL("../web/format.ts", import.meta.url).href)};
+    const result = ${JSON.stringify(fixtures)}.map(({ zone, times }) => {
+      process.env.TZ = zone;
+      return times.map(time => formatTime(Date.parse(time)));
+    });
+    process.stdout.write(JSON.stringify(result));
+  `;
+  const actual = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", source], {
+    encoding: "utf8",
+    env: { ...process.env, TZ: "UTC" },
+  }));
+  assert.deepEqual(actual, fixtures.map(({ expected }) => expected));
+});
 
 test("list and divider times: today's clock, yesterday across a month boundary, the year only when it differs", () => {
   assert.equal(listTime(at(2026, 10, 10, 0, 5), NOW), "00:05", "midnight reads 00, not 24");
@@ -12,9 +52,39 @@ test("list and divider times: today's clock, yesterday across a month boundary, 
   assert.equal(listTime(at(2026, 9, 30, 23), at(2026, 10, 1, 1)), "昨天");
   assert.equal(listTime(at(2026, 10, 8), NOW), "10/8");
   assert.equal(listTime(at(2025, 12, 31), NOW), "2025/12/31");
+  assert.equal(listTime(at(2024, 2, 29), at(2024, 3, 2)), "2/29");
+  assert.equal(listTime(at(2025, 12, 31), at(2026, 1, 1)), "昨天");
   assert.equal(dayLabel(at(2026, 10, 10, 0), NOW), "今天");
   assert.equal(dayLabel(at(2026, 10, 9), NOW), "昨天");
   assert.match(dayLabel(at(2025, 3, 2), NOW), /^2025年3月2日/);
+});
+
+test("list dates keep invalid timestamps distinguishable from real dates", () => {
+  for (const timestamp of [NaN, Infinity, -Infinity, 8_640_000_000_000_001]) {
+    assert.equal(listTime(timestamp, NOW), "Invalid Date");
+  }
+});
+
+test("list dates follow local calendar and year changes without caching the timezone", () => {
+  const fixtures = [
+    { zone: "UTC", expected: "2026/12/31" },
+    { zone: "Asia/Taipei", expected: "1/1" },
+    { zone: "America/Los_Angeles", expected: "2026/12/31" },
+    { zone: "UTC", expected: "2026/12/31" },
+  ];
+  const source = `
+    import { listTime } from ${JSON.stringify(new URL("../web/format.ts", import.meta.url).href)};
+    const result = ${JSON.stringify(fixtures)}.map(({ zone }) => {
+      process.env.TZ = zone;
+      return listTime(Date.parse("2026-12-31T23:30:00Z"), Date.parse("2027-01-03T12:00:00Z"));
+    });
+    process.stdout.write(JSON.stringify(result));
+  `;
+  const actual = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", source], {
+    encoding: "utf8",
+    env: { ...process.env, TZ: "UTC" },
+  }));
+  assert.deepEqual(actual, fixtures.map(({ expected }) => expected));
 });
 
 test("sizes switch units at 1 KiB and 1 MiB", () => {

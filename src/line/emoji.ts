@@ -20,7 +20,9 @@ export function parseEmojis(metadata: Record<string, string> | undefined, text: 
   }
   if (!Array.isArray(list)) return [];
   const found: TextEmoji[] = [];
-  for (const entry of list.slice(0, MAX_RECEIVED_EMOJIS) as unknown[]) {
+  const count = Math.min(list.length, MAX_RECEIVED_EMOJIS);
+  for (let index = 0; index < count; index++) {
+    const entry: unknown = list[index];
     if (!entry || typeof entry !== "object") continue;
     const { S, E, productId, sticonId } = entry as Record<string, unknown>;
     const start = Number(S);
@@ -29,8 +31,15 @@ export function parseEmojis(metadata: Record<string, string> | undefined, text: 
     if (typeof productId !== "string" || !PRODUCT_ID.test(productId) || typeof sticonId !== "string" || !STICON_ID.test(sticonId)) continue;
     found.push({ start, end, emojiId: `emoji-${productId}-${sticonId}` });
   }
+  if (found.length < 2) return found;
   found.sort((a, b) => a.start - b.start);
-  const kept: TextEmoji[] = [];
-  for (const emoji of found) if (emoji.start >= (kept.at(-1)?.end ?? 0)) kept.push(emoji);
-  return kept;
+  let kept = 0;
+  let lastEnd = 0;
+  for (const emoji of found) {
+    if (emoji.start < lastEnd) continue;
+    found[kept++] = emoji;
+    lastEnd = emoji.end;
+  }
+  found.length = kept;
+  return found;
 }

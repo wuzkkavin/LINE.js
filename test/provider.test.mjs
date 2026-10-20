@@ -129,6 +129,112 @@ test("friends are fetched in batches of 100, a few at a time, in LINE's order", 
   assert.deepEqual(channels.map((channel) => channel.channelId), friends);
 });
 
+test("late friend lookups cannot overwrite a replacement account's names or start more batches", async (t) => {
+  for (const phase of ["ids", "contacts"]) {
+    await t.test(phase, async () => {
+      const friends = Array.from({ length: 750 }, (_, index) => mid(1000 + index));
+      const gate = Promise.withResolvers();
+      const started = Promise.withResolvers();
+      const requests = [];
+      const base = fakeBase({ relation: {
+        async getUserFriendIds() {
+          if (phase === "ids") { started.resolve(); await gate.promise; }
+          return { userFriendMids: friends };
+        },
+        async getContactsV3({ mids }) {
+          requests.push([...mids]);
+          if (phase === "contacts") { started.resolve(); await gate.promise; }
+          return { responses: mids.map((mid) => ({ targetUserMid: mid, targetProfileDetail: { profileName: "舊帳號稱呼" } })) };
+        },
+      } });
+      const { provider } = await activeProvider(base, {
+        async fetchJoinedChats() { return []; },
+        async fetchJoinedSquares() { return []; },
+        async fetchJoinedSquareChats() { return []; },
+      });
+      const loading = provider.fetchChannels();
+      try {
+        await started.promise;
+        const pendingRequests = [...requests];
+        await provider.teardown();
+        let freshLookups = 0;
+        const replacement = fakeBase({ talk: {
+          async getRecentMessagesV2() { return [talk("1001", GROUP_A, friends[0], "新帳號的訊息").raw]; },
+          async getContactsV2({ mids }) {
+            freshLookups += 1;
+            return { contacts: Object.fromEntries(mids.map((mid) => [mid, { contact: { mid, displayName: "新帳號稱呼" } }])) };
+          },
+        } });
+        replacement.profile.mid = mid(9000);
+        provider.base = replacement;
+        await provider.activate(replacement);
+        const channel = { channelId: GROUP_A, kind: "group" };
+        const before = (await provider.fetchHistory(channel, 1)).messages[0];
+        assert.equal(before.senderName, "新帳號稱呼");
+        gate.resolve();
+        await loading;
+        const after = (await provider.fetchHistory(channel, 1)).messages[0];
+        assert.equal(after.senderName, before.senderName);
+        assert.deepEqual(requests, pendingRequests, "only the requests already in flight may finish");
+        assert.equal(freshLookups, 1, "the new profile is retained, not discarded and fetched again");
+      } finally {
+        gate.resolve();
+        await loading.catch(() => {});
+        await provider.close();
+      }
+    });
+  }
+});
+
+test("obsolete sticker lookups stop queued metadata work and preserve the replacement account's cache", async (t) => {
+  for (const phase of ["owned", "metadata"]) {
+    await t.test(phase, async () => {
+      const gate = Promise.withResolvers();
+      const started = Promise.withResolvers();
+      const requests = [];
+      const base = fakeBase();
+      base.request = { async request() {
+        if (phase === "owned") { started.resolve(); await gate.promise; }
+        return { 1: Array.from({ length: 12 }, (_, index) => ({ 1: String(index + 1) })) };
+      } };
+      const { provider } = await activeProvider(base);
+      provider.fetchPackageMeta = async (packageId) => {
+        requests.push(packageId);
+        if (packageId !== 9999 && phase === "metadata") { started.resolve(); await gate.promise; }
+        return { name: packageId === 9999 ? "新帳號貼圖" : "舊帳號貼圖", stickerIds: [packageId * 10], animated: false };
+      };
+      const loading = provider.fetchStickerPackages();
+      try {
+        await started.promise;
+        const pendingRequests = [...requests];
+        await provider.teardown();
+        let freshLookups = 0;
+        const replacement = fakeBase();
+        replacement.profile.mid = mid(9000);
+        replacement.request = { async request() {
+          freshLookups += 1;
+          return { 1: [{ 1: "9999" }] };
+        } };
+        provider.base = replacement;
+        await provider.activate(replacement);
+        const expected = [{ packageId: 9999, name: "新帳號貼圖", stickerIds: [99990], animated: false }];
+        assert.deepEqual(await provider.fetchStickerPackages(), expected);
+        gate.resolve();
+        const stale = await loading;
+        assert.deepEqual(requests.filter((id) => id !== 9999), pendingRequests);
+        assert.deepEqual(stale, []);
+        assert.deepEqual(await provider.fetchStickerPackages(), expected);
+        assert.equal(freshLookups, 1);
+        assert.deepEqual(requests.filter((id) => id === 9999), [9999]);
+      } finally {
+        gate.resolve();
+        await loading.catch(() => {});
+        await provider.close();
+      }
+    });
+  }
+});
+
 test("the chat list carries LINE's unread count, activity time and last message; E2EE previews decrypt once and register no media", async () => {
   const at = (n) => String(1_700_000_000_000 + n);
   let boxRequests = 0;
@@ -179,6 +285,137 @@ test("the chat list carries LINE's unread count, activity time and last message;
   await provider.fetchChannels();
   assert.equal(boxRequests, 2);
   assert.equal(decrypts, 1, "the same last message is not decrypted again on the next refresh");
+});
+
+test("chat summaries overlap talk pagination and keep five square workers busy despite slow or failed chats", async () => {
+  const ids = Array.from({ length: 8 }, (_, index) => `m${String(index).repeat(32)}`);
+  const gates = ids.map(() => Promise.withResolvers());
+  const talkGate = Promise.withResolvers();
+  const starts = [];
+  const boxRequests = [];
+  let active = 0;
+  let peak = 0;
+  const at = 1_700_000_000_123;
+  const base = fakeBase({
+    relation: { async getUserFriendIds() { return { userFriendMids: [] }; } },
+    talk: {
+      async getMessageBoxes({ messageBoxListRequest }) {
+        boxRequests.push(messageBoxListRequest.minChatId);
+        if (messageBoxListRequest.minChatId) throw new Error("later talk page unavailable");
+        await talkGate.promise;
+        return {
+          hasNext: true,
+          messageBoxes: [{ id: GROUP_A, unreadCount: 20000, lastDeliveredMessageId: { deliveredTime: String(at) }, lastMessages: [talk("123", GROUP_A, ME, "talk preview").raw] }],
+        };
+      },
+    },
+    square: {
+      async getSquareChatStatus({ request }) {
+        const index = ids.indexOf(request.squareChatMid);
+        starts.push(index);
+        active += 1;
+        peak = Math.max(peak, active);
+        try {
+          await gates[index].promise;
+          if (index === 2) throw new Error("one square unavailable");
+          return { chatStatus: {
+            otherStatus: { unreadMessageCount: index === 3 ? -1 : 20000, memberCount: index === 3 ? 0 : 42 },
+            senderDisplayName: "社群成員",
+            lastMessage: { message: { id: String(200 + index), to: ids[index], from: `pSender${index}`, contentType: "NONE", text: `square-${index}`, createdTime: String(at + index), contentMetadata: {} } },
+          } };
+        } finally {
+          active -= 1;
+        }
+      },
+    },
+  });
+  const { provider } = await activeProvider(base, {
+    async fetchJoinedChats() { return [{ mid: GROUP_A, name: "群A", raw: { type: "GROUP" } }]; },
+    async fetchJoinedSquares() { return []; },
+    async fetchJoinedSquareChats() { return ids.map((id) => ({ raw: { squareChatMid: id, name: id } })); },
+  });
+  const loading = provider.fetchChannels();
+  const drain = () => new Promise((resolve) => setImmediate(resolve));
+  await drain();
+  assert.deepEqual(boxRequests, [undefined]);
+  assert.deepEqual(starts, [0, 1, 2, 3, 4], "square summaries start while the talk first page remains pending");
+  gates[1].resolve();
+  await drain();
+  assert.deepEqual(starts, [0, 1, 2, 3, 4, 5], "a spare worker starts the next chat without waiting for slow chat zero");
+  gates[2].resolve();
+  await drain();
+  assert.deepEqual(starts, [0, 1, 2, 3, 4, 5, 6], "a failed chat also releases its worker");
+  gates[5].resolve();
+  await drain();
+  assert.equal(starts.length, 8, "work continues even while talk pagination and the slow square remain pending");
+  talkGate.resolve();
+  for (const gate of gates) gate.resolve();
+  const channels = await loading;
+  assert.equal(peak, 5);
+  assert.equal(active, 0);
+  assert.deepEqual(boxRequests, [undefined, GROUP_A]);
+  assert.deepEqual(channels.map((channel) => channel.channelId), [GROUP_A, ...ids], "completion order does not reorder the channel list");
+  assert.equal(channels[0].unreadCount, 9999);
+  assert.equal(channels[0].lastMessage.text, "talk preview", "successful earlier talk pages survive a later page failure");
+  assert.equal(channels[0].lastMessageAt, at);
+  for (let index = 0; index < ids.length; index += 1) {
+    const channel = channels[index + 1];
+    if (index === 2) {
+      assert.equal(channel.unreadCount, undefined);
+      assert.equal(channel.memberCount, undefined);
+      assert.equal(channel.lastMessage, undefined);
+      assert.equal(channel.lastMessageAt, undefined);
+    } else {
+      assert.equal(channel.unreadCount, index === 3 ? undefined : 9999);
+      assert.equal(channel.memberCount, index === 3 ? undefined : 42);
+      assert.equal(channel.lastMessage.text, `square-${index}`);
+      assert.equal(channel.lastMessage.senderName, "社群成員");
+      assert.equal(channel.lastMessageAt, at + index);
+    }
+  }
+});
+
+test("replacing the account stops queued summary work and discards old badges, members and previews", async () => {
+  const talkGate = Promise.withResolvers();
+  const squareGate = Promise.withResolvers();
+  let talks = 0;
+  let squares = 0;
+  const base = fakeBase({
+    relation: { async getUserFriendIds() { return { userFriendMids: [] }; } },
+    talk: { async getMessageBoxes() {
+      talks += 1;
+      await talkGate.promise;
+      return { hasNext: true, messageBoxes: [{ id: GROUP_A, unreadCount: 3 }] };
+    } },
+    square: { async getSquareChatStatus() {
+      squares += 1;
+      await squareGate.promise;
+      return { chatStatus: { otherStatus: { unreadMessageCount: 3, memberCount: 42 } } };
+    } },
+  });
+  const { provider } = await activeProvider(base, {
+    async fetchJoinedChats() { return [{ mid: GROUP_A, name: "群A", raw: { type: "GROUP" } }]; },
+    async fetchJoinedSquares() { return []; },
+    async fetchJoinedSquareChats() { return Array.from({ length: 8 }, (_, index) => ({ raw: { squareChatMid: `m${String(index).repeat(32)}`, name: "社群" } })); },
+  });
+  const loading = provider.fetchChannels();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(talks, 1);
+  assert.equal(squares, 5);
+  await provider.teardown();
+  const replacement = fakeBase();
+  provider.base = replacement;
+  await provider.activate(replacement);
+  talkGate.resolve();
+  squareGate.resolve();
+  const channels = await loading;
+  assert.equal(talks, 1, "no later talk page is fetched for the old account");
+  assert.equal(squares, 5, "queued square summaries never start for the old account");
+  for (const channel of channels) {
+    assert.equal(channel.unreadCount, undefined);
+    assert.equal(channel.memberCount, undefined);
+    assert.equal(channel.lastMessage, undefined);
+  }
 });
 
 test("OpenChat history stays current with live and own messages without walking LINE's events again", async () => {
@@ -296,6 +533,36 @@ test("LINE emoji in a received text keep their ranges and picture ids; odd ids, 
   assert.equal(received[1].message.text, "(emoji)");
 });
 
+test("received decoration limits count invalid entries and retain the first same-start range", async () => {
+  const { received, emit } = await activeProvider(fakeBase());
+  const text = "😀@甲 @All (甲)(乙)(丙) @乙";
+  const productId = "5ac1bfd5040ab15980c9b435";
+  const mentions = Array(101).fill(null);
+  mentions[1] = { S: "2", E: "4", M: ME };
+  mentions[2] = { S: "2", E: "3", M: mid(3) };
+  mentions[99] = { S: "5", E: "9", A: "1" };
+  mentions[100] = { S: "20", E: "22", M: mid(4) };
+  const emojis = Array(201).fill(null);
+  emojis[1] = { S: 10, E: 13, productId, sticonId: "001" };
+  emojis[2] = { S: 10, E: 11, productId, sticonId: "002" };
+  emojis[199] = { S: 13, E: 16, productId, sticonId: "003" };
+  emojis[200] = { S: 16, E: 19, productId, sticonId: "004" };
+  emit("message", talk("813", GROUP_A, mid(2), text, { contentMetadata: {
+    MENTION: JSON.stringify({ MENTIONEES: mentions }),
+    REPLACE: JSON.stringify({ sticon: { resources: emojis } }),
+  } }));
+  await settle();
+  assert.equal(received[0].message.text, text);
+  assert.deepEqual(received[0].message.mentions, [
+    { start: 2, end: 4, userId: ME },
+    { start: 5, end: 9 },
+  ]);
+  assert.deepEqual(received[0].message.emojis, [
+    { start: 10, end: 13, emojiId: `emoji-${productId}-001` },
+    { start: 13, end: 16, emojiId: `emoji-${productId}-003` },
+  ]);
+});
+
 test("a location sent with a numeric content type arrives named, with its card and without text", async () => {
   const { received, emit } = await activeProvider(fakeBase());
   emit("message", talk("901", GROUP_A, mid(2), undefined, { contentType: 15, location: { title: "公司", address: "台北市", latitude: 25.03, longitude: 121.56 } }));
@@ -337,6 +604,64 @@ test("a tag in an end-to-end encrypted chat travels inside the encrypted payload
   base.talk.sendMessage = async () => { throw Object.assign(new Error("boom"), { data: { code: "INTERNAL_ERROR" } }); };
   await assert.rejects(provider.sendText({ channelId: GROUP_A, kind: "group" }, "hi"), /boom/);
   assert.equal(sealed.length, 1, "only an E2EE refusal leads to encrypting");
+});
+
+test("obsolete encrypted sends cannot start another retry or overwrite the replacement account's sequence", async (t) => {
+  for (const phase of ["refusal", "encryption"]) {
+    await t.test(phase, async () => {
+      const gate = Promise.withResolvers();
+      const started = Promise.withResolvers();
+      const values = new Map();
+      const storage = {
+        async get(key) { return values.get(key); },
+        async set(key, value) { values.set(key, value); },
+        async flush() {},
+        async clear() { values.clear(); },
+      };
+      const provider = new EvexLineProvider(storage, "DESKTOPWIN", {
+        onMessage() {}, onRead() {}, onStatus() {}, onError() {},
+      }, async () => { throw new Error("unexpected network request"); });
+      provider.listen = () => {};
+      const base = provider.createBase();
+      base.profile = { mid: ME, displayName: "舊帳號" };
+      base.reqseqs = { talk: 40 };
+      base.auth.logoutZ = async () => {};
+      base.request.requestCore = async () => {
+        if (phase === "refusal") { started.resolve(); await gate.promise; }
+        throw Object.assign(new Error("e2ee required"), { data: { code: "E2EE_UPDATE_SENDER_KEY" } });
+      };
+      let encryptions = 0;
+      base.e2ee.encryptE2EEMessage = async () => {
+        encryptions += 1;
+        if (phase === "encryption") { started.resolve(); await gate.promise; }
+        return [Buffer.from("isolated ciphertext")];
+      };
+      await provider.activate(base);
+      const channel = { channelId: GROUP_A, kind: "group" };
+      const sending = provider.sendText(channel, "舊訊息").then(() => undefined, (error) => error);
+      try {
+        await started.promise;
+        await provider.logout();
+        const replacement = provider.createBase();
+        replacement.profile = { mid: mid(9000), displayName: "新帳號" };
+        replacement.reqseqs = { talk: 800 };
+        replacement.request.requestCore = async () => ({ data: { success: talk("1001", GROUP_A, mid(9000), "新訊息").raw } });
+        await provider.activate(replacement);
+        const message = await provider.sendText(channel, "新訊息");
+        assert.equal(message.senderId, mid(9000));
+        assert.equal(JSON.parse(values.get("reqseq")).talk, 801);
+        gate.resolve();
+        const error = await sending;
+        assert.equal(JSON.parse(values.get("reqseq")).talk, 801, "an old retry must not persist its stale sequence");
+        assert.equal(error?.message, "NOT_AUTHENTICATED");
+        assert.equal(encryptions, phase === "refusal" ? 0 : 1);
+      } finally {
+        gate.resolve();
+        await sending;
+        await provider.close();
+      }
+    });
+  }
 });
 
 test("taking back calls talk or OpenChat unsend the way linejs' own unsend() does, and the media goes with it", async () => {
@@ -570,6 +895,31 @@ test("OpenChat an invalidated in-flight walk cannot refill history or media afte
   assert.equal(provider.mediaOrigins.size, 0);
 });
 
+test("OpenChat push fetch failures invalidate history immediately without restarting the live connection or exposing log data", async () => {
+  const errors = [];
+  const statuses = [];
+  const provider = new EvexLineProvider({ async get() {}, async set() {}, async flush() {} }, "DESKTOPWIN", {
+    onError: (code) => errors.push(code),
+    onStatus: (status) => statuses.push(status),
+  });
+  const base = provider.createBase();
+  base.poll.islisten = true;
+  const log = (type) => base.emit("log", { type, get data() { throw new Error("must not inspect sensitive upstream data"); } });
+  provider.squareCache.set(SQUARE, {});
+  log("[LEGY/PUSH] noop failed");
+  assert.equal(provider.squareCache.size, 1, "a failed keepalive does not imply lost OpenChat events");
+  log("[LEGY/PUSH] fetchMyEvents failed");
+  assert.equal(provider.squareCache.size, 0, "in-flight history must be invalidated before it can complete");
+  await settle();
+  assert.deepEqual(errors, []);
+  assert.deepEqual(statuses, []);
+  assert.equal(provider.retry, undefined, "upstream retries the fetch on the next push");
+  provider.createBase();
+  provider.squareCache.set(SQUARE, {});
+  log("[LEGY/PUSH] fetchMyEvents failed");
+  assert.equal(provider.squareCache.size, 1, "a replaced client's failure cannot invalidate the current session");
+});
+
 test("OpenChat own reaction changes and take-backs remain correct on the next cached and refreshed history", async () => {
   const base = fakeBase({ square: {
     async fetchSquareChatEvents() { return { events: [squareEvent(1), squareEvent(2, SQUARE, "IMAGE")] }; },
@@ -686,6 +1036,106 @@ test("OpenChat administrators enumerate the actual chat across pages, map named/
     ],
   });
   assert.deepEqual(calls, [undefined, "next", "last"].map((continuationToken) => ({ squareChatMid: SQUARE, limit: 100, continuationToken })));
+});
+
+test("concurrent administrator consumers share the whole query only for the same chat, then refresh after settlement", async () => {
+  const firstPage = Promise.withResolvers();
+  const membership = Promise.withResolvers();
+  const membershipStarted = Promise.withResolvers();
+  const other = `m${"t".repeat(32)}`;
+  const calls = [];
+  let ownCalls = 0;
+  let refreshed = false;
+  const { provider } = await activeProvider(fakeBase({ square: {
+    async getSquareChatMembers({ squareChatMid, continuationToken }) {
+      calls.push([squareChatMid, continuationToken]);
+      if (squareChatMid === other) return { squareChatMembers: [] };
+      if (refreshed) return { squareChatMembers: [squareMember("pNewAdmin0000", "CO_ADMIN")] };
+      if (!continuationToken) {
+        await firstPage.promise;
+        return { squareChatMembers: [squareMember("pAdmin0000000", "ADMIN")], continuationToken: "next" };
+      }
+      return { squareChatMembers: [] };
+    },
+    async getSquareChat({ squareChatMid }) {
+      if (squareChatMid === SQUARE) {
+        ownCalls += 1;
+        if (!refreshed) { membershipStarted.resolve(); await membership.promise; }
+      }
+      return { squareChatMember: { squareChatMid, squareMemberMid: OWN_MEMBER } };
+    },
+  } }));
+  const channel = { channelId: SQUARE, kind: "square" };
+  const one = provider.fetchChatAdmins(channel);
+  const two = provider.fetchChatAdmins(channel);
+  assert.deepEqual(await provider.fetchChatAdmins({ channelId: other, kind: "square" }), { ownMemberId: OWN_MEMBER, admins: [] }, "another chat finishes while this chat is still enumerating");
+  firstPage.resolve();
+  await membershipStarted.promise;
+  const three = provider.fetchChatAdmins(channel);
+  assert.equal(ownCalls, 1, "membership lookup is part of the shared in-flight query");
+  membership.resolve();
+  const answers = await Promise.all([one, two, three]);
+  for (const answer of answers) assert.deepEqual(answer, { ownMemberId: OWN_MEMBER, admins: [{ userId: "pAdmin0000000", displayName: "名-pAdmin0000000", role: "admin" }] });
+  assert.deepEqual(calls, [[SQUARE, undefined], [other, undefined], [SQUARE, "next"]]);
+  refreshed = true;
+  assert.deepEqual((await provider.fetchChatAdmins(channel)).admins, [{ userId: "pNewAdmin0000", displayName: "名-pNewAdmin0000", role: "coAdmin" }], "a settled query never retains stale administrators");
+  assert.equal(calls.length, 4);
+  assert.equal(ownCalls, 2);
+});
+
+test("a failed shared administrator query rejects all consumers and allows a fresh retry", async () => {
+  const failed = Promise.withResolvers();
+  let calls = 0;
+  const { provider } = await activeProvider(fakeBase({ square: {
+    async getSquareChatMembers() {
+      calls += 1;
+      if (calls === 1) return failed.promise;
+      return { squareChatMembers: [] };
+    },
+  } }));
+  const channel = { channelId: SQUARE, kind: "square" };
+  const results = Promise.allSettled([provider.fetchChatAdmins(channel), provider.fetchChatAdmins(channel)]);
+  failed.reject(new Error("offline"));
+  for (const result of await results) {
+    assert.equal(result.status, "rejected");
+    assert.match(result.reason.message, /offline/);
+  }
+  assert.equal(calls, 1);
+  assert.deepEqual(await provider.fetchChatAdmins(channel), { ownMemberId: OWN_MEMBER, admins: [] });
+  assert.equal(calls, 2);
+});
+
+test("late administrator completion cannot erase a replacement account's shared query", async (t) => {
+  for (const teardown of [false, true]) await t.test(teardown ? "logout then activate" : "replace active client", async () => {
+    const oldPage = Promise.withResolvers();
+    const newPage = Promise.withResolvers();
+    const channel = { channelId: SQUARE, kind: "square" };
+    let newCalls = 0;
+    const { provider } = await activeProvider(fakeBase({ square: {
+      getSquareChatMembers() { return oldPage.promise; },
+    } }));
+    const oldResult = assert.rejects(provider.fetchChatAdmins(channel), /SESSION_CHANGED/);
+    if (teardown) await provider.teardown();
+    const replacement = fakeBase({ square: {
+      async getSquareChatMembers() {
+        newCalls += 1;
+        await newPage.promise;
+        return { squareChatMembers: [squareMember("pNewAdmin0000", "ADMIN")] };
+      },
+    } });
+    provider.base = replacement;
+    await provider.activate(replacement);
+    const current = provider.fetchChatAdmins(channel);
+    oldPage.resolve({ squareChatMembers: [], continuationToken: "must-not-fetch" });
+    await oldResult;
+    const joined = provider.fetchChatAdmins(channel);
+    assert.equal(newCalls, 1, "old cleanup must not delete the new account's pending query");
+    newPage.resolve();
+    for (const result of await Promise.all([current, joined])) {
+      assert.equal(result.ownMemberId, OWN_MEMBER);
+      assert.deepEqual(result.admins.map((admin) => admin.userId), ["pNewAdmin0000"]);
+    }
+  });
 });
 
 test("OpenChat administrators reject malformed later pages and never retain a partial list for retries", async (t) => {
@@ -831,5 +1281,281 @@ test("a failed or old-session own membership lookup cannot complete an administr
       pending.resolve({ squareChatMember: { squareChatMid: SQUARE, squareMemberMid: OWN_MEMBER } });
     }
     await assert.rejects(result, mode === "failure" ? /membership unavailable/ : /SESSION_CHANGED/);
+  });
+});
+
+test("member prefetch overlaps different senders in one chat and single-flights a sender across chats", async () => {
+  const gates = new Map();
+  const calls = [];
+  const base = fakeBase({ talk: { async getContactsV2({ mids }) {
+    calls.push(mids);
+    await new Promise((resolve) => gates.set(mids[0], resolve));
+    return { contacts: Object.fromEntries(mids.map((id) => [id, { contact: { mid: id, displayName: `resolved-${id}` } }])) };
+  } } });
+  const { provider, received, emit } = await activeProvider(base);
+  emit("message", talk("1", GROUP_A, mid(1), "first"));
+  emit("message", talk("2", GROUP_A, mid(2), "second"));
+  emit("message", talk("3", GROUP_B, mid(1), "other"));
+  assert.equal(calls.length, 2);
+  gates.get(mid(2))();
+  await settle();
+  assert.equal(received.length, 0, "ready second sender must not overtake the first");
+  gates.get(mid(1))();
+  await Promise.all([...provider.deliveries.values()]);
+  assert.deepEqual(received.filter(({ message }) => message.channelId === GROUP_A).map(({ message }) => message.text), ["first", "second"]);
+  assert.ok(received.every(({ message }) => message.senderName.startsWith("resolved-")));
+  await provider.close();
+});
+
+test("member timeouts keep a global bound on real LINE calls and discard queued and late results", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const releases = [];
+  let calls = 0;
+  let active = 0;
+  let peak = 0;
+  const base = fakeBase({ talk: { async getContactsV2({ mids }) {
+    calls += 1;
+    peak = Math.max(peak, ++active);
+    await new Promise((resolve) => releases.push(resolve));
+    active -= 1;
+    return { contacts: Object.fromEntries(mids.map((id) => [id, { contact: { mid: id, displayName: "late" } }])) };
+  } } });
+  const { provider, received, emit } = await activeProvider(base);
+  for (let id = 1; id <= 20; id += 1) emit("message", talk(String(id), GROUP_A, mid(id), String(id)));
+  assert.equal(calls, 5);
+  t.mock.timers.tick(5000);
+  await Promise.all([...provider.deliveries.values()]);
+  assert.equal(received.length, 20);
+  assert.equal(calls, 5, "expired queued lookups never reach LINE");
+  emit("message", talk("21", GROUP_B, mid(21), "next"));
+  assert.equal(calls, 5, "timed-out running requests retain their slots");
+  for (const release of releases.splice(0)) release();
+  await new Promise(setImmediate);
+  assert.equal(calls, 6);
+  assert.ok(!provider.profiles.has(mid(1)), "late timed-out results cannot fill profiles");
+  releases.splice(0).forEach((release) => release());
+  await Promise.all([...provider.deliveries.values()]);
+  assert.equal(peak, 5);
+  await provider.close();
+});
+
+test("member lookup and delivery results from a closed account cannot contaminate its replacement", async () => {
+  let release;
+  const old = fakeBase({ talk: { async getContactsV2({ mids }) {
+    await new Promise((resolve) => { release = resolve; });
+    return { contacts: { [mids[0]]: { contact: { mid: mids[0], displayName: "old account" } } } };
+  } } });
+  const { provider, received, emit } = await activeProvider(old);
+  emit("message", talk("1", GROUP_A, mid(1), "old"));
+  const oldDelivery = provider.deliveries.get(GROUP_A);
+  await provider.teardown();
+  const replacement = fakeBase();
+  provider.base = replacement;
+  await provider.activate(replacement);
+  provider.client.emit("message", talk("2", GROUP_A, mid(1), "new"));
+  await provider.deliveries.get(GROUP_A);
+  release();
+  await oldDelivery;
+  await new Promise(setImmediate);
+  assert.deepEqual(received.map(({ message }) => message.text), ["new"]);
+  assert.notEqual(provider.profiles.get(mid(1)).name, "old account");
+  assert.equal(provider.lookupFlights.size, 0);
+  await provider.close();
+});
+
+test("OpenChat ID index follows duplicate moves, equal-time cursors, eviction and late mutations", async () => {
+  const base = fakeBase({ square: {
+    async fetchSquareChatEvents() { return { events: [squareEvent(9), squareEvent(10), squareEvent(11)] }; },
+    async getSquareMember() { return { squareMember: { displayName: "成員" } }; },
+  } });
+  const { provider, emit } = await activeProvider(base);
+  const channel = { channelId: SQUARE, kind: "square" };
+  await provider.fetchHistory(channel, 50);
+  const replaced = squareRaw(10);
+  replaced.message.text = "原位置更新";
+  emit("square:message", { raw: replaced });
+  await provider.deliveries.get(SQUARE);
+  provider.updateSquareMessage(SQUARE, "10", { reactions: { counts: { NICE: 1 } } });
+  const unchangedOrder = (await provider.fetchHistory(channel, 50)).messages;
+  assert.deepEqual(unchangedOrder.map((message) => message.messageId), ["9", "10", "11"]);
+  assert.equal(unchangedOrder[1].text, "原位置更新");
+  assert.deepEqual(unchangedOrder[1].reactions, { counts: { NICE: 1 } });
+  const moved = squareRaw(11);
+  moved.message.createdTime = squareRaw(9).message.createdTime;
+  emit("square:message", { raw: moved });
+  emit("square:message", { raw: squareRaw(8) });
+  await provider.deliveries.get(SQUARE);
+  assert.deepEqual((await provider.fetchHistory(channel, 50)).messages.map((message) => message.messageId), ["8", "9", "11", "10"]);
+  assert.deepEqual((await provider.fetchHistory(channel, 50, `${1_700_000_000_009}:11`)).messages.map((message) => message.messageId), ["8", "9"]);
+  assert.equal((await provider.fetchHistory(channel, 50, "0:1")).messages.length, 0);
+  provider.updateSquareMessage(SQUARE, "11", { unsent: true });
+  emit("square:message", { raw: moved });
+  await provider.deliveries.get(SQUARE);
+  assert.equal(provider.squareCache.get(SQUARE).byId.get("11").unsent, true);
+  for (let id = 12; id <= 5015; id += 1) emit("square:message", { raw: squareRaw(id) });
+  await provider.deliveries.get(SQUARE);
+  const entry = provider.squareCache.get(SQUARE);
+  assert.equal(entry.byId.size, 5000);
+  assert.equal(entry.byId.has("8"), false);
+  assert.ok(entry.messages.every((message) => entry.byId.get(message.messageId) === message));
+  provider.updateSquareMessage(SQUARE, "5015", { reactions: { counts: { NICE: 2 } } });
+  provider.updateSquareMessage(SQUARE, "8", { reactions: { counts: { LOVE: 1 } } });
+  assert.deepEqual((await provider.fetchHistory(channel, 1)).messages[0].reactions, { counts: { NICE: 2 } });
+  assert.equal(entry.byId.has("8"), false);
+  await provider.close();
+});
+
+test("plain media preserves exact single-chunk slices and enforces actual streamed bytes", async () => {
+  const { provider } = await activeProvider(fakeBase());
+  const backing = Uint8Array.from([99, 1, 2, 3, 99]);
+  provider.downloadMaxBytes = 3;
+  const client = { base: {
+    authToken: "test-only", request: { systemType: "test" },
+    obs: { getMessageDataUrl: () => "https://example.invalid/media" },
+    fetch: async () => new Response(new ReadableStream({ start(controller) { controller.enqueue(backing.subarray(1, 4)); controller.close(); } })),
+  } };
+  assert.deepEqual(await provider.downloadPlainMedia(client, "1", false), Buffer.from([1, 2, 3]));
+  client.base.fetch = async () => new Response(new ReadableStream({ start(controller) {
+    controller.enqueue(Uint8Array.from([1, 2]));
+    controller.enqueue(Uint8Array.from([3, 4]));
+    controller.close();
+  } }), { headers: { "content-length": "1" } });
+  assert.equal(await provider.downloadPlainMedia(client, "1", false), undefined);
+  await provider.close();
+});
+
+test("animated sticker fallback releases the missing variant before downloading the static image", async (t) => {
+  const provider = new EvexLineProvider({}, "DESKTOPWIN", {});
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  let cancelled = false;
+  let consumed = 0;
+  t.mock.method(globalThis, "fetch", async (url) => {
+    if (url.endsWith("/sticker_animation.png")) {
+      return new Response(new ReadableStream({
+        pull(controller) { consumed++; controller.enqueue(Buffer.alloc(1024)); },
+        cancel() { cancelled = true; },
+      }, { highWaterMark: 0 }), { status: 404 });
+    }
+    assert.equal(cancelled, true, "the unused response must be released before the fallback starts");
+    return new Response(png, { headers: { "content-type": "image/png" } });
+  });
+  assert.deepEqual(await provider.fetchSticker("1", true), { mime: "image/png", bytes: png });
+  assert.equal(consumed, 0);
+});
+
+test("CDN images stop oversized bodies early but accept the exact byte limit", async (t) => {
+  const provider = new EvexLineProvider({}, "DESKTOPWIN", {});
+  const limit = 2 * 1024 * 1024;
+  const chunk = Buffer.alloc(64 * 1024);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(chunk);
+  for (const [method, args, code] of [
+    ["fetchSticker", ["1", false], "STICKER_BAD_SIZE"],
+    ["fetchAvatar", ["profile", "abcdefgh", false], "AVATAR_BAD_CONTENT"],
+    ["fetchStickerPack", ["1"], "STICKER_PACK_BAD_CONTENT"],
+    ["fetchEmoji", ["a".repeat(24), "1"], "EMOJI_BAD_CONTENT"],
+  ]) {
+    await t.test(method, async (t) => {
+      let response;
+      t.mock.method(globalThis, "fetch", async () => response);
+      for (const declared of [limit + 1, limit, undefined]) {
+        let received = 0;
+        let cancelled = false;
+        response = new Response(new ReadableStream({
+          pull(controller) {
+            if (received === limit * 2) return controller.close();
+            received += chunk.length;
+            controller.enqueue(chunk);
+          },
+          cancel() { cancelled = true; },
+        }, { highWaterMark: 0 }), { headers: {
+          "content-type": "image/png",
+          ...(declared === undefined ? {} : { "content-length": String(declared) }),
+        } });
+        await assert.rejects(provider[method](...args), { message: code });
+        assert.equal(cancelled, true, "rejected bodies must release the upstream stream");
+        if (declared > limit) assert.equal(received, 0, "declared oversize is rejected before consumption");
+        else assert.ok(received <= limit + chunk.length, "missing or understated lengths cannot bypass the streaming cap");
+      }
+
+      const bytes = Buffer.alloc(limit);
+      chunk.copy(bytes);
+      response = new Response(bytes, { headers: { "content-type": "image/png", "content-length": String(limit) } });
+      const media = await provider[method](...args);
+      assert.equal(media.mime, "image/png");
+      assert.deepEqual(media.bytes, bytes);
+      response = new Response(null, { headers: { "content-type": "image/png" } });
+      await assert.rejects(provider[method](...args), { message: code });
+    });
+  }
+});
+
+test("OpenChat member lookup eligibility precedes the 100-member cap and preserves the global request bound", async () => {
+  const member = (id) => `p${String(id).padStart(32, "0")}`;
+  const senders = ["", member(21), member(21), ...Array.from({ length: 150 }, (_, index) => member(index + 1))];
+  const events = senders.map((sender, index) => {
+    const event = squareEvent(index + 1);
+    event.payload.receiveMessage.squareMessage.message.from = sender;
+    delete event.payload.receiveMessage.senderDisplayName;
+    return event;
+  });
+  const queried = [];
+  let active = 0;
+  let peak = 0;
+  const base = fakeBase({ square: {
+    async fetchSquareChatEvents({ continuationToken }) {
+      const offset = Number(continuationToken ?? 0);
+      return { events: events.slice(offset, offset + 100), ...(offset === 0 ? { continuationToken: "100" } : {}) };
+    },
+    async getSquareMember({ squareMemberMid }) {
+      queried.push(squareMemberMid);
+      peak = Math.max(peak, ++active);
+      await new Promise(setImmediate);
+      active -= 1;
+      return { squareMember: { displayName: `resolved-${squareMemberMid}` } };
+    },
+  } });
+  const { provider } = await activeProvider(base);
+  for (let id = 1; id <= 10; id += 1) provider.profiles.set(member(id), { name: `cached-${id}`, settled: true });
+  for (let id = 11; id <= 20; id += 1) provider.lookupMisses.set(`square:${member(id)}`, Date.now() + 60_000);
+  const channel = { channelId: SQUARE, kind: "square" };
+  const page = await provider.fetchHistory(channel, 100);
+  assert.deepEqual(queried, Array.from({ length: 100 }, (_, index) => member(index + 21)));
+  assert.equal(page.messages.find((message) => message.senderId === member(120)).senderName, `resolved-${member(120)}`);
+  assert.notEqual(page.messages.find((message) => message.senderId === member(121)).senderName, `resolved-${member(121)}`);
+  const older = await provider.fetchHistory(channel, 100, page.cursor);
+  assert.equal(older.messages.find((message) => message.senderId === member(5)).senderName, "cached-5");
+  assert.equal(queried.length, 100);
+  assert.equal(peak, 5);
+  await provider.close();
+});
+
+test("media uploads exclude surrounding storage and retain their snapshot while the caller mutates the buffer", async (t) => {
+  for (const shared of [false, true]) await t.test(shared ? "shared backing store" : "ordinary backing store", async () => {
+    const backing = shared ? new SharedArrayBuffer(64) : new ArrayBuffer(64);
+    const envelope = Buffer.from(backing);
+    envelope.fill(0xa5);
+    const expected = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]);
+    const bytes = envelope.subarray(11, 11 + expected.length);
+    bytes.set(expected);
+    let release, started;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const uploading = new Promise((resolve) => { started = resolve; });
+    let received;
+    const base = fakeBase();
+    base.obs = {
+      async uploadObjTalk(_chat, _type, blob) {
+        started();
+        await gate;
+        received = Buffer.from(await blob.arrayBuffer());
+        return { objId: "9001" };
+      },
+    };
+    const { provider } = await activeProvider(base);
+    const pending = provider.sendMedia({ channelId: GROUP_A, kind: "group" }, { mime: "image/jpeg", bytes });
+    await Promise.race([uploading, pending]);
+    envelope.fill(0xee);
+    release();
+    await pending;
+    assert.deepEqual(received, expected);
   });
 });

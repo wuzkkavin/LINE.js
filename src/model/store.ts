@@ -23,9 +23,20 @@ export function withMyReaction(current: Reactions | undefined, mine: ReactionKin
   return Object.keys(counts).length > 0 ? { counts, ...(mine ? { mine } : {}) } : undefined;
 }
 
+function sameReactions(current: Reactions | undefined, next: Reactions | undefined): boolean {
+  if (current === next) return true;
+  if (!current || !next || current.mine !== next.mine) return false;
+  for (const kind of REACTION_KINDS) {
+    if (current.counts[kind] !== next.counts[kind]) return false;
+  }
+  return true;
+}
+
 /** In-memory only: messages are never persisted (plan §5). */
 export class ChatStore {
   private channels: Record<string, Channel> = {};
+  // Stable tie order for scoped snapshots without scanning unrelated channels.
+  private channelOrder = new Map<string, number>();
   private messages: Record<string, Message[]> = {};
   // Per chat, messageId → message: duplicate checks and lookups without scanning the list.
   private byId: Record<string, Map<string, Message>> = {};
@@ -36,6 +47,7 @@ export class ChatStore {
   /** Drops every cached channel and message (used on logout). */
   clear(): void {
     this.channels = {};
+    this.channelOrder.clear();
     this.messages = {};
     this.byId = {};
     this.unsentIds.clear();
@@ -57,6 +69,8 @@ export class ChatStore {
       if (!next[id] && this.messages[id]?.length) next[id] = channel;
     }
     this.channels = next;
+    this.channelOrder.clear();
+    for (const id in next) this.channelOrder.set(id, this.channelOrder.size);
   }
 
   hasChannel(channelId: string): boolean {
@@ -84,12 +98,13 @@ export class ChatStore {
     const message = this.unsentIds.has(incoming.messageId) ? unsentPlaceholder(incoming) : incoming;
     const list = this.messages[message.channelId] ?? [];
     const ids = this.byId[message.channelId] ?? new Map<string, Message>();
+    const known = ids.get(message.messageId);
     let stored = message;
-    if (ids.has(message.messageId)) {
+    if (known) {
       // A late edit must not bring back what the sender took back.
-      if (!edited || ids.get(message.messageId)!.unsent) return undefined;
+      if (!edited || known.unsent) return undefined;
       stored = { ...message, editedAt: message.editedAt ?? Date.now() };
-      list[list.findIndex((entry) => entry.messageId === message.messageId)] = stored;
+      list[list.indexOf(known)] = stored;
       ids.set(message.messageId, stored);
     } else {
       // Oldest first. Live messages land at the end; history and late arrivals are slotted in
@@ -104,11 +119,10 @@ export class ChatStore {
         }
       }
       if (at === 0 && list.length >= this.perChannelLimit) return message;
-      list.splice(at, 0, message);
+      if (at === list.length) list.push(message);
+      else list.splice(at, 0, message);
       ids.set(message.messageId, message);
-      if (list.length > this.perChannelLimit) {
-        for (const dropped of list.splice(0, list.length - this.perChannelLimit)) ids.delete(dropped.messageId);
-      }
+      if (list.length > this.perChannelLimit) ids.delete(list.shift()!.messageId);
     }
     this.messages[message.channelId] = list;
     this.byId[message.channelId] = ids;
@@ -126,6 +140,7 @@ export class ChatStore {
         lastMessageAt: stored.createdAt,
         lastMessage: stored,
       };
+      this.channelOrder.set(message.channelId, this.channelOrder.size);
     }
     return stored;
   }
@@ -151,7 +166,7 @@ export class ChatStore {
     if (known.unsent) return undefined;
     const placeholder = unsentPlaceholder(known);
     const list = this.messages[channelId]!;
-    list[list.findIndex((entry) => entry.messageId === messageId)] = placeholder;
+    list[list.indexOf(known)] = placeholder;
     ids.set(messageId, placeholder);
     const channel = this.channels[channelId];
     if (channel?.lastMessage?.messageId === messageId) this.channels[channelId] = { ...channel, lastMessage: placeholder };
@@ -164,19 +179,28 @@ export class ChatStore {
    */
   setReactions(messageId: string, channelId: string, reactions: Reactions | undefined): Message | undefined {
     const known = this.byId[channelId]?.get(messageId);
-    if (!known || known.unsent || JSON.stringify(known.reactions) === JSON.stringify(reactions)) return undefined;
+    if (!known || known.unsent || sameReactions(known.reactions, reactions)) return undefined;
     const { reactions: _old, ...rest } = known;
     const stored: Message = reactions ? { ...rest, reactions } : rest;
     const list = this.messages[channelId]!;
-    list[list.findIndex((entry) => entry.messageId === messageId)] = stored;
+    list[list.indexOf(known)] = stored;
     this.byId[channelId]!.set(messageId, stored);
     const channel = this.channels[channelId];
     if (channel?.lastMessage?.messageId === messageId) this.channels[channelId] = { ...channel, lastMessage: stored };
     return stored;
   }
 
-  snapshotChannels(): Channel[] {
-    return Object.values(this.channels).sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0) || a.name.localeCompare(b.name));
+  snapshotChannels(scope?: ReadonlySet<string>): Channel[] {
+    const channels: Channel[] = [];
+    if (scope) {
+      for (const id of scope) {
+        if (this.channelOrder.has(id)) channels.push(this.channels[id]!);
+      }
+    } else {
+      for (const id in this.channels) channels.push(this.channels[id]!);
+    }
+    return channels.sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0)
+      || a.name.localeCompare(b.name) || this.channelOrder.get(a.channelId)! - this.channelOrder.get(b.channelId)!);
   }
 
   /** One chat's cached messages, oldest first. Read-only view of the cache: copy before keeping it. */

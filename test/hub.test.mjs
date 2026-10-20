@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, stat, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile, rm, symlink } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -220,6 +220,163 @@ test("a restored session receives ready state, profile, channels and cached mess
   assert.equal(client.frames[0].protocol, 2);
 });
 
+function seedLargeReplay(env) {
+  env.provider.channels = Array.from({ length: 20 }, (_, index) => ({ channelId: `replay-${index}`, kind: "group", name: `Chat ${index}` }));
+  env.store.setChannels(env.provider.channels);
+  for (const { channelId } of env.provider.channels) {
+    for (let index = 0; index < 500; index += 1) {
+      env.store.upsert({
+        messageId: `${channelId}-${index}`, channelId, channelKind: "group",
+        senderId: "u1", senderName: "Sender", text: "x".repeat(2000), contentType: "NONE", createdAt: index,
+      }, false);
+    }
+  }
+}
+
+test("large reconnect replay is chunked and completes before concurrent live edits and take-backs", async (t) => {
+  const env = await start(t);
+  await env.login.restore();
+  seedLargeReplay(env);
+  const client = connect(env.port, { Origin: `http://127.0.0.1:${env.port}`, Cookie: env.cookie });
+  t.after(() => client.socket.close());
+  let changed = false;
+  client.socket.on("message", (data) => {
+    if (changed || JSON.parse(data.toString()).type !== "messages") return;
+    changed = true;
+    const original = env.store.get("replay-19-0", "replay-19");
+    env.hub.handleMessage({ ...original, text: "edited during replay" }, "edit");
+    env.hub.handleUnsend("replay-19", "replay-19-1");
+    env.hub.handleMessage({ ...original, messageId: "live", text: "live during replay", createdAt: 501 }, "new");
+  });
+  await client.opened;
+  await client.until((frame) => frame.type === "message" && frame.message.messageId === "live", 15_000);
+  const snapshots = client.frames.filter((frame) => frame.type === "messages");
+  assert.equal(snapshots.reduce((sum, frame) => sum + frame.messages.length, 0), 10_000);
+  assert.equal(new Set(snapshots.flatMap((frame) => frame.messages.map((message) => message.messageId))).size, 10_000);
+  assert.ok(snapshots.length > 20, "a chat's megabyte snapshot must be split into bounded batches");
+  assert.ok(snapshots.every((frame) => Buffer.byteLength(JSON.stringify(frame)) <= 256 * 1024));
+  assert.ok(snapshots.reduce((sum, frame) => sum + Buffer.byteLength(JSON.stringify(frame)), 0) > 20_000_000);
+  assert.equal(client.socket.readyState, WebSocket.OPEN);
+  const lastSnapshot = client.frames.findLastIndex((frame) => frame.type === "messages");
+  assert.ok(client.frames.findIndex((frame) => frame.type === "message:edit") > lastSnapshot);
+  assert.ok(client.frames.findIndex((frame) => frame.type === "message:unsend") > lastSnapshot);
+  // Apply the browser's merge/replace semantics, rather than merely asserting frame wiring.
+  const messages = new Map();
+  for (const frame of client.frames) {
+    if (frame.type === "messages") for (const message of frame.messages) messages.set(message.messageId, message);
+    if (frame.type === "message" || frame.type === "message:edit") messages.set(frame.message.messageId, frame.message);
+    if (frame.type === "message:unsend") messages.set(frame.messageId, { messageId: frame.messageId, unsent: true });
+  }
+  assert.equal(messages.size, 10_001);
+  assert.equal(messages.get("replay-19-0").text, "edited during replay");
+  assert.equal(messages.get("replay-19-1").unsent, true);
+  assert.equal(messages.get("replay-19-1").text, undefined);
+  assert.equal(messages.get("live").text, "live during replay");
+  assert.equal(client.frames.filter((frame) => frame.type === "message:edit").length, 1);
+  assert.equal(client.frames.filter((frame) => frame.type === "message:unsend").length, 1);
+});
+
+test("logout cancels pending replay and events before a new account becomes ready", async (t) => {
+  const env = await start(t);
+  await env.login.restore();
+  seedLargeReplay(env);
+  const client = connect(env.port, { Origin: `http://127.0.0.1:${env.port}`, Cookie: env.cookie });
+  t.after(() => client.socket.close());
+  let logout;
+  client.socket.on("message", (data) => {
+    if (logout || JSON.parse(data.toString()).type !== "messages") return;
+    const original = env.store.get("replay-19-0", "replay-19");
+    env.hub.handleMessage({ ...original, text: "must be discarded" }, "edit");
+    logout = env.login.logout();
+  });
+  await client.opened;
+  await client.until((frame) => frame.type === "auth:state" && frame.state === "idle", 10_000);
+  await logout;
+  await env.login.restore();
+  const fresh = { messageId: "fresh", channelId: "c1", channelKind: "group", senderId: "u1", senderName: "Sender", text: "new account", contentType: "NONE", createdAt: 1 };
+  env.hub.handleMessage(fresh, "new");
+  await client.until((frame) => frame.type === "message" && frame.message.messageId === "fresh");
+  const idle = client.frames.findIndex((frame) => frame.type === "auth:state" && frame.state === "idle");
+  assert.equal(client.frames.slice(idle + 1).some((frame) => frame.type === "messages" || frame.type === "message:edit"), false);
+  assert.ok(client.frames.filter((frame) => frame.type === "messages").reduce((sum, frame) => sum + frame.messages.length, 0) < 10_000);
+  assert.equal(env.store.get("replay-19-0", "replay-19"), undefined);
+});
+
+test("server close cancels a large replay instead of flushing the remaining snapshots", async (t) => {
+  const env = await start(t);
+  await env.login.restore();
+  seedLargeReplay(env);
+  const client = connect(env.port, { Origin: `http://127.0.0.1:${env.port}`, Cookie: env.cookie });
+  let stopped = false;
+  client.socket.on("message", (data) => {
+    if (stopped || JSON.parse(data.toString()).type !== "messages") return;
+    stopped = true;
+    env.hub.close();
+  });
+  const closed = new Promise((resolve) => client.socket.once("close", resolve));
+  await client.opened;
+  assert.equal(await closed, 1001);
+  assert.ok(client.frames.filter((frame) => frame.type === "messages").reduce((sum, frame) => sum + frame.messages.length, 0) < 10_000);
+});
+
+test("a paused replay consumer cannot build an unbounded live-event queue", async (t) => {
+  const env = await start(t);
+  await env.login.restore();
+  seedLargeReplay(env);
+  const client = connect(env.port, { Origin: `http://127.0.0.1:${env.port}`, Cookie: env.cookie });
+  t.after(() => client.socket.terminate());
+  let flooded = false;
+  client.socket.on("message", (data) => {
+    if (flooded || JSON.parse(data.toString()).type !== "messages") return;
+    flooded = true;
+    client.socket.pause();
+    const original = env.store.get("replay-19-499", "replay-19");
+    for (let index = 0; index < 2500; index += 1) {
+      env.hub.handleMessage({ ...original, text: `${index}:${"y".repeat(2000)}` }, "edit");
+    }
+    client.socket.resume();
+  });
+  const closed = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("slow consumer was not disconnected")), 10_000);
+    client.socket.once("close", (code) => { clearTimeout(timer); resolve(code); });
+  });
+  await client.opened;
+  assert.equal(await closed, 1006);
+  assert.ok(client.frames.filter((frame) => frame.type === "messages").reduce((sum, frame) => sum + frame.messages.length, 0) < 10_000);
+});
+
+test("a receiver that stops reading replay is disconnected when its write makes no progress", async (t) => {
+  const env = await start(t);
+  await env.login.restore();
+  seedLargeReplay(env);
+  const realTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const client = connect(env.port, { Origin: `http://127.0.0.1:${env.port}`, Cookie: env.cookie });
+  t.after(() => client.socket.terminate());
+  const paused = new Promise((resolve) => {
+    const onMessage = (data) => {
+      if (JSON.parse(data.toString()).type !== "messages") return;
+      client.socket.off("message", onMessage);
+      client.socket.pause();
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      resolve();
+    };
+    client.socket.on("message", onMessage);
+  });
+  const closed = new Promise((resolve, reject) => {
+    const timer = realTimeout(() => reject(new Error("stalled replay was not disconnected")), 10_000);
+    client.socket.once("close", (code) => { realClearTimeout(timer); resolve(code); });
+  });
+  await client.opened;
+  await paused;
+  // Real I/O must first fill the receiver's TCP window; advancing time alone does not do that.
+  await new Promise((resolve) => realTimeout(resolve, 500));
+  t.mock.timers.tick(30_001);
+  client.socket.resume();
+  assert.equal(await closed, 1006);
+  assert.ok(client.frames.filter((frame) => frame.type === "messages").reduce((sum, frame) => sum + frame.messages.length, 0) < 10_000);
+});
+
 test("live messages broadcast once; duplicates are suppressed and edits arrive as message:edit", async (t) => {
   const { port, cookie, login, hub } = await start(t);
   await login.restore();
@@ -334,6 +491,50 @@ test("built assets may be kept by the browser for good; the page and anything ou
   assert.equal((await fetch(`http://127.0.0.1:${port}/assets/..%2F..%2Fetc%2Fpasswd`)).status, 404);
 });
 
+test("static HEAD preserves page and asset headers without a response body", async (t) => {
+  const { port, root, cookie } = await start(t);
+  await mkdir(join(root, "assets"));
+  await writeFile(join(root, "assets", "index-abc123.js"), "console.log(1)");
+  for (const path of ["/", "/index.html", "/assets/index-abc123.js"]) {
+    const url = `http://127.0.0.1:${port}${path}`;
+    const get = await fetch(url);
+    assert.equal(get.status, 200);
+    await get.arrayBuffer();
+    const head = await fetch(url, { method: "HEAD" });
+    assert.equal(head.status, 200, path);
+    assert.equal(await head.text(), "", path);
+    for (const header of ["content-type", "cache-control", "set-cookie", "x-content-type-options", "referrer-policy", "content-security-policy"]) {
+      assert.equal(head.headers.get(header), get.headers.get(header), `${path}: ${header}`);
+    }
+    assert.equal(head.headers.get("content-type"), path.startsWith("/assets/") ? "text/javascript; charset=utf-8" : "text/html; charset=utf-8");
+    assert.equal(head.headers.get("cache-control"), path.startsWith("/assets/") ? "public, max-age=31536000, immutable" : "no-store");
+    assert.equal(head.headers.get("set-cookie"), path.startsWith("/assets/") ? null : `${cookie}; HttpOnly; SameSite=Strict; Path=/`);
+  }
+});
+
+test("static HEAD rejects missing files, directories, escaped symlinks and cross-site requests", async (t) => {
+  const { port, root } = await start(t);
+  await mkdir(join(root, "directory.js"));
+  const outside = await mkdtemp(join(tmpdir(), "linejs-static-outside-"));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  await writeFile(join(outside, "secret.js"), "private");
+  await symlink(join(outside, "secret.js"), join(root, "escape.js"));
+  for (const path of ["/missing.js", "/directory.js", "/escape.js"]) {
+    for (const method of ["GET", "HEAD"]) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { method });
+      assert.equal(response.status, 404, `${method} ${path}`);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("set-cookie"), null);
+      if (method === "HEAD") assert.equal(await response.text(), "");
+      else assert.deepEqual(await response.json(), { code: "NOT_FOUND" });
+    }
+  }
+  const forbidden = await fetch(`http://127.0.0.1:${port}/`, { method: "HEAD", headers: { "Sec-Fetch-Site": "cross-site" } });
+  assert.equal(forbidden.status, 403);
+  assert.equal(forbidden.headers.get("set-cookie"), null);
+  assert.equal(await forbidden.text(), "");
+});
+
 test("media route serves stickers only to the browser that holds the cookie and only for valid ids", async (t) => {
   const { port, cookie } = await start(t);
   const base = `http://127.0.0.1:${port}/media/`;
@@ -344,6 +545,9 @@ test("media route serves stickers only to the browser that holds the cookie and 
   assert.equal(await ok.text(), "png-123");
   assert.equal((await fetch(`${base}sticker-123`)).status, 404, "no cookie");
   assert.equal((await fetch(`${base}sticker-123`, { headers: { Cookie: "linejs_browser=" + "0".repeat(64) } })).status, 404, "wrong cookie");
+  for (const malformed of [cookie.slice(0, -1), cookie + "0", cookie + "zz", "linejs_browser=" + "A".repeat(64), cookie.slice(0, -1) + "g"]) {
+    assert.equal((await fetch(`${base}sticker-123`, { headers: { Cookie: malformed } })).status, 404, "malformed cookie");
+  }
   for (const bad of ["..%2F..%2Fsession.json", "sticker-12-x", "sticker-", "image-1"]) {
     assert.equal((await fetch(base + bad, { headers: { Cookie: cookie } })).status, 404, bad);
   }
@@ -498,11 +702,14 @@ test("malformed history requests are refused before LINE is contacted; failures 
   assert.equal((await env.client.until((frame) => frame.requestId === "u1")).code, "UNKNOWN_CHAT");
   assert.equal(env.provider.calls.length, 0);
 
-  env.provider.historyError = new Error("LINE said no: token=secret-token");
+  const logs = [];
+  t.mock.method(console, "error", (...args) => logs.push(args));
+  env.provider.historyError = Object.assign(new Error("LINE said no: token=secret-token"), { name: "secret-name" });
   env.request({ type: "history:fetch", requestId: "f1", chatId: CHAT });
   const failure = await env.client.until((frame) => frame.requestId === "f1");
   assert.equal(failure.code, "HISTORY_FAILED");
   assert.ok(!JSON.stringify(failure).includes("secret"));
+  assert.deepEqual(logs, [["HISTORY_FAILED"]], "neither upstream error names nor messages may reach local logs");
 });
 
 test("text and sticker sends are validated, acknowledged to the sender and shown to every client once", async (t) => {
@@ -665,6 +872,29 @@ test("live read events reach the browser only for chats the account has", async 
   env.hub.handleRead(CHAT, { readerId: "u1", messageId: "7" });
   await env.client.until((frame) => frame.type === "read");
   assert.deepEqual(env.client.frames.filter((frame) => frame.type === "read"), [{ type: "read", chatId: CHAT, positions: [{ readerId: "u1", messageId: "7" }] }]);
+});
+
+test("live read broadcasts only advance each member's numeric position, including zero and large ids", async (t) => {
+  const env = await signedIn(t);
+  const positions = [
+    { readerId: "u1", messageId: "0" },
+    { readerId: "u1", messageId: "00" },
+    { readerId: "u1", messageId: "9007199254740992" },
+    { readerId: "u1", messageId: "9007199254740993" },
+    { readerId: "u1", messageId: "09007199254740993" },
+    { readerId: "u1", messageId: "9007199254740992" },
+    { readerId: "u2", messageId: "0" },
+    { readerId: "u2", messageId: "0" },
+  ];
+  for (const position of positions) env.hub.handleRead(CHAT, position);
+  env.request({ type: "ping" });
+  await env.client.until((frame) => frame.type === "pong");
+  assert.deepEqual(env.client.frames.filter((frame) => frame.type === "read").flatMap((frame) => frame.positions), [
+    { readerId: "u1", messageId: "0" },
+    { readerId: "u1", messageId: "9007199254740992" },
+    { readerId: "u1", messageId: "9007199254740993" },
+    { readerId: "u2", messageId: "0" },
+  ]);
 });
 
 test("a message taken back is replaced for every page, its media stops being served from cache, and a reload shows only the placeholder", async (t) => {
@@ -1390,7 +1620,7 @@ test("the bot endpoint stays closed unless the config enables it", async (t) => 
 test("a token is created from the page, shown once and kept only as a hash", async (t) => {
   const env = await botEnv(t);
   assert.match(env.token, /^linejs_[A-Za-z0-9_-]{43}$/);
-  const state = env.page.frames.findLast((frame) => frame.type === "api:state");
+  const state = await env.page.until((frame) => frame.type === "api:state" && frame.createdAt !== undefined);
   assert.deepEqual(state.chats, [CHAT]);
   assert.ok(Number.isSafeInteger(state.createdAt));
   const stored = await readFile(join(env.root, "api-token.json"), "utf8");
@@ -1448,6 +1678,82 @@ test("a bot sees its sign-in state and only the chats it is allowed, with no rep
   assert.deepEqual(await bot.until((frame) => frame.type === "message:unsend"), { type: "message:unsend", chatId: CHAT, messageId: "11" });
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(bot.frames.filter((frame) => frame.type === "message:unsend").length, 1, "nothing from chats outside api.chats");
+});
+
+test("API-only channel synchronization stays scoped and current after a new chat arrives", async (t) => {
+  const SECOND = `c${"b".repeat(32)}`;
+  const env = await botEnv(t, { chats: [SECOND, CHAT] });
+  env.store.setChannels([
+    { channelId: CHAT, kind: "group", name: "B", lastMessageAt: 1 },
+    { channelId: SECOND, kind: "group", name: "A", lastMessageAt: 1 },
+    { channelId: "c1", kind: "group", name: "private", lastMessageAt: 100 },
+  ]);
+  const closed = new Promise((resolve) => env.page.socket.once("close", resolve));
+  env.page.socket.close();
+  await closed;
+  const bot = await env.open();
+  assert.deepEqual(bot.frames.find((f) => f.type === "channels").channels.map((c) => c.channelId), [SECOND, CHAT]);
+  env.hub.handleMessage({ messageId: "100", channelId: CHAT, channelKind: "group", senderId: "u1", senderName: "member", contentType: "NONE", text: "latest", createdAt: 200 }, "new");
+  env.hub.handleMessage({ messageId: "101", channelId: "new-private", channelKind: "group", senderId: "u1", senderName: "member", contentType: "NONE", text: "private", createdAt: 300 }, "new");
+  const refreshed = await bot.until((f) => f.type === "channels" && f.channels[0]?.lastMessage?.messageId === "100");
+  assert.deepEqual(refreshed.channels.map((c) => c.channelId), [CHAT, SECOND]);
+  assert.equal(refreshed.channels[0].lastMessage.text, "latest");
+});
+
+test("broadcast bursts stay ordered UTF-8 text and preserve bot scope with any recipient group empty", async (t) => {
+  for (const mode of ["page", "bot", "mixed"]) await t.test(mode, async (t) => {
+    const env = await botEnv(t);
+    const pages = mode === "bot" ? [] : [env.page];
+    const bots = [];
+    if (mode === "mixed") {
+      const page = connect(env.port, { Origin: `http://127.0.0.1:${env.port}`, Cookie: env.cookie });
+      t.after(() => page.socket.close());
+      await page.until((frame) => frame.type === "channels");
+      pages.push(page);
+    }
+    if (mode !== "page") for (let i = 0; i < (mode === "mixed" ? 4 : 1); i++) bots.push(await env.open());
+    if (mode === "bot") {
+      const closed = new Promise((resolve) => env.page.socket.once("close", resolve));
+      env.page.socket.close();
+      await closed;
+    }
+    const clients = [...pages, ...bots];
+    const wire = new Map(clients.map((client) => [client, []]));
+    for (const client of clients) client.socket.on("message", (data, binary) => {
+      wire.get(client).push({ frame: JSON.parse(data.toString()), binary });
+    });
+    const expected = [];
+    for (let i = 0; i < 32; i++) {
+      const message = {
+        messageId: String(1000 + i), channelId: i % 2 === 0 ? CHAT : "c1", channelKind: "group",
+        senderId: "u1", senderName: "測試成員", contentType: "NONE", createdAt: i + 1,
+        text: `第 ${i} 則：繁體中文、𠮷、🙂、引號\"、換行\n、NUL\u0000、孤立代理字元\ud800`,
+      };
+      env.hub.handleMessage(message, "new");
+      env.hub.handleMessage(message, "new");
+      expected.push({ type: "message", message });
+      const edited = { ...message, text: `${message.text}（修改）`, editedAt: 100 };
+      env.hub.handleMessage(edited, "edit");
+      expected.push({ type: "message:edit", message: edited });
+      env.hub.handleUnsend(message.channelId, message.messageId);
+      expected.push({ type: "message:unsend", chatId: message.channelId, messageId: message.messageId });
+    }
+    env.hub.setStatus("listening");
+    // A round trip fences all preceding broadcasts without sleeping or timing assertions.
+    await Promise.all(clients.map(async (client) => {
+      client.socket.send(JSON.stringify({ type: "ping" }));
+      await client.until((frame) => frame.type === "pong");
+    }));
+    for (const client of clients) {
+      const received = wire.get(client);
+      assert.equal(received.every(({ binary }) => !binary), true, "Buffer optimization must not change text opcodes");
+      const frames = received.map(({ frame }) => frame);
+      assert.deepEqual(frames.filter((frame) => ["message", "message:edit", "message:unsend"].includes(frame.type)),
+        bots.includes(client) ? expected.filter((frame) => (frame.chatId ?? frame.message.channelId) === CHAT) : expected);
+      assert.deepEqual(frames.find((frame) => frame.type === "status"), { type: "status", state: "listening" });
+      if (bots.includes(client)) assert.equal(frames.some((frame) => frame.type === "channel"), false);
+    }
+  });
 });
 
 test("a bot can send text and read history in an allowed chat only", async (t) => {
@@ -1656,6 +1962,28 @@ test("queried silent admins may be mentioned only by that bot in that chat, not 
   const reconnected = await env.open();
   assert.equal((await env.mention(reconnected)).code, "INVALID_REQUEST");
   assert.equal(env.provider.calls.filter(([kind]) => kind === "text").length, 1);
+});
+
+test("mixed mentions require every target and cached-speaker permission ends on eviction", async (t) => {
+  const env = await adminBotEnv(t);
+  const bot = await env.open();
+  const speaker = `p${"c".repeat(32)}`;
+  const unknown = `p${"d".repeat(32)}`;
+  env.store.upsert({ ...older("1001", 10), channelId: SQUARE, channelKind: "square", senderId: speaker }, false);
+  await env.ask(bot, "chat:admins:get");
+  const mentionMany = (ids) => env.ask(bot, "message:send", {
+    text: ids.map(() => "@人").join(" "),
+    mentions: ids.map((userId, index) => ({ userId, start: index * 3, end: index * 3 + 2 })),
+  });
+  assert.equal((await mentionMany([ADMIN, speaker, speaker])).type, "sent");
+  assert.equal((await mentionMany([ADMIN, unknown])).code, "INVALID_REQUEST");
+  assert.equal((await mentionMany([speaker, unknown])).code, "INVALID_REQUEST");
+  for (let index = 0; index < 500; index++) {
+    env.store.upsert({ ...older(String(2000 + index), 20 + index), channelId: SQUARE, channelKind: "square", senderId: unknown }, false);
+  }
+  assert.equal((await mentionMany([ADMIN, speaker])).code, "INVALID_REQUEST");
+  assert.equal((await env.mention(bot)).type, "sent", "eviction does not revoke this connection's administrator grant");
+  assert.equal(env.provider.calls.filter(([kind]) => kind === "text").length, 2);
 });
 
 test("a refresh immediately revokes old admin mentions, including empty, failed and rate-limited lookups", async (t) => {
