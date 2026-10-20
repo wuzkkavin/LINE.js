@@ -5,13 +5,16 @@
 //   1. 收到的 message 影格: 每則都帶 senderId, 看到就登記 (含機器人自己被廣播回來的訊息)。
 //   2. 自己送出後的 sent 影格: 核心回新訊息的 messageId, 當下登記為機器人本人。
 //   3. history:fetch 查回的歷史訊息: 補登記連線前就存在的訊息 (bot 的 lookupQuotedSender 呼叫)。
-// 持久化: 存成 data 目錄下的 JSON, 程序重啟後仍認得先前的回答; 條目有保存期限 (預設 7 天)
-// 與數量上限 (預設 2000 筆), 過期或超量自動清除最舊的。
+// 持久化: 存成 data 目錄下的 JSON, 程序重啟後仍認得先前的回答; 條目有保存期限 (預設 30 天)
+// 與數量上限 (預設 10000 筆), 過期或超量自動清除最舊的。
+// 上限調高理由 (2026-10-20 修復批次一, 第 6 項): 舊值 2000 筆 / 7 天在熱鬧群組裡幾天就被新訊息擠掉,
+// 機器人稍早的回答被擠出登記簿後, 同事引用它追問就認不出來、續答失效; 10000 筆 / 30 天涵蓋一般公司群組
+// 約一個月的訊息量, 檔案大小仍在可控範圍 (每筆約百餘 bytes, 全滿約 1-2 MB)。
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 export class MessageSenderRegistry {
-  constructor({ path = "", maxEntries = 2000, ttlMs = 7 * 24 * 3600 * 1000, saveIntervalMs = 5000, now = () => Date.now(), logger } = {}) {
+  constructor({ path = "", maxEntries = 10000, ttlMs = 30 * 24 * 3600 * 1000, saveIntervalMs = 5000, now = () => Date.now(), logger } = {}) {
     this.path = path;
     this.maxEntries = maxEntries;
     this.ttlMs = ttlMs;

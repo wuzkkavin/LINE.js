@@ -48,7 +48,23 @@ class FakeProvider {
   async fetchStickerPack() { return undefined; }
   async markRead() {}
   async fetchReadPositions() { return []; }
-  async fetchHistory() { this.fetchHistoryCalls++; return { messages: this.historyMessages, hasMore: false }; }
+  // 比照真實 provider 的分頁契約 (src/line/provider.ts): historyMessages 依時間舊到新排列,
+  // 每頁回最近的 limit 則 (頁內舊到新), cursor 是該頁最舊一則的 createdAt:messageId,
+  // 下一頁從 cursor 的前一則開始 (錨點本身剔除), 還有更舊的才 hasMore。
+  async fetchHistory(channel, limit = 100, before) {
+    this.fetchHistoryCalls++;
+    const all = this.historyMessages;
+    let end = all.length;
+    if (before) {
+      const anchorId = String(before).split(":").pop();
+      const idx = all.findIndex((x) => x.messageId === anchorId);
+      if (idx >= 0) end = idx;
+    }
+    const start = Math.max(0, end - limit);
+    const messages = all.slice(start, end);
+    const oldest = messages[0];
+    return { messages, hasMore: start > 0, ...(start > 0 && oldest ? { cursor: `${oldest.createdAt}:${oldest.messageId}` } : {}) };
+  }
   outgoing(channel, fields) { return { messageId: `mid-${++this.seq}`, channelId: channel.channelId, channelKind: channel.kind, senderId: "u-me", senderName: "假測試帳號", contentType: "NONE", createdAt: Date.now(), ...fields }; }
   async sendText(channel, text, options) {
     this.calls.push(["text", channel, text, options]);
@@ -207,6 +223,50 @@ test("e2e 引用續答: 引用自己的回答觸發、引用別人不觸發、hi
   inject("401", "u-g", "", botAnswer.messageId);
   await sleep(800);
   assert.equal(textsSince(base).length, 0, "引用但文字為空不應觸發");
+
+  // 7) 灌入大量他人訊息 (修復批次一第 6 項情境): 機器人回答後, 同聊天室再灌 2100 則他人訊息 —
+  // 超過舊登記簿上限 2000 筆 (舊版會把機器人的回答擠出登記簿) 也超過舊補查範圍 2 頁 (200 則)。
+  // 新版上限加大後, 引用該回答追問仍應觸發續答。
+  const FLOOD = 2100;
+  for (let i = 0; i < FLOOD; i++) {
+    inject(String(500000 + i), "u-flood", `閒聊訊息 ${i}`);
+  }
+  await waitFor(() => bot.registry.lookup(String(500000 + FLOOD - 1)) === "u-flood", 20000, "flood messages registered");
+  assert.equal(bot.registry.lookup(botAnswer.messageId), "u-me", "灌入 2100 則後, 機器人回答應仍在登記簿 (舊上限 2000 會被擠出)");
+  base = provider.texts().length;
+  inject("601", "u-h", "那 Word 呢", botAnswer.messageId);
+  await waitFor(() => textsSince(base).find((c) => c[3]?.replyTo === "601"), 8000, "quote after flood answer");
+
+  // 8) 深頁補查: 被引用的機器人訊息只存在於歷史、且被 349 則較新的訊息壓在第 4 頁 (舊版只查 2 頁找不到)。
+  // 登記簿裡沒有它 (從未以即時訊息出現、補登也發生在設定這批歷史之前), 引用時靠加深到 5 頁的補查命中。
+  const deepBotId = "200001";
+  provider.historyMessages = [
+    { messageId: deepBotId, channelId: CHAT, channelKind: "group", senderId: "u-me", senderName: "假測試帳號", text: "很久以前機器人的回答", contentType: "NONE", createdAt: 1000000 },
+    ...Array.from({ length: 349 }, (_, i) => ({ messageId: String(200002 + i), channelId: CHAT, channelKind: "group", senderId: "u-other", senderName: "別人", text: `歷史訊息 ${i}`, contentType: "NONE", createdAt: 1001000 + i * 1000 })),
+  ];
+  assert.equal(bot.registry.lookup(deepBotId), undefined, "深頁訊息不應在登記簿裡 (本情境專測歷史補查)");
+  const deepCallsBefore = provider.fetchHistoryCalls;
+  base = provider.texts().length;
+  inject("701", "u-i", "可以再說明一次嗎", deepBotId);
+  await waitFor(() => textsSince(base).find((c) => c[3]?.replyTo === "701"), 8000, "deep history quote answer");
+  assert.ok(provider.fetchHistoryCalls - deepCallsBefore >= 4, `補查應深入到至少第 4 頁, 實際打了 ${provider.fetchHistoryCalls - deepCallsBefore} 頁 (舊版 2 頁會找不到)`);
+
+  // 9) 連線後主動補登: 歷史裡有一則機器人訊息從未被引用過; bot 重連後, 不等任何人引用,
+  // 補登就應把它登記進登記簿; 之後引用它追問直接命中登記簿, 不需再向核心補查。
+  const prefetchId = "300001";
+  provider.historyMessages = [
+    { messageId: prefetchId, channelId: CHAT, channelKind: "group", senderId: "u-me", senderName: "假測試帳號", text: "重連前機器人的回答", contentType: "NONE", createdAt: 2000000 },
+  ];
+  assert.equal(bot.registry.lookup(prefetchId), undefined);
+  bot.disconnect();
+  await bot.connect();
+  await waitFor(() => bot.selfId === "u-me", 4000, "bot reconnected");
+  await waitFor(() => bot.registry.lookup(prefetchId) === "u-me", 6000, "prefetch registered after reconnect");
+  const prefetchCallsBefore = provider.fetchHistoryCalls;
+  base = provider.texts().length;
+  inject("801", "u-j", "那後來呢", prefetchId);
+  await waitFor(() => textsSince(base).find((c) => c[3]?.replyTo === "801"), 8000, "prefetched quote answer");
+  assert.equal(provider.fetchHistoryCalls, prefetchCallsBefore, "已補登的訊息被引用時不應再向核心補查");
 
   // 6) 登記簿已持久化: 檔案存在且含機器人回答 ID
   bot.disconnect();

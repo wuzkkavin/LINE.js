@@ -70,6 +70,77 @@ enum SvcClass {
     Flapping,
 }
 
+/// 執行中 stack 的建置版本戳記比對結果。戳記 = ENGINE_ID (payload 內容雜湊+長度,
+/// build.rs 產生, 同時是引擎解開目錄名 engine/<ENGINE_ID>/): 從埠上 listener 行程的
+/// 映像路徑就能讀出該 stack 是用哪個建置的引擎在跑, 不必等對方回應 (對方忙到不回應時也判得出)。
+#[derive(Debug, Clone, PartialEq)]
+enum StackVersion {
+    /// 與本殼同一個建置
+    SameBuild,
+    /// 自家產品但不同建置 (附對方的 ENGINE_ID)
+    OtherBuild(String),
+    /// 判讀不出 (映像不在引擎目錄底下 — 例如獨立雙擊執行的引擎 exe — 或非 Windows 環境):
+    /// 不干預, 回到只看回應形狀的既有分類。
+    Unknown,
+}
+
+/// 從行程映像路徑讀 ENGINE_ID: 路徑形狀須為 <資料目錄>/engine/<16 碼 hex>-<數字>/engine.exe,
+/// 形狀不符回 None (避免把任意目錄名當戳記)。
+fn engine_id_of_image(path: &std::path::Path) -> Option<String> {
+    let root = shell::data_dir().join("engine");
+    let dir = path.parent()?;
+    if dir.parent()? != root {
+        return None;
+    }
+    let id = dir.file_name()?.to_string_lossy().to_string();
+    let (hash, size) = id.split_once('-')?;
+    if hash.len() == 16
+        && hash.chars().all(|c| c.is_ascii_hexdigit())
+        && !size.is_empty()
+        && size.chars().all(|c| c.is_ascii_digit())
+    {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+fn running_stack_version() -> StackVersion {
+    if !ENGINE_EMBEDDED {
+        return StackVersion::Unknown;
+    }
+    #[cfg(windows)]
+    {
+        for port in [CORE_PORT, HELPER_PORT] {
+            for pid in crate::platform::listening_pids(port) {
+                if let Some(p) = crate::platform::process_image_path(pid) {
+                    if let Some(id) = engine_id_of_image(&p) {
+                        return if id == ENGINE_ID {
+                            StackVersion::SameBuild
+                        } else {
+                            StackVersion::OtherBuild(id)
+                        };
+                    }
+                }
+            }
+        }
+    }
+    StackVersion::Unknown
+}
+
+/// 版本不符的 log 節流: probe 會被 tick 每 4 秒呼叫, 同一個對方建置只記一次, 換了才再記。
+fn log_version_mismatch(other: &str) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if last.as_deref() != Some(other) {
+        shell::log_line(&format!(
+            "版本戳記不符: 埠上 AI寶 服務是建置 {other}, 本程式是 {ENGINE_ID}; 視為舊世代走換版流程 (不收編使用)"
+        ));
+        *last = Some(other.to_string());
+    }
+}
+
 /// 單一埠探測的原始結果: 先分「完全無回應 / 回應不完整 / 有完整 body」三層, 再依 body 形狀分類。
 enum PortProbe {
     NoResponse,
@@ -247,9 +318,25 @@ impl EngineManager {
         }
     }
 
-    /// 同時分類兩埠, 回傳 (核心, helper)。
+    /// 同時分類兩埠, 回傳 (核心, helper)。分類後一律套版本戳記 (見 apply_version_stamp)。
     fn probe_classes() -> (SvcClass, SvcClass) {
-        (Self::classify_core(), Self::classify_helper())
+        let (core, helper) = (Self::classify_core(), Self::classify_helper());
+        Self::apply_version_stamp(core, helper)
+    }
+
+    /// 把建置版本戳記套進世代分類: 在跑的 stack 若是「自家產品但不同建置」, helper 一律降為
+    /// Legacy (走清除/換版流程), 不得當 Current 收編使用 — classify 只看 /api/status 形狀
+    /// 分不出建置世代: 舊建置 helper 同樣有 service 身分標記, 曾被新殼當 Current 收編,
+    /// 結果新殼用舊 helper 服務 (新端點回 404、舊掃描行為重現, 2026-10-20 老吳實機定案之四)。
+    fn apply_version_stamp(core: SvcClass, helper: SvcClass) -> (SvcClass, SvcClass) {
+        if helper != SvcClass::Current {
+            return (core, helper);
+        }
+        if let StackVersion::OtherBuild(other) = running_stack_version() {
+            log_version_mismatch(&other);
+            return (core, SvcClass::Legacy);
+        }
+        (core, helper)
     }
 
     /// 啟動前專用的身分確認 (多輪重探): 單輪探測可能正好撞上自家引擎「正在退場/正在啟動」的窗口 —
@@ -381,9 +468,10 @@ impl EngineManager {
                     return;
                 }
                 if self.state == EngineState::Starting {
-                    // 就緒 = 雙埠都有回應且 helper 是目前世代 (少一邊都不算就緒, 半套存活不能裝作正常)
-                    let core_up = http_status(CORE_PORT, "/").is_some();
-                    let helper_cls = Self::classify_helper();
+                    // 就緒 = 雙埠都有回應且 helper 是目前世代 (少一邊都不算就緒, 半套存活不能裝作正常)。
+                    // 走 probe_classes (含版本戳記): 若埠上其實是別的建置的自家 stack, 不算就緒。
+                    let (core_cls_rt, helper_cls) = Self::probe_classes();
+                    let core_up = core_cls_rt != SvcClass::None;
                     if core_up && helper_cls == SvcClass::Current {
                         self.state = EngineState::Running;
                         self.starting_foreign_strikes = 0;

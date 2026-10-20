@@ -12,6 +12,14 @@ export const PROVIDER_DEFAULTS = {
 };
 export const SECRET_NAMES = { openai: "ai:openai", groq: "ai:groq", minimax: "ai:minimax", jev: "jev", lineToken: "line:apiToken" };
 
+// 創造者問題的固定回覆 (出廠預設, 老吳 2026-10-20 定案, 一字不差; 使用者可在控制台改)
+export const DEFAULT_CREATOR_REPLY = "是吳治綱大師創造此機器人，©Copyright By 吳治綱";
+
+// 機器人人設欄位 (皆為字串, 預設空字串 = 尚未設定; 被問到空欄位時要誠實說還沒設定, 不得編造)
+export function defaultPersona() {
+  return { birthdate: "", gender: "", zodiac: "", measurements: "", interests: "", maritalStatus: "", intro: "" };
+}
+
 export const DEFAULT_SYSTEM_PROMPT = [
   "你是華葳集成的電腦學習助理, 在公司 LINE 群組回答同事的電腦與 AI 工具操作問題。",
   "你的名字會在每次對話時另外告訴你, 被叫到名字時要自然回應。",
@@ -24,6 +32,12 @@ export function defaultSettings() {
   return {
     botName: "AI寶",
     aliases: [],
+    // 回答時是否附上參考來源行 (知識庫來源); 出廠預設關閉 (老吳定案: 一律不顯示, 要開自己開)
+    showSources: false,
+    // 創造者意圖問題的固定回覆 (不呼叫 AI); 非機密, publicView 明文回傳
+    creatorReply: DEFAULT_CREATOR_REPLY,
+    // 機器人人設 (非機密, publicView 明文回傳); 空欄位 = 尚未設定
+    persona: defaultPersona(),
     triggerMode: "standard",
     cooldownSec: 20,
     dailyLimit: 100,
@@ -93,7 +107,8 @@ export class SettingsStore {
     mkdirSync(dirname(this.path), { recursive: true });
     writeFileSync(this.path, JSON.stringify(this.data, null, 2), { mode: 0o600 });
   }
-  // 對外 (控制台 API) 的遮罩檢視: Key 只回已設定與末 4 碼
+  // 對外 (控制台 API) 的遮罩檢視: Key 只回已設定與末 4 碼。
+  // showSources / creatorReply / persona 不是機密, 隨 structuredClone 明文回傳 (App 殼與控制台都直接讀寫)。
   async publicView(secrets) {
     const view = structuredClone(this.data);
     for (const id of Object.keys(PROVIDER_DEFAULTS)) {

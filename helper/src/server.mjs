@@ -269,15 +269,23 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
       }
       if (req.method === "POST" && path === "/api/kb/reindex") {
         if (!kb) return json(res, 400, { ok: false, message: "知識庫尚未啟用" });
-        // 掃描是非阻塞分段進行: 小資料夾很快就好, 等它完成再回結果 (行為同舊版);
-        // 大資料夾超過等待上限就先回「背景整理中」, /api/status 會持續反映進度, 不把這支 API 掛住。
+        // 任何狀態都要在短時間內回 JSON (修復批次一, 第 4 項): 舊版在掃描進行中再打這支 API,
+        // 會跟著等進行中的掃描 (最長等到 15 秒逾時才回), UI 看起來像當掉、App 端直接逾時。
+        // 現在: 已在掃描中就立刻回 already-scanning (這次要求會由 kb.scan 的排隊機制在該輪後補做);
+        // 沒在掃描才啟動新掃描, 而且只短等 1 秒 — 小資料夾直接回完成結果, 大資料夾回背景整理中,
+        // 進度看 /api/status 的 scanning 欄位, 不把這支 API 掛住。
+        if (kb.status().scanning) {
+          void kb.scan({ force: true }); // 排隊補做一次 (kb.scan 進行中呼叫只登記需求, 不重複跑)
+          const st = kb.status();
+          return json(res, 200, { ok: true, scanState: "already-scanning", queued: true, status: st, scanning: true, message: "知識庫正在整理中, 這次重新整理的要求已經排入, 會接著處理; 你可以先做別的事, 狀態會自動更新。" });
+        }
         const scanP = kb.scan({ force: true });
-        const finished = await Promise.race([scanP.then(() => true), new Promise((r) => setTimeout(() => r(false), 15000))]);
+        const finished = await Promise.race([scanP.then(() => true), new Promise((r) => setTimeout(() => r(false), 1000))]);
         const st = kb.status();
         if (!finished) {
-          return json(res, 200, { ok: true, status: st, scanning: true, message: "檔案很多, 正在背景整理索引 (不會卡住其他功能); 整理完成後, 知識庫狀態會自動更新。" });
+          return json(res, 200, { ok: true, scanState: "scanning", status: st, scanning: true, message: "檔案很多, 正在背景整理索引 (不會卡住其他功能); 整理完成後, 知識庫狀態會自動更新。" });
         }
-        return json(res, 200, { ok: true, status: st, message: st.ready ? `整理完成: ${st.files} 個檔案、${st.chunks} 段` : "資料夾裡沒有可讀的 .txt/.md/.csv 檔案, 請確認資料夾路徑與檔案格式" });
+        return json(res, 200, { ok: true, scanState: "completed", status: st, message: st.ready ? `整理完成: ${st.files} 個檔案、${st.chunks} 段` : "資料夾裡沒有可讀的 .txt/.md/.csv 檔案, 請確認資料夾路徑與檔案格式" });
       }
       if (req.method === "GET" && path === "/api/logs") {
         const tail = (logger?.readToday() ?? "").split("\n").slice(-200).join("\n");
@@ -301,8 +309,9 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
       res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
       return res.end("找不到這個路徑");
     } catch (e) {
+      // 原始錯誤只進 log; 回給畫面的只有白話說明與下一步, 不外露例外字串或狀態碼 (修復批次一, 第 7 項)
       logger?.error("控制台", "API 處理失敗", { path, error: String(e?.message ?? e) });
-      return json(res, 500, { ok: false, message: `發生錯誤: ${String(e?.message ?? e)}。下一步: 重新整理頁面再試; 若一直失敗, 請匯出診斷包給維護人員。` });
+      return json(res, 500, { ok: false, message: "發生錯誤, 這次沒有完成。下一步: 重新整理頁面再試一次; 若一直失敗, 請到下方下載診斷包給維護人員。" });
     }
   });
   return server;

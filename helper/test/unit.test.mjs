@@ -6,15 +6,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Logger } from "../src/logger.mjs";
 import { FileSecretStore, MemorySecretStore, WindowsSecretStore, createSecretStore, maskSecret } from "../src/secrets.mjs";
-import { SettingsStore, SECRET_NAMES } from "../src/config.mjs";
-import { createAiClient } from "../src/ai.mjs";
+import { SettingsStore, SECRET_NAMES, DEFAULT_CREATOR_REPLY } from "../src/config.mjs";
+import { createAiClient, DEFAULT_LIST_MODELS_TIMEOUT_MS } from "../src/ai.mjs";
 import { createTriggerState, evaluateTrigger, markAnswered, markTriggered } from "../src/trigger.mjs";
 import { KnowledgeBase } from "../src/kb.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, ruleFallbackJudge, PerMinuteLimiter } from "../src/scam.mjs";
 import { createConsoleServer } from "../src/server.mjs";
 import { parseApiSection, applyApiConfig, applyCoreApiConfig, readCoreApiStatus, isValidChatId } from "../src/linecfg.mjs";
 import { MessageSenderRegistry } from "../src/msgregistry.mjs";
-import { HelperBot } from "../src/bot.mjs";
+import { HelperBot, isCreatorIntent, calculateAge, buildPersonaSection, QUOTE_HISTORY_PAGES } from "../src/bot.mjs";
 import { coreEndpoints, fetchCoreChannels, shapeChatList } from "../src/corechats.mjs";
 import { WebSocketServer } from "ws";
 import { createAiClient as aiFactory } from "../src/ai.mjs";
@@ -492,6 +492,9 @@ test("console: 設定 API 遮罩、頁面有粉圓字體與動態標題, 診斷�
   const html = await (await fetch(base + "/")).text();
   assert.ok(html.includes("Huninn"));
   assert.ok(html.includes("名字由你自訂"));
+  assert.ok(html.includes("回答時附上參考來源"), "知識庫區應有參考來源開關");
+  assert.ok(html.includes("創造者問題的固定回覆"), "機器人區應有創造者固定回覆欄位");
+  assert.ok(html.includes("機器人人設") && html.includes("出生日"), "機器人區應有人設欄位組");
   const view = await (await fetch(base + "/api/settings")).json();
   assert.ok(!JSON.stringify(view).includes("sk-CONSOLE-KEY-5555qrst"));
   assert.equal(view.ai.providers.openai.last4, "qrst");
@@ -822,4 +825,265 @@ test("kb: 索引重載直接還原詞頻可搜尋; 舊格式索引 (無詞頻) �
   await kb3.scan();
   assert.equal(kb3.statsStale, false);
   assert.ok(kb3.search("公司彩色列印在哪裡", 3).length >= 1);
+});
+
+// ===== 修復批次一 (2026-10-20) 新測試 =====
+
+test("config: showSources 預設 false、creatorReply 預設值一字不差、persona 預設全空; 保存與 publicView 明文回傳", async () => {
+  const dir = await tmp();
+  const store = new SettingsStore({ path: join(dir, "settings.json") });
+  const d = store.get();
+  assert.equal(d.showSources, false);
+  assert.equal(d.creatorReply, "是吳治綱大師創造此機器人，©Copyright By 吳治綱");
+  assert.equal(d.creatorReply, DEFAULT_CREATOR_REPLY);
+  assert.deepEqual(d.persona, { birthdate: "", gender: "", zodiac: "", measurements: "", interests: "", maritalStatus: "", intro: "" });
+  // 部分更新 persona: 只給 birthdate, 其他欄位保留空字串 (deepMerge)
+  store.update({ showSources: true, creatorReply: "自訂回覆", persona: { birthdate: "2000-10-21", interests: "畫畫" } });
+  const u = store.get();
+  assert.equal(u.showSources, true);
+  assert.equal(u.creatorReply, "自訂回覆");
+  assert.equal(u.persona.birthdate, "2000-10-21");
+  assert.equal(u.persona.interests, "畫畫");
+  assert.equal(u.persona.gender, "");
+  // 落盤保存: 新實例讀得回來
+  const store2 = new SettingsStore({ path: join(dir, "settings.json") });
+  assert.equal(store2.get().persona.birthdate, "2000-10-21");
+  assert.equal(store2.get().showSources, true);
+  // publicView: 三項都明文回傳 (非機密), 不被遮罩邏輯吞掉
+  const view = await store.publicView(new MemorySecretStore());
+  assert.equal(view.showSources, true);
+  assert.equal(view.creatorReply, "自訂回覆");
+  assert.equal(view.persona.birthdate, "2000-10-21");
+});
+
+test("creator: 創造者意圖判定 (命中三例、不命中外部主詞兩例)", () => {
+  const s = { botName: "AI寶", aliases: ["阿寶"] };
+  // 命中
+  assert.equal(isCreatorIntent("你是誰創造的？", s), true);
+  assert.equal(isCreatorIntent("AI寶 的作者是誰", s), true);
+  assert.equal(isCreatorIntent("版權屬於誰", s), true);
+  assert.equal(isCreatorIntent("這個機器人的開發者是誰？", s), true);
+  assert.equal(isCreatorIntent("你的主人是誰？", s), true);
+  assert.equal(isCreatorIntent("Who holds the Copyright?", s), true);
+  // 不命中: 主詞是外部事物, 且沒有提到機器人本身
+  assert.equal(isCreatorIntent("Excel 是誰開發的", s), false);
+  assert.equal(isCreatorIntent("這份文件作者是誰", s), false);
+  assert.equal(isCreatorIntent("誰創造了宇宙", s), false);
+  assert.equal(isCreatorIntent("這篇文章是誰寫的", s), false);
+  assert.equal(isCreatorIntent("Excel 怎麼凍結窗格？", s), false);
+  assert.equal(isCreatorIntent("", s), false);
+  // 已知取捨 (見 bot.mjs isCreatorIntent 註解): 對機器人說「你知道 Excel 是誰開發的嗎」因有「你」會命中,
+  // 這是刻意接受的取捨; 上面兩例指定的外部主詞問句 (無「你」、無名字) 不命中才是本判定要守住的線。
+});
+
+test("persona: 年紀自動計算 (未過生日 25、已過生日 26) 與人設段落組裝/空欄位規則", () => {
+  const today = new Date(2026, 9, 20); // 2026-10-20
+  assert.equal(calculateAge("2000-10-21", today), 25, "生日還沒到, 應扣 1 歲");
+  assert.equal(calculateAge("2000-10-19", today), 26, "生日已過, 足歲");
+  assert.equal(calculateAge("2000-10-20", today), 26, "今天生日就是足歲");
+  assert.equal(calculateAge("", today), null);
+  assert.equal(calculateAge("2000-02-30", today), null, "不存在的日期應回 null");
+  assert.equal(calculateAge("abc", today), null);
+  const section = buildPersonaSection({ birthdate: "2000-10-21", gender: "女", zodiac: "", measurements: "", interests: "畫畫", maritalStatus: "", intro: "" }, today);
+  assert.ok(section.includes("出生日: 2000-10-21"));
+  assert.ok(section.includes("目前 25 歲"), "段落應含自動計算的年紀");
+  assert.ok(section.includes("性別: 女"));
+  assert.ok(section.includes("興趣: 畫畫"));
+  assert.ok(!section.includes("星座:"), "空欄位不應出現在段落裡 (才不會讓 AI 把空值當內容)");
+  assert.ok(section.includes("這部分我還沒有設定"), "段落應含空欄位誠實回答規則");
+  assert.ok(section.includes("不可以自己編造"), "段落應含不得編造規則");
+  const empty = buildPersonaSection({ birthdate: "", gender: "", zodiac: "", measurements: "", interests: "", maritalStatus: "", intro: "" }, today);
+  assert.ok(empty.includes("目前沒有填寫任何個人設定"));
+  assert.ok(empty.includes("這部分我還沒有設定"), "全空時規則仍要在, 被問身世才答得誠實");
+});
+
+test("msgregistry: 預設上限加大至 10000 筆 / 30 天 (引用續答加固)", () => {
+  const reg = new MessageSenderRegistry({});
+  assert.equal(reg.maxEntries, 10000);
+  assert.equal(reg.ttlMs, 30 * 24 * 3600 * 1000);
+  assert.equal(QUOTE_HISTORY_PAGES, 5, "引用補查應加深至 5 頁");
+});
+
+test("ai: 永不回應的上游 — listModels/testConnection/chat 在注入逾時內回白話錯誤 (無 URL/無原始例外字串)", async (t) => {
+  const hang = createServer(() => { /* 永遠不回應, 模擬主代理實測的卡住情境 */ });
+  await new Promise((r) => hang.listen(0, "127.0.0.1", r));
+  t.after(() => { hang.closeAllConnections(); hang.close(); });
+  const url = `http://127.0.0.1:${hang.address().port}/v1`;
+  const ai = createAiClient({});
+  assert.equal(DEFAULT_LIST_MODELS_TIMEOUT_MS, 15000, "listModels 正式預設逾時應為 15 秒");
+  let t0 = Date.now();
+  const r = await ai.listModels({ baseUrl: url, timeoutMs: 300 }, "sk-HANG-0000aaaa");
+  assert.ok(Date.now() - t0 < 3000, "listModels 應在注入逾時附近回來, 不可無限卡住");
+  assert.equal(r.ok, false);
+  assert.match(r.message, /抓取逾時, 對方服務沒有回應/);
+  assert.ok(!/fetch failed/i.test(r.message), "訊息不得含原始例外字串");
+  assert.ok(!r.message.includes("127.0.0.1"), "訊息不得含 URL");
+  t0 = Date.now();
+  const tc = await ai.testConnection({ baseUrl: url, model: "stub-model" }, "sk-HANG-0000aaaa", { timeoutMs: 300 });
+  assert.ok(Date.now() - t0 < 3000, "testConnection 應在注入逾時附近回來");
+  assert.equal(tc.ok, false);
+  assert.match(tc.message, /連線失敗/);
+  assert.ok(!/fetch failed/i.test(tc.message), "testConnection 訊息不得含原始例外字串 (主代理實測舊版有此問題)");
+  assert.ok(!tc.message.includes("127.0.0.1"), "testConnection 訊息不得含 URL");
+  const err = await ai.chat({ baseUrl: url, apiKey: "sk-HANG-0000aaaa", model: "stub-model", messages: [{ role: "user", content: "hi" }], timeoutMs: 300 }).then(() => null, (e) => e);
+  assert.equal(err?.code, "AI_NETWORK");
+  assert.ok(!/fetch failed/i.test(err.message));
+  assert.ok(!err.message.includes("127.0.0.1"));
+  assert.ok(String(err.detail).includes("127.0.0.1"), "原始細節應保留在 detail 供 log 追查");
+});
+
+// --- bot 整合 harness: 假核心 (WebSocketServer) + AI stub, 直接驗 bot 的訊息流程 ---
+const HARNESS_CHAT = "c" + "a".repeat(32);
+async function waitUntilUnit(pred, timeout = 6000, label = "condition") {
+  const started = Date.now();
+  for (;;) {
+    const v = pred();
+    if (v) return v;
+    if (Date.now() - started > timeout) throw new Error("waitUntilUnit timeout: " + label);
+    await new Promise((r) => setTimeout(r, 30));
+  }
+}
+async function startBotHarness(t, { settingsOver = {}, kbFolder = "" } = {}) {
+  const dir = await tmp();
+  const logger = new Logger({ dir: join(dir, "logs") });
+  const settings = new SettingsStore({ path: join(dir, "settings.json"), logger });
+  const aiBodies = [];
+  const { server: aiServer, url: aiUrl } = await aiStubServer((body) => {
+    aiBodies.push(body);
+    const all = (body.messages ?? []).map((m) => m.content).join("\n");
+    const content = all.includes("以下是公司知識庫片段") ? "依知識庫內容回答: 彩色列印請到四樓影印室。" : "這是一般回答。";
+    return { body: { model: body.model, choices: [{ message: { role: "assistant", content } }] } };
+  });
+  t.after(() => aiServer.close());
+  const wss = new WebSocketServer({ port: 0 });
+  await new Promise((r) => wss.on("listening", r));
+  const sentFrames = [];
+  let botSocket = null;
+  wss.on("connection", (s) => {
+    botSocket = s;
+    s.send(JSON.stringify({ type: "auth:ready", profile: { userId: "u-me", displayName: "假帳號" } }));
+    s.on("message", (d) => {
+      let f; try { f = JSON.parse(d.toString()); } catch { return; }
+      sentFrames.push(f);
+      if (f.type === "message:send") s.send(JSON.stringify({ type: "sent", requestId: f.requestId, messageId: `botmsg-${f.requestId}` }));
+    });
+  });
+  t.after(() => wss.close());
+  settings.update({
+    botName: "AI寶", aliases: [], triggerMode: "standard", cooldownSec: 0, dailyLimit: 100,
+    lineApiUrl: `ws://127.0.0.1:${wss.address().port}/api/ws`,
+    ai: { active: "openai", providers: { openai: { baseUrl: aiUrl, model: "stub-model" } } },
+    scam: { enabled: false, threshold: 0.8, perMinute: 10 },
+    kb: { folder: kbFolder },
+    ...settingsOver,
+  });
+  const secrets = new MemorySecretStore();
+  await secrets.set(SECRET_NAMES.openai, "sk-STUBKEY-0000aaaa");
+  await secrets.set(SECRET_NAMES.lineToken, "tok-HARNESS-0000");
+  const kb = new KnowledgeBase({ folder: kbFolder, indexPath: join(dir, "kb-index.json"), logger });
+  if (kbFolder) await kb.scan({ force: true });
+  const registry = new MessageSenderRegistry({ path: join(dir, "message-senders.json"), logger });
+  const bot = new HelperBot({ settings, secrets, ai: createAiClient({}), kb, logger, registry });
+  await bot.connect();
+  t.after(() => bot.disconnect());
+  await waitUntilUnit(() => bot.selfId === "u-me", 4000, "bot auth ready");
+  const inject = (messageId, senderId, text) => botSocket.send(JSON.stringify({ type: "message", message: { messageId, channelId: HARNESS_CHAT, senderId, text } }));
+  const waitSent = (pred, label) => waitUntilUnit(() => sentFrames.filter((f) => f.type === "message:send").find(pred), 6000, label);
+  return { bot, settings, aiBodies, inject, waitSent };
+}
+
+test("bot: 創造者問題直接回固定答覆 (不呼叫 AI); Excel 誰開發的照常問 AI; 所有格問句也命中", async (t) => {
+  const h = await startBotHarness(t);
+  h.inject("m1", "u-a", "AI寶，你是誰創造的？");
+  const sent1 = await h.waitSent((f) => f.replyTo === "m1", "creator reply");
+  assert.equal(sent1.text, DEFAULT_CREATOR_REPLY);
+  assert.equal(h.aiBodies.length, 0, "創造者問題不應呼叫 AI");
+  h.inject("m2", "u-b", "AI寶，Excel 是誰開發的？");
+  const sent2 = await h.waitSent((f) => f.replyTo === "m2", "excel reply");
+  assert.equal(sent2.text, "這是一般回答。");
+  assert.equal(h.aiBodies.length, 1, "外部主詞問題應照常呼叫 AI");
+  h.inject("m3", "u-c", "AI寶的作者是誰");
+  const sent3 = await h.waitSent((f) => f.replyTo === "m3", "possessive creator reply");
+  assert.equal(sent3.text, DEFAULT_CREATOR_REPLY);
+  assert.equal(h.aiBodies.length, 1, "所有格問句命中後不應再呼叫 AI");
+  // 自訂 creatorReply 後照新值回
+  h.settings.update({ creatorReply: "我是老吳做的機器人" });
+  h.inject("m4", "u-d", "AI寶，版權屬於誰？");
+  const sent4 = await h.waitSent((f) => f.replyTo === "m4", "custom creator reply");
+  assert.equal(sent4.text, "我是老吳做的機器人");
+  assert.equal(h.aiBodies.length, 1);
+});
+
+test("bot: 人設注入 system prompt (出生日/性別/興趣入 prompt, 含空欄位誠實規則)", async (t) => {
+  const h = await startBotHarness(t, { settingsOver: { persona: { birthdate: "2000-10-21", gender: "女", zodiac: "", measurements: "", interests: "畫畫", maritalStatus: "", intro: "" } } });
+  h.inject("p1", "u-a", "AI寶，Excel 怎麼凍結窗格？");
+  await h.waitSent((f) => f.replyTo === "p1", "persona answer");
+  assert.equal(h.aiBodies.length, 1);
+  const system = h.aiBodies[0].messages.find((m) => m.role === "system")?.content ?? "";
+  assert.ok(system.includes("出生日: 2000-10-21"), "system prompt 應含出生日");
+  assert.ok(system.includes("性別: 女"));
+  assert.ok(system.includes("興趣: 畫畫"));
+  assert.ok(/目前 \d+ 歲/.test(system), "system prompt 應含自動計算的年紀");
+  assert.ok(system.includes("這部分我還沒有設定"), "system prompt 應含空欄位誠實規則");
+});
+
+test("bot: showSources 開/關兩態 (關閉時 KB 回答不含參考來源, 開啟時含)", async (t) => {
+  const root = await tmp();
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const kbDir = join(root, "kb"); await mkdir(kbDir);
+  await writeFile(join(kbDir, "列印說明.txt"), "公司彩色列印在總公司四樓影印室。彩色影印機分機 412, 列印前請先在影印室登記。A3 列印也在四樓。");
+  const h = await startBotHarness(t, { kbFolder: kbDir, settingsOver: { showSources: false } });
+  h.inject("s1", "u-a", "AI寶，公司彩色列印在哪裡？");
+  const off = await h.waitSent((f) => f.replyTo === "s1", "sources off answer");
+  assert.ok(off.text.includes("依知識庫內容回答"), "應有知識庫回答本體");
+  assert.ok(!off.text.includes("參考來源"), "關閉時不得含參考來源行");
+  h.settings.update({ showSources: true });
+  h.inject("s2", "u-b", "AI寶，公司彩色列印在哪裡？");
+  const on = await h.waitSent((f) => f.replyTo === "s2", "sources on answer");
+  assert.ok(on.text.includes("參考來源"), "開啟時應附參考來源");
+  assert.ok(on.text.includes("列印說明.txt"), "開啟時應附來源檔名");
+});
+
+test("console: reindex 掃描進行中立即回 JSON (already-scanning, 3 秒內); 小資料夾回 completed", async (t) => {
+  const dir = await tmp();
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const kbDir = join(dir, "bigkb"); await mkdir(kbDir);
+  const para = "出差申請流程: 先填出差單, 經主管核准後訂票, 回來檢據核銷。\n\n";
+  for (let i = 0; i < 300; i++) await writeFile(join(kbDir, `doc${i}.txt`), para.repeat(140));
+  const settings = new SettingsStore({ path: join(dir, "settings.json") });
+  const secrets = new MemorySecretStore();
+  const logger = new Logger({ dir: join(dir, "logs") });
+  const ai = createAiClient({});
+  const kb = new KnowledgeBase({ folder: kbDir, indexPath: join(dir, "kb.json"), logger });
+  const bot = new HelperBot({ settings, secrets, ai, kb, logger });
+  const server = createConsoleServer({ settings, secrets, ai, kb, bot, logger, lineEnv: { dataDir: dir, repoRoot: join(dir, "nope"), packaged: true } });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  // 先啟動一輪掃描 (不等待), 掃描進行中打 reindex: 必須在 3 秒內回 JSON, 不可跟著掃描一起卡住
+  const scanP = kb.scan({ force: true });
+  assert.equal(kb.status().scanning, true);
+  const t0 = Date.now();
+  const r = await fetch(base + "/api/kb/reindex", { method: "POST", signal: AbortSignal.timeout(3000) }).then((x) => x.json());
+  const ms = Date.now() - t0;
+  assert.equal(r.ok, true);
+  assert.equal(r.scanState, "already-scanning");
+  assert.equal(r.scanning, true);
+  assert.ok(ms < 3000, `掃描中 reindex 應立即回應, 實際 ${ms}ms`);
+  await scanP;
+  // 小資料夾: reindex 直接回 completed
+  const dir2 = await tmp();
+  const kbDir2 = join(dir2, "kb"); await mkdir(kbDir2);
+  await writeFile(join(kbDir2, "a.txt"), "公司公告: 本週五下午大掃除。");
+  const settings2 = new SettingsStore({ path: join(dir2, "settings.json") });
+  const logger2 = new Logger({ dir: join(dir2, "logs") });
+  const kb2 = new KnowledgeBase({ folder: kbDir2, indexPath: join(dir2, "kb.json"), logger: logger2 });
+  const bot2 = new HelperBot({ settings: settings2, secrets, ai, kb: kb2, logger: logger2 });
+  const server2 = createConsoleServer({ settings: settings2, secrets, ai, kb: kb2, bot: bot2, logger: logger2, lineEnv: { dataDir: dir2, repoRoot: join(dir2, "nope"), packaged: true } });
+  await new Promise((r2) => server2.listen(0, "127.0.0.1", r2));
+  t.after(() => server2.close());
+  const done = await fetch(`http://127.0.0.1:${server2.address().port}/api/kb/reindex`, { method: "POST" }).then((x) => x.json());
+  assert.equal(done.ok, true);
+  assert.equal(done.scanState, "completed");
+  assert.equal(done.status.files, 1);
 });

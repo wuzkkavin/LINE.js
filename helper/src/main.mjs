@@ -24,7 +24,7 @@ for (const [envName, secretName] of [["HELPER_AI_OPENAI_KEY", SECRET_NAMES.opena
   if (process.env[envName]) { await secrets.set(secretName, process.env[envName]); logger.info("啟動", "已從環境變數載入一筆機密 (不顯示內容)", { name: secretName }); }
 }
 
-const ai = createAiClient({});
+const ai = createAiClient({ logger }); // logger 讓 AI 上游的原始錯誤細節只進 log, 不回給使用者
 const kb = new KnowledgeBase({ folder: settings.get().kb.folder, indexPath: join(dataDir, "kb-index.json"), logger });
 if (settings.get().kb.folder) void kb.scan(); // 背景分段掃描, 不擋控制台啟動與 bot 連線
 

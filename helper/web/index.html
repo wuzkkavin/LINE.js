@@ -164,6 +164,44 @@ a.btn { text-decoration: none; }
     </div>
     <label for="lineApiUrl">LINE 核心連線位置 (進階, 通常不用改)</label>
     <input type="text" id="lineApiUrl">
+    <h3>創造者問題的固定回覆</h3>
+    <div class="hint">同事問「你是誰創造的」「作者是誰」「版權是誰的」這類問題時, 我會直接回下面這句, 不會去問 AI。每個人問的次數一樣會計入每日上限與冷卻。</div>
+    <label for="creatorReply">創造者問題的固定回覆</label>
+    <input type="text" id="creatorReply">
+    <h3>機器人人設</h3>
+    <div class="hint">填了才算數: 同事問我的年紀、生日、星座、性別、三圍、興趣、婚姻狀態或自我介紹時, 我只會照這裡填的回答; 沒填的欄位我會老實說「這部分我還沒有設定」, 不會自己編。年紀不用填, 我會用出生日自己算。</div>
+    <div class="row">
+      <div>
+        <label for="personaBirthdate">出生日 (西元年-月-日, 範例:2000-10-21)</label>
+        <input type="text" id="personaBirthdate" placeholder="YYYY-MM-DD" autocomplete="off">
+      </div>
+      <div>
+        <label for="personaGender">性別</label>
+        <input type="text" id="personaGender" autocomplete="off">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="personaZodiac">星座</label>
+        <input type="text" id="personaZodiac" autocomplete="off">
+      </div>
+      <div>
+        <label for="personaMeasurements">三圍</label>
+        <input type="text" id="personaMeasurements" autocomplete="off">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="personaInterests">興趣</label>
+        <input type="text" id="personaInterests" autocomplete="off">
+      </div>
+      <div>
+        <label for="personaMaritalStatus">婚姻狀態</label>
+        <input type="text" id="personaMaritalStatus" autocomplete="off">
+      </div>
+    </div>
+    <label for="personaIntro">自我介紹</label>
+    <input type="text" id="personaIntro" autocomplete="off">
   </section>
 
   <section class="card">
@@ -208,6 +246,7 @@ a.btn { text-decoration: none; }
     <h2>知識庫</h2>
     <label for="kbFolder">知識庫資料夾 (只讀取, 不會修改裡面的檔案; 內容請先脫敏)</label>
     <input type="text" id="kbFolder" placeholder="範例:D:/公司知識庫">
+    <label class="checkline"><input type="checkbox" id="showSources"> 回答時附上參考來源 (在回答最後註明知識庫來源檔名; 預設關閉)</label>
     <div class="hint" id="kbStatus">尚未讀取狀態</div>
     <div style="margin-top:12px"><button type="button" class="ghost" id="btnKb">立即重新整理知識庫</button><span class="test-result" id="kbMsg"></span></div>
     <div class="hint">第一版支援 .txt、.md、.csv。同事問公司資訊時會先查知識庫, 回答時會註明來源檔名; 查不到會明說, 不會亂編。</div>
@@ -290,6 +329,16 @@ async function loadAll() {
   $("cooldownSec").value = s.cooldownSec;
   $("dailyLimit").value = s.dailyLimit;
   $("lineApiUrl").value = s.lineApiUrl;
+  $("creatorReply").value = s.creatorReply || "";
+  const persona = s.persona || {};
+  $("personaBirthdate").value = persona.birthdate || "";
+  $("personaGender").value = persona.gender || "";
+  $("personaZodiac").value = persona.zodiac || "";
+  $("personaMeasurements").value = persona.measurements || "";
+  $("personaInterests").value = persona.interests || "";
+  $("personaMaritalStatus").value = persona.maritalStatus || "";
+  $("personaIntro").value = persona.intro || "";
+  $("showSources").checked = !!s.showSources;
   const holder = $("providers"); holder.innerHTML = "";
   for (const id of PROVIDERS) {
     const p = s.ai.providers[id];
@@ -410,7 +459,7 @@ async function loadWhitelist() {
   } catch { box.innerHTML = ""; }
 }
 async function loadLog() {
-  try { const r = await (await fetch("/api/logs")).json(); $("logTail").textContent = r.tail || "(今天還沒有 log)"; } catch {}
+  try { const r = await (await fetch("/api/logs")).json(); $("logTail").textContent = r.tail || "(今天還沒有 log)"; } catch { $("logTail").textContent = "Log 讀取失敗: 連不上控制台服務, 請重新整理頁面"; }
 }
 async function testAi(id) {
   const btn = $("test-" + id); btn.disabled = true; $("testres-" + id).textContent = "測試中…";
@@ -422,8 +471,11 @@ async function testAi(id) {
   btn.disabled = false;
 }
 async function clearKey(id) {
-  await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ai: { providers: { [id]: { apiKey: "__clear__" } } } }) });
-  $("saveMsg").textContent = "已清除這家的 Key"; loadAll();
+  try {
+    await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ai: { providers: { [id]: { apiKey: "__clear__" } } } }) });
+    $("saveMsg").textContent = "已清除這家的 Key";
+  } catch { $("saveMsg").textContent = "清除失敗: 連不上控制台服務, 請重新整理頁面再試"; }
+  loadAll();
 }
 function collect() {
   const providers = {};
@@ -439,6 +491,17 @@ function collect() {
     cooldownSec: Number($("cooldownSec").value) || 20,
     dailyLimit: Number($("dailyLimit").value) || 100,
     lineApiUrl: $("lineApiUrl").value.trim(),
+    creatorReply: $("creatorReply").value.trim(),
+    showSources: $("showSources").checked,
+    persona: {
+      birthdate: $("personaBirthdate").value.trim(),
+      gender: $("personaGender").value.trim(),
+      zodiac: $("personaZodiac").value.trim(),
+      measurements: $("personaMeasurements").value.trim(),
+      interests: $("personaInterests").value.trim(),
+      maritalStatus: $("personaMaritalStatus").value.trim(),
+      intro: $("personaIntro").value.trim(),
+    },
     ai: { active: document.querySelector("input[name=aiActive]:checked")?.value || "openai", fallback: $("aiFallback").checked, providers, systemPrompt: $("systemPrompt").value },
     scam: { enabled: $("scamEnabled").checked, threshold: Number($("scamThreshold").value) || 0.8, perMinute: Number($("scamPerMinute").value) || 10, jev: { enabled: $("jevEnabled").checked, model: $("jevModel").value.trim(), ...($("jevKey").value.trim() ? { apiKey: $("jevKey").value.trim() } : {}) } },
     kb: { folder: $("kbFolder").value.trim() },
@@ -456,9 +519,12 @@ $("btnSave").onclick = async () => {
 };
 $("btnKb").onclick = async () => {
   $("kbMsg").textContent = "整理中… (會先儲存目前設定)";
-  await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(collect()) });
-  const r = await (await fetch("/api/kb/reindex", { method: "POST" })).json();
-  $("kbMsg").textContent = r.message || "";
+  try {
+    await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(collect()) });
+    const r = await (await fetch("/api/kb/reindex", { method: "POST" })).json();
+    $("kbMsg").textContent = r.message || "";
+    $("kbMsg").style.color = r.ok ? "var(--dark)" : "var(--err)";
+  } catch { $("kbMsg").textContent = "整理失敗: 連不上控制台服務, 請重新整理頁面再試"; $("kbMsg").style.color = "var(--err)"; }
   loadAll();
 };
 async function applyWhitelist(chatId, msg) {
@@ -534,7 +600,7 @@ $("btnGenToken").onclick = async () => {
   btn.disabled = false;
 };
 $("btnRefreshTop").onclick = () => loadAll();
-$("btnLogDir").onclick = async () => { const r = await (await fetch("/api/log-dir")).json(); $("logDirText").textContent = r.dir; };
+$("btnLogDir").onclick = async () => { try { const r = await (await fetch("/api/log-dir")).json(); $("logDirText").textContent = r.dir; } catch { $("logDirText").textContent = "讀取失敗: 連不上控制台服務, 請重新整理頁面"; } };
 $("btnLogRefresh").onclick = loadLog;
 loadAll().catch(() => { $("saveMsg").textContent = "讀不到設定, 請確認程式有在執行, 再重新整理頁面"; });
 </script>

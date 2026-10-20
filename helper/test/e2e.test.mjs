@@ -151,6 +151,7 @@ test("e2e 假資料全流程: 觸發 (含句尾)、知識庫、防詐騙、改�
   const settings = new SettingsStore({ path: join(dataDir, "settings.json"), logger });
   settings.update({
     botName: "AI寶", aliases: [], triggerMode: "standard", cooldownSec: 0, dailyLimit: 100,
+    showSources: true, // 來源開關測試: 本流程先開 (案例 C 驗附來源), 案例 C2 再關掉驗不附來源
     lineApiUrl: `ws://127.0.0.1:${corePort}/api/ws`,
     ai: { active: "openai", providers: { openai: { baseUrl: stub.baseUrl, model: "stub-model" } } },
     scam: { enabled: true, threshold: 0.8, perMinute: 10 },
@@ -187,11 +188,20 @@ test("e2e 假資料全流程: 觸發 (含句尾)、知識庫、防詐騙、改�
   got = await waitFor(() => textsSince(base).find((c) => c[2].includes("凍結窗格步驟")), 6000, "end-position trigger answer");
   assert.equal(got[3]?.replyTo, "103");
 
-  // C) 知識庫問題: 回答含來源檔名
+  // C) 知識庫問題 (showSources 開): 回答含來源檔名
   base = provider.texts().length;
   inject("104", "u-c", "AI寶，公司彩色列印在哪裡？");
   got = await waitFor(() => textsSince(base).find((c) => c[2].includes("參考來源")), 6000, "kb answer");
   assert.ok(got[2].includes("公司列印說明.txt"), "回答應註明來源檔名");
+
+  // C2) 來源開關關閉 (showSources 關, 也是出廠預設): 同樣命中知識庫, 回答不得含任何來源行
+  settings.update({ showSources: false });
+  base = provider.texts().length;
+  inject("1042", "u-c2", "AI寶，公司彩色列印在哪裡？");
+  got = await waitFor(() => textsSince(base).find((c) => c[2].includes("依知識庫內容回答")), 6000, "kb answer without sources");
+  assert.ok(!got[2].includes("參考來源"), "showSources 關閉時回答不得含參考來源");
+  assert.ok(!got[2].includes("公司列印說明.txt"), "showSources 關閉時回答不得含來源檔名");
+  settings.update({ showSources: true });
 
   // D) 公司類問題但知識庫查不到: 明說查不到
   base = provider.texts().length;

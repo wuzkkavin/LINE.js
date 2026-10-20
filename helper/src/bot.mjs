@@ -4,7 +4,7 @@ import WebSocket from "ws";
 import { evaluateTrigger, markAnswered, markTriggered, createTriggerState } from "./trigger.mjs";
 import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, scamVerdictText, scamWarningText, PerMinuteLimiter } from "./scam.mjs";
-import { SECRET_NAMES } from "./config.mjs";
+import { SECRET_NAMES, DEFAULT_CREATOR_REPLY } from "./config.mjs";
 
 const COMPANY_HINTS = ["公司", "華葳", "內部", "規定", "請假", "加班", "影印", "列印", "印表機", "分機", "會議室", "系統", "帳號申請", "福利", "薪資", "考勤", "打卡", "公文", "簽呈", "部門", "同仁", "總公司", "工務所"];
 
@@ -18,6 +18,70 @@ export function limitText(botName) {
 export function kbMissText() {
   return "這個問題我在公司的知識庫裡查不到，所以不敢亂答。建議你問一下資訊部同事，或請管理員把相關文件放進知識庫資料夾，我下次就能回答了。";
 }
+
+// --- 創造者意圖判定 (修復批次一, 第 2 項) ---
+// 命中就直接回 settings.creatorReply, 不呼叫 AI。判定分兩層, 目的是降低誤觸:
+// 1. 「版權 / copyright」是強訊號: 在跟機器人的對話裡問版權, 幾乎就是問機器人本身, 直接命中。
+// 2. 其他創造者關鍵詞 (誰開發、作者是誰…) 太常見, 必須同時提到機器人本身才命中:
+//    機器人名字/別名、你、這個機器人、此機器人、機器人。主詞是外部事物時不命中,
+//    例如「Excel 是誰開發的」「這份文件作者是誰」都不命中 (名字觸發時名字會先被去掉再進來判定)。
+// 已知取捨: 若使用者對機器人說「你知道 Excel 是誰開發的嗎」, 因為有「你」會被當成問機器人本身而命中,
+// 這是刻意接受的取捨 (在群組裡對機器人說話, 「你」多半就是指機器人); 沒有「你」與名字的外部主詞問句則不會誤觸。
+const CREATOR_KEYWORDS = ["誰創造的", "誰創造", "創造者", "誰做的", "誰開發", "開發者", "作者是誰", "誰寫的", "你的主人", "誰發明"];
+const COPYRIGHT_KEYWORDS = ["版權", "copyright"];
+const BOT_REF_WORDS = ["你", "這個機器人", "此機器人", "這台機器人", "機器人"];
+export function isCreatorIntent(text, settings = {}) {
+  if (typeof text !== "string" || !text.trim()) return false;
+  const lower = text.toLowerCase();
+  if (COPYRIGHT_KEYWORDS.some((k) => lower.includes(k))) return true;
+  if (!CREATOR_KEYWORDS.some((k) => lower.includes(k))) return false;
+  const names = [settings.botName, ...(settings.aliases ?? [])].filter((s) => typeof s === "string" && s.trim()).map((s) => s.trim());
+  if (names.some((n) => text.includes(n))) return true;
+  return BOT_REF_WORDS.some((w) => text.includes(w));
+}
+
+// --- 機器人人設 (修復批次一, 第 3 項) ---
+// 年紀由出生日自動計算; today 可注入供測試 (預設今天)。
+export function calculateAge(birthdate, today = new Date()) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(birthdate ?? "").trim());
+  if (!m) return null;
+  const by = Number(m[1]), bm = Number(m[2]), bd = Number(m[3]);
+  const probe = new Date(by, bm - 1, bd);
+  if (probe.getFullYear() !== by || probe.getMonth() !== bm - 1 || probe.getDate() !== bd) return null; // 不是真實日期 (如 2 月 30 日)
+  let age = today.getFullYear() - by;
+  const tm = today.getMonth() + 1, td = today.getDate();
+  if (tm < bm || (tm === bm && td < bd)) age--; // 今年生日還沒到
+  return age >= 0 ? age : null;
+}
+
+// 組出注入 system prompt 的人設段落: 非空欄位逐項寫入, 並附誠實回答規則 (空欄位說還沒設定, 不得編造)。
+export function buildPersonaSection(persona, today = new Date()) {
+  const p = persona ?? {};
+  const val = (k) => (typeof p[k] === "string" ? p[k].trim() : "");
+  const items = [];
+  if (val("birthdate")) {
+    const age = calculateAge(val("birthdate"), today);
+    items.push(`出生日: ${val("birthdate")}${age !== null ? ` (目前 ${age} 歲)` : ""}`);
+  }
+  if (val("gender")) items.push(`性別: ${val("gender")}`);
+  if (val("zodiac")) items.push(`星座: ${val("zodiac")}`);
+  if (val("measurements")) items.push(`三圍: ${val("measurements")}`);
+  if (val("interests")) items.push(`興趣: ${val("interests")}`);
+  if (val("maritalStatus")) items.push(`婚姻狀態: ${val("maritalStatus")}`);
+  if (val("intro")) items.push(`自我介紹: ${val("intro")}`);
+  const lines = ["你的個人設定:"];
+  if (items.length) lines.push(...items.map((i) => `- ${i}`));
+  else lines.push("(目前沒有填寫任何個人設定)");
+  lines.push("回答規則: 被問到年紀、生日、星座、性別、三圍、興趣、婚姻狀態、身世或自我介紹時, 只能照上面的個人設定回答; 上面沒有寫到的欄位, 就誠實說「這部分我還沒有設定」, 不可以自己編造數字或內容。");
+  return lines.join("\n");
+}
+
+// 引用補查深度 (修復批次一, 第 6 項): 每頁 100 則 (核心 history:fetch 上限), 舊版只查 2 頁 (200 則),
+// 熱鬧群組裡機器人稍早的回答很快被新訊息推過 200 則之外, 引用續答就失效。改為 5 頁 (500 則),
+// 命中或沒有下一頁 (hasMore=false) 就早停, 不會每次都查滿; 核心對 history 有每秒 10 次限流, 5 頁仍在預算內。
+export const QUOTE_HISTORY_PAGES = 5;
+// 連線成功後主動補登的頁數: 3 頁 (300 則) 涵蓋離線期間與重啟前的近期訊息, 成本可控。
+export const HISTORY_PREFETCH_PAGES = 3;
 
 export class HelperBot {
   constructor({ settings, secrets, ai, kb, logger, registry, reconnectDelaysMs } = {}) {
@@ -48,6 +112,12 @@ export class HelperBot {
     this.connectInFlight = null;
     this.pending = new Map();
     this.reqSeq = 0;
+    // 引用續答加固 (第 6 項): 核心送來的白名單聊天室清單與「連線後主動補登歷史」的進度。
+    // 補登目的: 離線/重啟期間機器人自己發過的訊息不在登記簿裡, 重連後先主動把近期歷史補登,
+    // 同事引用那些回答追問時第一時間就認得出來, 不必等引用當下才向核心補查。
+    this.botChats = []; // 白名單聊天室 ID (由核心 channels 影格提供)
+    this.historyPrefetchedChats = new Set(); // 本次連線已補登過的聊天室 (重連時清空重補)
+    this.historyPrefetchInFlight = new Set();
     this.stats = { date: "", answered: 0, triggered: 0, scamChecked: 0, scamWarned: 0 };
   }
   cfg() { return this.settings.get(); }
@@ -96,7 +166,8 @@ export class HelperBot {
         return { ...r, provider: pid };
       } catch (e) {
         lastErr = e;
-        this.logger?.warn("AI", "AI 呼叫失敗", { provider: pid, error: String(e?.message ?? e) });
+        // 原始細節 (detail: URL/狀態碼/上游原文) 只進 log, 不進任何回給使用者的訊息
+        this.logger?.warn("AI", "AI 呼叫失敗", { provider: pid, error: String(e?.message ?? e), detail: e?.detail ? String(e.detail) : undefined });
         if (!s.ai.fallback) break;
       }
     }
@@ -138,6 +209,7 @@ export class HelperBot {
           this.connected = true;
           this.lineState = "已連線";
           this.reconnectAttempt = 0;
+          this.historyPrefetchedChats.clear(); // 新連線: 離線期間的訊息要重新補登
           this.logger?.info("機器人", "已連上 LINE 核心 /api/ws", { url });
           done(true);
         });
@@ -244,9 +316,41 @@ export class HelperBot {
     });
   }
 
+  // 連線成功後主動補登: 對每個白名單聊天室向核心要近期數頁歷史, 把訊息寄件者整頁登記進登記簿。
+  // 為什麼 (第 6 項 a): 機器人在離線/重啟前自己發過的回答, 若沒被即時訊息或 sent 影格登記到,
+  // 同事引用它追問時只能靠引用當下的補查 (還可能被新訊息推到補查範圍外)。連線後先補登近期歷史,
+  // 常見情況 (引用最近的回答) 直接命中登記簿, 不必等補查、也不受補查深度限制。
+  async prefetchHistory(chatIds, pages = HISTORY_PREFETCH_PAGES) {
+    if (!this.connected) return;
+    for (const chatId of chatIds ?? []) {
+      if (!chatId || this.historyPrefetchedChats.has(chatId) || this.historyPrefetchInFlight.has(chatId)) continue;
+      this.historyPrefetchInFlight.add(chatId);
+      try {
+        let cursor;
+        for (let page = 0; page < pages; page++) {
+          const frame = await this.fetchHistoryPage(chatId, cursor);
+          const messages = Array.isArray(frame.messages) ? frame.messages : [];
+          for (const hm of messages) {
+            if (hm.messageId && hm.senderId) this.registry.register(hm.messageId, hm.senderId, hm.channelId ?? chatId);
+          }
+          if (!frame.hasMore || !frame.cursor) break;
+          cursor = frame.cursor;
+        }
+        this.historyPrefetchedChats.add(chatId);
+        this.logger?.info("訊息登記簿", "連線後歷史補登完成", { chat: chatId, pages });
+      } catch (e) {
+        // 補登失敗不影響正常服務: 引用當下仍有 isQuotedSelf 的歷史補查兜底
+        this.logger?.warn("訊息登記簿", "連線後歷史補登失敗, 改靠引用當下補查", { chat: chatId, error: String(e?.message ?? e) });
+      } finally {
+        this.historyPrefetchInFlight.delete(chatId);
+      }
+    }
+  }
+
   // 被引用的訊息是不是機器人自己發的:
-  // 先查登記簿 (收到的影格與自己的 sent 影格都有登記); 查不到才向核心要歷史補查 (最多 2 頁),
-  // 歷史裡每則訊息都帶 senderId, 順便整頁補登記。查無此訊息時在登記簿留空字串記號, 避免每次引用都重查。
+  // 先查登記簿 (收到的影格、自己的 sent 影格、連線後主動補登的歷史都有登記); 查不到才向核心要歷史補查
+  // (最多 QUOTE_HISTORY_PAGES 頁, 理由見該常數註解), 歷史裡每則訊息都帶 senderId, 順便整頁補登記。
+  // 查無此訊息時在登記簿留空字串記號, 避免每次引用都重查。
   async isQuotedSelf(m) {
     if (!m.replyTo || !this.selfId) return false;
     const known = this.registry.lookup(m.replyTo);
@@ -254,7 +358,7 @@ export class HelperBot {
     if (!this.connected) return false;
     try {
       let cursor;
-      for (let page = 0; page < 2; page++) {
+      for (let page = 0; page < QUOTE_HISTORY_PAGES; page++) {
         const frame = await this.fetchHistoryPage(m.channelId, cursor);
         const messages = Array.isArray(frame.messages) ? frame.messages : [];
         for (const hm of messages) {
@@ -283,6 +387,16 @@ export class HelperBot {
       return;
     }
     if (frame.type === "auth:state") { if (frame.state) this.lineState = frame.state; return; }
+    // 核心送來的聊天室清單 (機器人連線只會拿到 api.chats 白名單內的): 記下來, 並在連線完成後
+    // 主動對每個聊天室補登近期歷史 (prefetchHistory), 讓引用續答認得離線/重啟前的回答。
+    if (frame.type === "channels") {
+      const ids = (Array.isArray(frame.channels) ? frame.channels : []).map((c) => c?.channelId).filter((x) => typeof x === "string" && x);
+      if (ids.length) {
+        this.botChats = ids;
+        void this.prefetchHistory(ids);
+      }
+      return;
+    }
     // 自己送出的訊息: 核心在 sent 影格回新訊息的 messageId, 立刻登記為機器人本人,
     // 之後有人引用這則回答, 登記簿就認得出來 (引用續答觸發的認定主路徑)。
     if (frame.type === "sent" && frame.messageId && this.selfId) {
@@ -358,6 +472,20 @@ export class HelperBot {
       return;
     }
     const question = verdict.question;
+    // 創造者意圖: 直接回固定答覆, 不呼叫 AI、不附來源; 冷卻與每日上限已在 evaluateTrigger/markAnswered 照常計入。
+    // 判定文字用 question (已去掉觸發名字); 例外: 「AI寶的作者是誰」去掉名字後 question 會以「的」開頭,
+    // 那是所有格殘留 (主詞就是機器人本身), 補回名字再判定, 否則會漏判。
+    const creatorText = question.startsWith("的") ? `${s.botName ?? ""}${question}` : question;
+    if (isCreatorIntent(creatorText, s)) {
+      const reply = typeof s.creatorReply === "string" && s.creatorReply.trim() ? s.creatorReply : DEFAULT_CREATOR_REPLY;
+      await this.sendText(m.channelId, reply, m.messageId).catch((e) => this.logger?.error("機器人回覆", "創造者固定答覆送出失敗", { error: String(e?.message ?? e) }));
+      markAnswered(this.triggerState);
+      this.stats.answered++;
+      const mem0 = this.memory.get(m.channelId) ?? [];
+      this.memory.set(m.channelId, [...mem0, { role: "user", content: question }, { role: "assistant", content: reply }].slice(-(s.ai.memoryTurns ?? 6) * 2));
+      this.logger?.info("機器人回覆", "已回覆創造者固定答覆 (未呼叫 AI)", { id: m.messageId });
+      return;
+    }
     // 手動防詐騙判讀
     if (isManualScamAsk(question)) {
       const target = extractScamTarget(question) || m.text;
@@ -381,8 +509,10 @@ export class HelperBot {
     }
     const mem = this.memory.get(m.channelId) ?? [];
     const nameLine = s.botName ? `你的名字是「${s.botName}」, 同事這樣叫你時就是在叫你。` : "";
+    // 人設注入 (第 3 項): 非空欄位逐項寫入 system prompt, 年紀由出生日自動計算, 並附空欄位誠實回答規則
+    const personaSection = buildPersonaSection(s.persona);
     const messages = [
-      { role: "system", content: `${s.ai.systemPrompt}\n${nameLine}` },
+      { role: "system", content: `${s.ai.systemPrompt}\n${nameLine}\n${personaSection}` },
       ...mem,
     ];
     if (hits.length) {
@@ -396,10 +526,13 @@ export class HelperBot {
       const r = await this.chatWithAi(messages);
       answer = r.content;
     } catch (e) {
-      this.logger?.error("機器人回覆", "AI 回答失敗, 回覆備援訊息", { error: String(e?.message ?? e) });
-      answer = `不好意思, 我現在連不上 AI 服務 (${String(e?.message ?? e)})。下一步: 請管理員到控制台設定頁按「測試連線」確認 API Key 與網路, 或稍後再問我一次。`;
+      // 備援訊息只給白話原因與下一步, 不把原始例外字串丟給群組同事看 (原始細節已由 chatWithAi 寫進 log)
+      this.logger?.error("機器人回覆", "AI 回答失敗, 回覆備援訊息", { error: String(e?.message ?? e), detail: e?.detail ? String(e.detail) : undefined });
+      answer = "不好意思, 我現在連不上 AI 服務。下一步: 請管理員到控制台設定頁按「測試連線」確認 API Key 與網路, 或稍後再問我一次。";
     }
-    if (hits.length) {
+    // 參考來源開關 (第 1 項): settings.showSources 為 false 時不附加任何來源行 (預設就是 false);
+    // true 時維持原行為, 在回答最後附上知識庫來源檔名。
+    if (hits.length && s.showSources) {
       const sources = [...new Set(hits.map((h) => h.file))];
       answer += `\n\n(參考來源: ${sources.join("、")})`;
     }

@@ -28,6 +28,9 @@ pub struct LoginUi {
     pub qr_url: Option<String>,
     pub pin: Option<String>,
     pub profile_name: Option<String>,
+    /// 登入帳號實際頭像的本機 media id (核心 profile 的 pictureId, 不含位元組);
+    /// 殼以此向核心 /media/<id> 取圖顯示, 取不到時退回品牌定版頭像。
+    pub profile_picture_id: Option<String>,
     /// 登入流程開始時間 (逾時判定; 上限比照 CLI 的 LOGIN_MS 180 秒)
     pub login_started: Option<Instant>,
     pub last_error: Option<String>,
@@ -41,6 +44,7 @@ impl Default for LoginUi {
             qr_url: None,
             pin: None,
             profile_name: None,
+            profile_picture_id: None,
             login_started: None,
             last_error: None,
         }
@@ -71,6 +75,40 @@ fn fetch_cookie() -> Result<String, String> {
         .map(|s| s.trim().to_string())
         .ok_or_else(|| "核心服務沒有回傳登入 cookie".to_string())?;
     Ok(cookie)
+}
+
+/// 取登入帳號實際頭像的位元組: 核心 /media/<pictureId> 需帶瀏覽器 cookie
+/// (與 WS 連線同一套 fetch_cookie 流程)。pictureId 是核心給的不透明 id,
+/// 這裡只做基本形狀檢查防路徑字元混入; 失敗回 Err 由 UI 退回品牌頭像。
+pub fn fetch_profile_picture(picture_id: &str) -> Result<Vec<u8>, String> {
+    if picture_id.is_empty()
+        || picture_id.len() > 128
+        || !picture_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("頭像編號形狀不正確".to_string());
+    }
+    let cookie = fetch_cookie()?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout_read(Duration::from_secs(5))
+        .build();
+    let resp = agent
+        .get(&format!("http://127.0.0.1:{CORE_PORT}/media/{picture_id}"))
+        .set("Cookie", &cookie)
+        .call()
+        .map_err(|e| format!("向核心取頭像失敗: {e}"))?;
+    use std::io::Read;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(5 * 1024 * 1024)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("讀取頭像資料失敗: {e}"))?;
+    if buf.is_empty() {
+        return Err("核心回傳的頭像是空的".to_string());
+    }
+    Ok(buf)
 }
 
 /// 登入背景執行緒: 維持一條 WS 連線, 斷線自動重連 (引擎重啟時能自己接回)。
@@ -239,6 +277,7 @@ fn run_connection(
                 }
                 if g.auth == AuthState::Idle {
                     g.profile_name = None;
+                    g.profile_picture_id = None;
                     profile_requested = false;
                 }
                 drop(g);
@@ -273,13 +312,24 @@ fn run_connection(
                 }
             }
             "auth:ready" | "profile" => {
-                if let Some(name) = frame
-                    .get("profile")
+                // profile 同時帶 displayName 與 pictureId (帳號有設頭像時);
+                // pictureId 只當不透明 id 透傳, 位元組由殼另向核心 /media 取。
+                let profile = frame.get("profile");
+                let name = profile
                     .and_then(|p| p.get("displayName"))
+                    .and_then(|v| v.as_str());
+                let picture = profile
+                    .and_then(|p| p.get("pictureId"))
                     .and_then(|v| v.as_str())
-                {
+                    .filter(|s| !s.is_empty());
+                if name.is_some() || picture.is_some() {
                     let mut g = state.lock().unwrap();
-                    g.profile_name = Some(name.to_string());
+                    if let Some(name) = name {
+                        g.profile_name = Some(name.to_string());
+                    }
+                    if let Some(picture) = picture {
+                        g.profile_picture_id = Some(picture.to_string());
+                    }
                     drop(g);
                     poke(state);
                 }

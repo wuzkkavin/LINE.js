@@ -78,6 +78,15 @@ struct SettingsForm {
     jev_enabled: bool,
     jev_model: String,
     kb_folder: String,
+    show_sources: bool,
+    creator_reply: String,
+    persona_birthdate: String,
+    persona_gender: String,
+    persona_zodiac: String,
+    persona_measurements: String,
+    persona_interests: String,
+    persona_marital: String,
+    persona_intro: String,
     line_token_configured: bool,
     line_token_last4: String,
     line_token_input: String,
@@ -131,7 +140,16 @@ struct App {
     logs_slot: Slot<Value>,
     logs_text: String,
     diag_slot: Slot<String>,
+    repair_slot: Slot<Vec<String>>,
+    repair_lines: Vec<String>,
     avatar_tex: Option<egui::TextureHandle>,
+    /// 登入帳號的實際 LINE 頭像 (以核心 profile 的 pictureId 向 /media 取圖)。
+    /// account_avatar_id 記錄目前這張圖 (或這次失敗嘗試) 對應的 pictureId,
+    /// id 沒變就不重抓; 抓不到時顯示退回品牌頭像 avatar_tex。
+    account_avatar_tex: Option<egui::TextureHandle>,
+    account_avatar_id: Option<String>,
+    account_avatar_fetching: Option<String>,
+    account_avatar_slot: Slot<(String, Result<Vec<u8>, String>)>,
     hidden: bool,
     confirm_quit: bool,
     quitting: bool,
@@ -163,6 +181,77 @@ fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     Some((rgba.into_raw(), w, h))
+}
+
+/// 圖示專用縮放: 以「預乘 alpha 面積加權」把 RGBA 縮到目標尺寸, 並先置中補成正方形。
+/// 為什麼不用原圖 (233x232) 直交 egui/winit 與 tray-icon 自行縮放 (2026-10-20 實機回報
+/// 工作列圖示不見、系統匣 icon 黑邊): 來源圖是二值 alpha (只有 0/255) 的硬邊圖,
+/// 透明像素的 RGB 是白色; 系統以非預乘方式即時縮小 233 到 16/20 時, 邊緣像素會被
+/// 透明區的顏色 (或縮放緩衝區的黑色) 污染而出現黑邊, 超大圖示的 HICON 轉換也不穩。
+/// 在這裡先算出帶正確抗鋸齒邊的小圖, 呼叫端幾乎不必再縮放, 邊緣才乾淨。
+/// 只處理縮小 (目標邊長小於來源); 否則原樣回傳 (仍會補正方形)。
+fn icon_rgba(size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let (rgba, w, h) = decode_png_rgba(ICON_BYTES)?;
+    // 置中貼到正方形透明畫布 (來源 233x232 非正方形, 直接給非正方形尺寸會被拉伸變形)
+    let side = w.max(h);
+    let mut canvas = vec![0u8; (side * side * 4) as usize];
+    let ox = ((side - w) / 2) as usize;
+    let oy = ((side - h) / 2) as usize;
+    for y in 0..h as usize {
+        let src_row = &rgba[y * w as usize * 4..(y + 1) * w as usize * 4];
+        let dst = ((y + oy) * side as usize + ox) * 4;
+        canvas[dst..dst + src_row.len()].copy_from_slice(src_row);
+    }
+    if size >= side {
+        return Some((canvas, side, side));
+    }
+    // 面積加權: 每個輸出像素涵蓋來源的一個矩形範圍, 以重疊面積為權重累積預乘顏色
+    let (tw, th) = (size, size);
+    let mut out = vec![0u8; (tw * th * 4) as usize];
+    let sx = side as f64 / tw as f64;
+    let sy = side as f64 / th as f64;
+    for ty in 0..th {
+        let y0 = ty as f64 * sy;
+        let y1 = y0 + sy;
+        for tx in 0..tw {
+            let x0 = tx as f64 * sx;
+            let x1 = x0 + sx;
+            let (mut r, mut g, mut b, mut a) = (0f64, 0f64, 0f64, 0f64);
+            let mut yy = y0.floor() as u32;
+            while (yy as f64) < y1 {
+                let wy = ((yy as f64 + 1.0).min(y1) - (yy as f64).max(y0)).max(0.0);
+                if wy > 0.0 {
+                    let mut xx = x0.floor() as u32;
+                    while (xx as f64) < x1 {
+                        let wx = ((xx as f64 + 1.0).min(x1) - (xx as f64).max(x0)).max(0.0);
+                        if wx > 0.0 {
+                            let idx = ((yy * side + xx) * 4) as usize;
+                            let alpha = canvas[idx + 3] as f64 / 255.0;
+                            let weight = wx * wy;
+                            r += canvas[idx] as f64 * alpha * weight;
+                            g += canvas[idx + 1] as f64 * alpha * weight;
+                            b += canvas[idx + 2] as f64 * alpha * weight;
+                            a += alpha * weight;
+                        }
+                        xx += 1;
+                    }
+                }
+                yy += 1;
+            }
+            let o = ((ty * tw + tx) * 4) as usize;
+            let area = sx * sy;
+            let alpha_out = a / area;
+            out[o + 3] = (alpha_out * 255.0).round().clamp(0.0, 255.0) as u8;
+            if a > 1e-9 {
+                // r/g/b 累積的是 (0..255 色值 x alpha x 權重), 除以 a 即 alpha 加權平均原色 (0..255);
+                // 全透明像素 RGB 保持 0, 不帶任何顏色污染
+                out[o] = (r / a).round().clamp(0.0, 255.0) as u8;
+                out[o + 1] = (g / a).round().clamp(0.0, 255.0) as u8;
+                out[o + 2] = (b / a).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    Some((out, tw, th))
 }
 
 fn main() {
@@ -225,12 +314,19 @@ fn main() {
     let shell_settings = shell::ShellSettings::load();
     let start_hidden = autostart || !shell_settings.show_window_on_start;
 
+    // 視窗尺寸鎖定(2026-10-20 老吳指示):不給使用者任意放大縮小,避免版面被
+    // 拉到走樣。沿用現行設計尺寸 1024x720:resizable(false) 之外再把 min/max
+    // 釘在同一尺寸雙重保險;最大化按鈕由 Windows 隨不可調整大小一併停用。
+    // 縮到系統匣、最小化、關閉行為不受影響;--autostart 走同一條路徑同樣固定。
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("AI寶")
         .with_inner_size([1024.0, 720.0])
-        .with_min_inner_size([880.0, 600.0])
+        .with_min_inner_size([1024.0, 720.0])
+        .with_max_inner_size([1024.0, 720.0])
+        .with_resizable(false)
         .with_visible(!start_hidden);
-    if let Some((rgba, w, h)) = decode_png_rgba(ICON_BYTES) {
+    // 視窗/工作列圖示: 給預先縮好的 64px 圖 (理由見 icon_rgba), 不再直交 233x232 原圖
+    if let Some((rgba, w, h)) = icon_rgba(64) {
         viewport = viewport.with_icon(egui::IconData { rgba, width: w, height: h });
     }
     let options = eframe::NativeOptions {
@@ -242,7 +338,14 @@ fn main() {
     let result = eframe::run_native(
         "AI寶",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, sig_rx, autostart, start_hidden, settings_for_app)))),
+        Box::new(move |cc| {
+            // 停用 egui 介面縮放(老吳指示):關掉鍵盤縮放捷徑(Ctrl +/- /0),
+            // pixels_per_point 只跟隨系統 DPI;捏合手勢的 Event::Zoom 在
+            // App::update 每幀濾除,zoom_factor 也每幀強制回 1.0。
+            cc.egui_ctx
+                .memory_mut(|m| m.options.zoom_with_keyboard = false);
+            Ok(Box::new(App::new(cc, sig_rx, autostart, start_hidden, settings_for_app)))
+        }),
     );
     if let Err(e) = result {
         shell::log_line(&format!("eframe 結束時回報錯誤: {e}"));
@@ -314,7 +417,9 @@ fn refresh_line_cfg_status(app: &mut App) {
 #[cfg(windows)]
 fn build_tray() -> Option<Tray> {
     use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
-    let (rgba, w, h) = decode_png_rgba(ICON_BYTES)?;
+    // 系統匣圖示: 給預先縮好的 32px 圖 (涵蓋 100% 到 200% DPI 的 16/20/24 顯示尺寸,
+    // 理由見 icon_rgba), 不再讓 Windows 把 233x232 原圖即時縮小而產生黑邊
+    let (rgba, w, h) = icon_rgba(32)?;
     let normal = tray_icon::Icon::from_rgba(rgba.clone(), w, h).ok()?;
     // 灰階版: 未登入/異常時用 (飽和度降為 0)
     let mut gray = rgba.clone();
@@ -426,7 +531,13 @@ impl App {
             logs_slot: Arc::new(Mutex::new(None)),
             logs_text: String::new(),
             diag_slot: Arc::new(Mutex::new(None)),
+            repair_slot: Arc::new(Mutex::new(None)),
+            repair_lines: Vec::new(),
             avatar_tex,
+            account_avatar_tex: None,
+            account_avatar_id: None,
+            account_avatar_fetching: None,
+            account_avatar_slot: Arc::new(Mutex::new(None)),
             hidden: start_hidden,
             confirm_quit: false,
             quitting: false,
@@ -491,6 +602,99 @@ impl App {
         });
     }
 
+    /// 一鍵修復 (消費級基線: 使用者不該用指令自救): 在背景執行緒診斷常見壞狀態並安全自修。
+    /// 能修的: 引擎沒在跑/狀態鎖死/服務無回應 → 走 EngineManager 既有 stop()+start()
+    /// (start 內含世代與版本判定: 自家舊建置 stack 先清除再啟新版; 真外來佔用會被擋下並在
+    /// Failed 訊息裡附佔用者名稱 — 修復不硬搶, 把那段訊息原樣整理給使用者看)。
+    /// 機器人斷線但引擎與服務都正常時: helper 本身會退避自動重連, 修復只等待並確認結果。
+    /// 結果以白話逐項寫進 repair_slot, 總覽頁列出「做了什麼」。
+    fn start_repair(&mut self, ctx: &egui::Context) {
+        if self.busy.get("repair").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("repair".into(), true);
+        self.repair_lines = vec!["修復中… 正在檢查服務狀態".to_string()];
+        let slot = self.repair_slot.clone();
+        let engine = self.engine.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let mut lines: Vec<String> = Vec::new();
+            let mut restarted = false;
+            let state0 = engine.lock().unwrap().state.clone();
+            let helper_ok = helper_api::ping_helper();
+            let need_restart = match state0 {
+                EngineState::Running | EngineState::ExternalRunning => {
+                    if helper_ok {
+                        lines.push("檢查完成: 引擎與服務都在正常回應".to_string());
+                        false
+                    } else {
+                        lines.push("檢查發現: 引擎顯示執行中, 但服務沒有回應".to_string());
+                        true
+                    }
+                }
+                EngineState::Starting => {
+                    lines.push("檢查發現: 引擎還在啟動中, 先等它完成".to_string());
+                    false
+                }
+                EngineState::Failed(_) => {
+                    lines.push("檢查發現: 引擎處於異常停止狀態".to_string());
+                    true
+                }
+                EngineState::Stopped | EngineState::NotStarted => {
+                    lines.push("檢查發現: 引擎目前沒有在執行".to_string());
+                    true
+                }
+            };
+            if need_restart {
+                lines.push("已重新啟動引擎 (舊的服務會先被清乾淨, 再啟動目前版本的引擎)".to_string());
+                let mut mgr = engine.lock().unwrap();
+                let _ = mgr.stop();
+                match mgr.start() {
+                    Ok(()) => {
+                        restarted = true;
+                    }
+                    Err(e) => {
+                        mgr.state = EngineState::Failed(e.clone());
+                        lines.push(format!("自動修復到這裡停住了: {e}"));
+                        lines.push("上面有寫佔用的程式名稱: 請先在工作管理員結束它, 再重新開啟 AI寶。".to_string());
+                    }
+                }
+            }
+            if restarted || matches!(state0, EngineState::Running | EngineState::ExternalRunning) {
+                // 等服務就緒並確認機器人連線 (剛重啟要給它時間; 本來就在跑則快速確認)
+                let wait_rounds = if restarted { 12 } else { 4 };
+                let mut bot_ok = false;
+                let mut svc_ok = false;
+                for _ in 0..wait_rounds {
+                    std::thread::sleep(Duration::from_secs(2));
+                    if let Ok(v) = helper_api::get_status() {
+                        svc_ok = true;
+                        bot_ok = v
+                            .get("bot")
+                            .and_then(|b| b.get("botConnected"))
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false);
+                        if bot_ok {
+                            break;
+                        }
+                    }
+                }
+                if svc_ok && bot_ok {
+                    lines.push("確認完成: 服務已恢復, 機器人已連線, 可以到群組測試了".to_string());
+                } else if svc_ok {
+                    lines.push("服務已恢復回應; 機器人還在自動連線中 (它會自己重試, 不用再處理)。若超過一分鐘還沒連上, 請到「機器人與觸發」頁確認 Token 是否已設定".to_string());
+                } else {
+                    lines.push("服務還是沒有回應: 請把 AI寶 完全關閉後重新開啟一次; 若還是不行, 請到「紀錄」頁匯出診斷包給維護人員".to_string());
+                }
+            } else if matches!(state0, EngineState::Starting) {
+                lines.push("引擎還在啟動, 請等左下角變成「引擎: 執行中」再到群組測試".to_string());
+            }
+            shell::log_line(&format!("一鍵修復完成: {}", lines.join(" / ")));
+            *slot.lock().unwrap() = Some(lines);
+            ctx2.request_repaint();
+        });
+    }
+
     fn engine_tick_and_snap(&mut self) {
         if let Ok(mut mgr) = self.engine.try_lock() {
             mgr.tick();
@@ -504,6 +708,65 @@ impl App {
 
     fn login_snapshot(&self) -> LoginUi {
         self.login.lock().unwrap().clone()
+    }
+
+    /// 每幀同步帳號實際頭像: pictureId 出現或變化時在背景抓一次圖, 成功就
+    /// 換上 texture; 失敗只記 log 並退回品牌頭像 (不打擾使用者、不重試轟炸)。
+    /// 登出 (pictureId 消失) 時清掉帳號頭像, 下次登入會重新抓。
+    fn sync_account_avatar(&mut self, ctx: &egui::Context) {
+        let want = self.login_snapshot().profile_picture_id;
+        if let Some((id, res)) = self.account_avatar_slot.lock().unwrap().take() {
+            if self.account_avatar_fetching.as_deref() == Some(id.as_str()) {
+                self.account_avatar_fetching = None;
+            }
+            if want.as_deref() == Some(id.as_str()) {
+                self.account_avatar_id = Some(id);
+                match res {
+                    Ok(bytes) => {
+                        self.account_avatar_tex = decode_png_rgba(&bytes).map(|(rgba, w, h)| {
+                            let img = egui::ColorImage::from_rgba_unmultiplied(
+                                [w as usize, h as usize],
+                                &rgba,
+                            );
+                            ctx.load_texture("account-avatar", img, egui::TextureOptions::LINEAR)
+                        });
+                        if self.account_avatar_tex.is_none() {
+                            shell::log_line("帳號頭像解碼失敗, 退回品牌頭像顯示");
+                        }
+                    }
+                    Err(e) => {
+                        self.account_avatar_tex = None;
+                        shell::log_line(&format!("帳號頭像抓取失敗, 退回品牌頭像顯示: {e}"));
+                    }
+                }
+            }
+        }
+        match &want {
+            None => {
+                if self.account_avatar_id.is_some() || self.account_avatar_tex.is_some() {
+                    self.account_avatar_id = None;
+                    self.account_avatar_tex = None;
+                }
+            }
+            Some(id) => {
+                if self.account_avatar_id.as_deref() != Some(id.as_str())
+                    && self.account_avatar_fetching.as_deref() != Some(id.as_str())
+                {
+                    let id = id.clone();
+                    let slot = self.account_avatar_slot.clone();
+                    self.account_avatar_fetching = Some(id.clone());
+                    std::thread::spawn(move || {
+                        let res = core_ws::fetch_profile_picture(&id);
+                        *slot.lock().unwrap() = Some((id, res));
+                    });
+                }
+            }
+        }
+    }
+
+    /// 顯示用頭像: 優先登入帳號的實際頭像, 沒有就用品牌定版頭像。
+    fn display_avatar(&self) -> Option<&egui::TextureHandle> {
+        self.account_avatar_tex.as_ref().or(self.avatar_tex.as_ref())
     }
 
     fn helper_status(&self) -> Option<Value> {
@@ -542,8 +805,19 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        // 介面縮放鎖定(老吳指示):每幀濾掉捏合手勢產生的 Zoom 事件、重申鍵盤
+        // 縮放停用,並把 zoom_factor 強制回 1.0 — pixels_per_point 只跟隨系統
+        // DPI,不被使用者以快捷鍵或手勢改動(視窗尺寸鎖定在 main 的 viewport)。
+        ctx.input_mut(|i| {
+            i.events.retain(|e| !matches!(e, egui::Event::Zoom(_)));
+        });
+        ctx.memory_mut(|m| m.options.zoom_with_keyboard = false);
+        if (ctx.zoom_factor() - 1.0).abs() > f32::EPSILON {
+            ctx.set_zoom_factor(1.0);
+        }
         ctx.request_repaint_after(Duration::from_millis(400));
         self.engine_tick_and_snap();
+        self.sync_account_avatar(ctx);
 
         // 第二實例/系統匣喚醒與結束訊號
         while let Ok(sig) = self.signals.try_recv() {
@@ -618,7 +892,7 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 ui.add_space(10.0);
                 ui.vertical_centered(|ui| {
-                    if let Some(tex) = &self.avatar_tex {
+                    if let Some(tex) = self.display_avatar() {
                         ui.image((tex.id(), egui::vec2(72.0, 72.0)));
                     }
                     ui.label(egui::RichText::new("AI寶").strong().size(20.0).color(GREEN));
@@ -916,6 +1190,21 @@ impl App {
             .unwrap_or("jev-1.13.0")
             .to_string();
         f.kb_folder = v.get("kb").and_then(|k| k.get("folder")).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        f.show_sources = v.get("showSources").and_then(|x| x.as_bool()).unwrap_or(false);
+        f.creator_reply = v
+            .get("creatorReply")
+            .and_then(|x| x.as_str())
+            .unwrap_or("是吳治綱大師創造此機器人，©Copyright By 吳治綱")
+            .to_string();
+        let persona = v.get("persona").cloned().unwrap_or(Value::Null);
+        let pstr = |k: &str| persona.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        f.persona_birthdate = pstr("birthdate");
+        f.persona_gender = pstr("gender");
+        f.persona_zodiac = pstr("zodiac");
+        f.persona_measurements = pstr("measurements");
+        f.persona_interests = pstr("interests");
+        f.persona_marital = pstr("maritalStatus");
+        f.persona_intro = pstr("intro");
         let line = v.get("line").cloned().unwrap_or(Value::Null);
         f.line_token_configured = line.get("set").and_then(|x| x.as_bool()).unwrap_or(false);
         f.line_token_last4 = line.get("last4").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -952,7 +1241,18 @@ impl App {
                 "perMinute": f.scam_per_minute,
                 "jev": { "enabled": f.jev_enabled, "model": f.jev_model }
             },
-            "kb": { "folder": f.kb_folder }
+            "kb": { "folder": f.kb_folder },
+            "showSources": f.show_sources,
+            "creatorReply": f.creator_reply,
+            "persona": {
+                "birthdate": f.persona_birthdate,
+                "gender": f.persona_gender,
+                "zodiac": f.persona_zodiac,
+                "measurements": f.persona_measurements,
+                "interests": f.persona_interests,
+                "maritalStatus": f.persona_marital,
+                "intro": f.persona_intro
+            }
         })
     }
 
@@ -1094,6 +1394,11 @@ impl App {
             }
         }
         // 診斷包匯出結果
+        // 一鍵修復結果
+        if let Some(lines) = self.repair_slot.lock().unwrap().take() {
+            self.busy.insert("repair".into(), false);
+            self.repair_lines = lines;
+        }
         if let Some(msg) = self.diag_slot.lock().unwrap().take() {
             self.busy.insert("diag".into(), false);
             self.page_msg.insert("diag".into(), msg);
@@ -1183,13 +1488,14 @@ impl App {
     }
 
     fn page_overview(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         let login = self.login_snapshot();
         let status = self.helper_status();
         ui.heading("總覽");
         ui.add_space(8.0);
         card(ui, "服務狀態", |ui| {
             ui.horizontal(|ui| {
-                if let Some(tex) = &self.avatar_tex {
+                if let Some(tex) = self.display_avatar() {
                     ui.image((tex.id(), egui::vec2(84.0, 84.0)));
                 }
                 ui.vertical(|ui| {
@@ -1285,10 +1591,21 @@ impl App {
                 if ui.button("重新啟動引擎").clicked() {
                     self.restart_engine();
                 }
+                let repairing = self.busy.get("repair").copied().unwrap_or(false);
+                if ui.button(if repairing { "修復中…" } else { "一鍵修復" }).clicked() && !repairing {
+                    self.start_repair(&ctx);
+                }
                 if ui.button("開啟 LINE 登入頁").clicked() {
                     self.page = Page::LineLogin;
                 }
             });
+            if !self.repair_lines.is_empty() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("一鍵修復結果:").strong());
+                for line in self.repair_lines.clone() {
+                    ui.label(format!("・{line}"));
+                }
+            }
             if let EngineState::Failed(msg) = &self.engine_snap.state {
                 ui.label(egui::RichText::new(format!("引擎異常: {msg}")).color(COLOR_BAD));
             }
@@ -1535,13 +1852,18 @@ impl App {
         let ctx = ui.ctx().clone();
         card(ui, "機器人名字與觸發規則", |ui| {
             ui.horizontal(|ui| {
-                ui.label("機器人主名:");
+                ui.label("機器人主名 (在群組裡叫這個名字, 我就會回應):");
                 ui.add(egui::TextEdit::singleline(&mut self.form.bot_name).desired_width(200.0));
             });
             ui.horizontal(|ui| {
                 ui.label("別名 (可多個, 用逗號分開):");
-                ui.add(egui::TextEdit::singleline(&mut self.form.aliases_text).desired_width(280.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.form.aliases_text)
+                        .desired_width(280.0)
+                        .hint_text("例: 小寶, 阿寶"),
+                );
             });
+            ui.label(egui::RichText::new("別名是我的小名: 別人用別名叫我, 我也會回應。主名和別名都算數。").weak());
             ui.label("群組裡有人在訊息中提到這個名字 (含問句或請求), 或引用機器人自己的回答再追問, 機器人就會回應。");
             ui.horizontal(|ui| {
                 ui.label("觸發寬嚴:");
@@ -1558,6 +1880,38 @@ impl App {
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
                 if ui.button(if saving { "儲存中…" } else { "儲存設定" }).clicked() {
+                    self.save_settings(&ctx);
+                }
+                if let Some(m) = &self.form.save_msg {
+                    ui.label(m.clone());
+                }
+            });
+        });
+        ui.add_space(10.0);
+        card(ui, "機器人身分 (別人問我的身世時, 我照這裡回答)", |ui| {
+            ui.label(egui::RichText::new("這些是機器人的個人資料: 群組裡有人問我的年紀、生日、星座、興趣等等, 我會照這裡填的回答; 沒填的我會老實說還沒設定, 不會亂編。年紀不用填, 我會自己用出生日算。").weak());
+            let mut row = |ui: &mut egui::Ui, label: &str, field: &mut String, hint: &str, width: f32| {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    ui.add(egui::TextEdit::singleline(field).desired_width(width).hint_text(hint));
+                });
+            };
+            row(ui, "出生日:", &mut self.form.persona_birthdate, "例: 2020-05-01", 200.0);
+            row(ui, "性別:", &mut self.form.persona_gender, "例: 女", 200.0);
+            row(ui, "星座:", &mut self.form.persona_zodiac, "例: 金牛座", 200.0);
+            row(ui, "三圍:", &mut self.form.persona_measurements, "可留空", 200.0);
+            row(ui, "興趣:", &mut self.form.persona_interests, "例: 學習新知識、幫忙查資料", 320.0);
+            row(ui, "婚姻狀態:", &mut self.form.persona_marital, "例: 未婚", 200.0);
+            row(ui, "自我介紹:", &mut self.form.persona_intro, "一句話介紹自己", 420.0);
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("有人問「是誰創造你的 / 作者是誰 / 版權是誰的」這類問題時, 我會固定回下面這句 (不讓 AI 自由發揮):").weak());
+            ui.horizontal(|ui| {
+                ui.label("創造者問答:");
+                ui.add(egui::TextEdit::singleline(&mut self.form.creator_reply).desired_width(460.0));
+            });
+            ui.horizontal(|ui| {
+                let saving = self.busy.get("save").copied().unwrap_or(false);
+                if ui.button(if saving { "儲存中…" } else { "儲存身分設定" }).clicked() {
                     self.save_settings(&ctx);
                 }
                 if let Some(m) = &self.form.save_msg {
@@ -1709,7 +2063,11 @@ impl App {
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
         card(ui, "知識庫資料夾", |ui| {
-            ui.label("指定一個資料夾, AI寶 會讀取裡面的 .txt / .md / .csv 回答公司問題, 並註明來源檔案。資料夾內容請先自行脫敏。");
+            ui.label("指定一個資料夾, AI寶 會讀取裡面的 .txt / .md / .csv 回答公司問題。資料夾內容請先自行脫敏。");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.form.show_sources, "回答時附上參考來源");
+                ui.label(egui::RichText::new("(打開才會在回答後面附上參考的檔案名稱; 關閉就不顯示)").weak());
+            });
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.form.kb_folder).desired_width(420.0).hint_text("例如 D:\\公司文件\\知識庫"));
                 if ui.button("選擇資料夾…").clicked() {
@@ -1741,7 +2099,7 @@ impl App {
             }
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
-                if ui.button("儲存資料夾設定").clicked() && !saving {
+                if ui.button("儲存知識庫設定").clicked() && !saving {
                     self.save_settings(&ctx);
                 }
                 let busy = self.busy.get("reindex").copied().unwrap_or(false);
@@ -1841,7 +2199,10 @@ impl App {
                         std::thread::spawn(move || {
                             let msg = match shell::export_diagnostic(&path) {
                                 Ok(m) => m,
-                                Err(e) => format!("匯出失敗: {e}"),
+                                Err(e) => {
+                                    shell::log_line(&format!("診斷包匯出失敗: {e}"));
+                                    "匯出失敗: 檔案寫不進去, 請換一個位置再試一次".to_string()
+                                }
                             };
                             *slot.lock().unwrap() = Some(msg);
                             ctx2.request_repaint();
@@ -1884,7 +2245,8 @@ impl App {
                             match platform::autostart_set(&exe) {
                                 Ok(()) => shell::log_line("已啟用開機自啟動 (HKCU Run)"),
                                 Err(e) => {
-                                    self.page_msg.insert("autostart".into(), format!("寫入自啟動失敗: {e}"));
+                                    shell::log_line(&format!("寫入自啟動失敗: {e}"));
+                                    self.page_msg.insert("autostart".into(), "設定失敗: 沒能把開機自啟動寫進 Windows 設定, 請重新試一次".to_string());
                                 }
                             }
                         }
@@ -1892,7 +2254,8 @@ impl App {
                         match platform::autostart_remove() {
                             Ok(()) => shell::log_line("已取消開機自啟動 (HKCU Run 已移除)"),
                             Err(e) => {
-                                self.page_msg.insert("autostart".into(), format!("移除自啟動失敗: {e}"));
+                                shell::log_line(&format!("移除自啟動失敗: {e}"));
+                                self.page_msg.insert("autostart".into(), "設定失敗: 沒能把開機自啟動從 Windows 設定移除, 請重新試一次".to_string());
                             }
                         }
                     }
