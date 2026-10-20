@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>AI寶 主題預覽 — 五套配色對照</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:"jf-openhuninn","PingFang TC","PingFang SC","Microsoft JhengHei",sans-serif;
+         background:#E9ECE9; color:#222; padding:22px 26px 30px; }
+  h1 { font-size:20px; margin-bottom:4px; }
+  .note { font-size:12.5px; color:#555; margin-bottom:18px; line-height:1.6; }
+  .grid { display:grid; grid-template-columns:repeat(3, 530px); gap:20px; }
+  .cap { font-size:13.5px; font-weight:700; margin-bottom:6px; display:flex; align-items:center; gap:8px; }
+  .cap .chip { width:14px; height:14px; border-radius:4px; border:1px solid rgba(0,0,0,.18); display:inline-block; }
+  .cap .hex { font-weight:400; color:#666; font-size:12px; }
+  /* ---- App 小樣：530x370 = 固定視窗 1060x740 的 50% ---- */
+  .app { width:530px; height:370px; display:flex; border-radius:10px; overflow:hidden;
+         background:var(--bg); color:var(--tmain); border:1px solid var(--border);
+         box-shadow:0 4px 18px rgba(0,0,0,.13); font-size:11px; }
+  .side { width:122px; flex:none; background:var(--side); display:flex; flex-direction:column; padding:10px 8px 8px; }
+  .brand { text-align:center; padding-bottom:8px; }
+  .avatar { width:34px; height:34px; border-radius:50%; margin:0 auto 3px;
+            background:linear-gradient(160deg, var(--primary), var(--secondary));
+            color:#fff; display:flex; align-items:center; justify-content:center; font-size:15px; font-weight:700; }
+  .brand .nm { font-size:12.5px; font-weight:700; }
+  .brand .sub { font-size:8.5px; color:var(--tsub); }
+  .nav { display:flex; flex-direction:column; gap:1px; margin-top:2px; }
+  .nav a { display:flex; align-items:center; gap:6px; padding:4.5px 7px; border-radius:6px;
+           color:var(--tmain); text-decoration:none; font-size:10.5px; }
+  .nav a svg { width:13px; height:13px; flex:none; }
+  .nav a.sel { background:var(--primary); color:#fff; font-weight:700; }
+  .side .foot { margin-top:auto; font-size:8.5px; color:var(--tsub); text-align:center; }
+  .main { flex:1; display:flex; flex-direction:column; padding:12px 14px 0; min-width:0; }
+  .main h2 { font-size:15px; margin-bottom:8px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:9px 12px; margin-bottom:8px; }
+  .card h3 { font-size:11.5px; color:var(--primary); margin-bottom:6px; }
+  .row { display:flex; align-items:center; gap:6px; padding:2.5px 0; font-size:11px; }
+  .dot { width:8px; height:8px; border-radius:50%; flex:none; }
+  .ok { background:var(--ok); } .warn { background:var(--warn); }
+  .row .tail { margin-left:auto; color:var(--tsub); font-size:10px; }
+  .btns { display:flex; gap:7px; margin-top:7px; }
+  .btn { font-size:10.5px; padding:4.5px 10px; border-radius:6px; border:1px solid var(--border);
+         background:var(--card); color:var(--tmain); }
+  .btn.p { background:var(--primary); border-color:var(--primary); color:#fff; font-weight:700; }
+  .small { font-size:10px; color:var(--tsub); line-height:1.65; }
+  .pfoot { margin-top:auto; border-top:1px solid var(--border); padding:5px 2px 7px;
+           display:flex; justify-content:space-between; font-size:8.5px; color:var(--tsub); }
+  .pfoot .quit { color:var(--bad); }
+  /* ---- 五套主題變數（與 palettes.md 定稿一致） ---- */
+  .t-forest { --bg:#F3F8F3; --side:#E6F0E6; --card:#FFFFFF; --primary:#0C513D; --secondary:#2E7D5B;
+              --tmain:#1E2B22; --tsub:#55685B; --ok:#1DA457; --warn:#D98A00; --bad:#C0392B; --border:#D8E4D8; }
+  .t-ocean  { --bg:#F2F7FB; --side:#E2EDF7; --card:#FFFFFF; --primary:#0B5FA5; --secondary:#2E86C8;
+              --tmain:#152A3D; --tsub:#4E6A82; --ok:#178A4C; --warn:#D98A00; --bad:#C0392B; --border:#D2E0EE; }
+  .t-sakura { --bg:#FDF5F8; --side:#FAE7EF; --card:#FFFFFF; --primary:#B02A5E; --secondary:#C95C8C;
+              --tmain:#38222E; --tsub:#7A5568; --ok:#1E7D4F; --warn:#D98A00; --bad:#B3261E; --border:#F2D3DF; }
+  .t-violet { --bg:#F6F3FC; --side:#EAE3F8; --card:#FFFFFF; --primary:#5E35B1; --secondary:#8E6BC8;
+              --tmain:#28203F; --tsub:#655C86; --ok:#1E7D4F; --warn:#D98A00; --bad:#B3261E; --border:#DCD1F0; }
+  .t-mono   { --bg:#F7F7F7; --side:#EBEBEB; --card:#FFFFFF; --primary:#1B1B1B; --secondary:#5C5C5C;
+              --tmain:#111111; --tsub:#5A5A5A; --ok:#2E7D32; --warn:#9E6200; --bad:#B3261E; --border:#D9D9D9; }
+</style>
+</head>
+<body>
+<h1>AI寶 App — 五套主題預覽（總覽頁小樣）</h1>
+<p class="note">每個小樣為固定視窗 1060×740 的 50% 縮放（530×370），比例與實品一致；實品視窗固定尺寸、不可縮放。<br>
+字型：實品內嵌粉圓體（jf-openhuninn-2.1）；本預覽在未安裝粉圓體的電腦上以系統圓體／黑體替代，字形略有差異屬正常。<br>
+側欄圖示為簡化線稿示意，正式圖示依 icons.md 的「macOS 光澤風自繪」規格製作。</p>
+<div class="grid" id="grid"></div>
+
+<script>
+const ICONS = {
+  home:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11 L12 3 L21 11"/><path d="M5.5 9.5 V21 H18.5 V9.5"/></svg>',
+  key:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="15.5" r="4.5"/><path d="M11.3 12.2 L20 3.5 M16.5 7 L19.5 10"/></svg>',
+  sliders:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 7h10 M17.5 7H21 M3 17h3.5 M11 17h10"/><circle cx="15" cy="7" r="2.3"/><circle cx="8.5" cy="17" r="2.3"/></svg>',
+  chat:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M4 4.5h16V16H9.5L4 20.5z"/><circle cx="8.5" cy="10.2" r="0.6" fill="currentColor"/><circle cx="12" cy="10.2" r="0.6" fill="currentColor"/><circle cx="15.5" cy="10.2" r="0.6" fill="currentColor"/></svg>',
+  book:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M5 19.5A2.5 2.5 0 0 1 7.5 17H20V2.5H7.5A2.5 2.5 0 0 0 5 5z"/><path d="M5 19.5V5"/></svg>',
+  shield:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 2.8 19 5.8v6.1c0 4.4-2.9 7.4-7 9.3-4.1-1.9-7-4.9-7-9.3V5.8z"/><path d="M8.8 11.8 11 14l4.2-4.4"/></svg>',
+  list:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8.5 6H21 M8.5 12H21 M8.5 18H21"/><circle cx="4" cy="6" r="1.1" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.1" fill="currentColor" stroke="none"/></svg>',
+  gear:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3.4"/><path d="M12 2.5v3 M12 18.5v3 M2.5 12h3 M18.5 12h3 M5 5l2.1 2.1 M16.9 16.9 19 19 M19 5l-2.1 2.1 M7.1 16.9 5 19"/></svg>',
+  info:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5.5"/><circle cx="12" cy="7.6" r="1.1" fill="currentColor" stroke="none"/></svg>'
+};
+const NAV = [['總覽','home'],['LINE 登入','key'],['AI 設定','sliders'],['機器人與觸發','chat'],['知識庫','book'],['防詐騙','shield'],['紀錄','list'],['程式設定','gear'],['關於','info']];
+const THEMES = [
+  ['t-forest','1. 森林綠（預設）','#0C513D'],
+  ['t-ocean','2. 海洋藍','#0B5FA5'],
+  ['t-sakura','3. 櫻花粉','#B02A5E'],
+  ['t-violet','4. 紫羅蘭紫','#5E35B1'],
+  ['t-mono','5. 黑白簡約','#1B1B1B']
+];
+function panel(cls, name, hex) {
+  const nav = NAV.map((n,i)=>'<a class="'+(i===0?'sel':'')+'">'+ICONS[n[1]]+n[0]+'</a>').join('');
+  return '<div><div class="cap"><span class="chip" style="background:'+hex+'"></span>'+name+' <span class="hex">主色 '+hex+'</span></div>'
+  + '<div class="app '+cls+'">'
+  + '<div class="side"><div class="brand"><div class="avatar">寶</div><div class="nm">AI寶</div><div class="sub">LINE 學習小幫手</div></div>'
+  + '<div class="nav">'+nav+'</div><div class="foot">引擎：執行中</div></div>'
+  + '<div class="main"><h2>總覽</h2>'
+  + '<div class="card"><h3>服務狀態</h3>'
+  + '<div class="row"><span class="dot ok"></span>引擎：執行中<span class="tail">v1.8.0</span></div>'
+  + '<div class="row"><span class="dot ok"></span>LINE：已登入（AI寶）</div>'
+  + '<div class="row"><span class="dot ok"></span>機器人：已連線（會回應群組訊息）</div>'
+  + '<div class="row"><span class="dot warn"></span>使用中的 AI：groq / gpt-oss-120b<span class="tail">今日已回答 4 次</span></div>'
+  + '<div class="btns"><span class="btn p">重新啟動引擎</span><span class="btn">開啟 LINE 登入頁</span><span class="btn">一鍵修復</span></div></div>'
+  + '<div class="card"><h3>使用方式</h3><div class="small">1. 在「LINE 登入」頁用次要帳號掃描 QR 碼登入（只需一次）。<br>2. 在「AI 設定」貼上 API Key、選好模型。<br>3. 在「機器人與觸發」完成 LINE 開通（白名單＋Token）。</div></div>'
+  + '<div class="pfoot"><span class="quit">結束服務並關閉程式</span><span>©Copyright 2026 By 吳治綱 繁體中文化</span></div>'
+  + '</div></div></div>';
+}
+document.getElementById('grid').innerHTML = THEMES.map(t=>panel(t[0],t[1],t[2])).join('');
+</script>
+</body>
+</html>
