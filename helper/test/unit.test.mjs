@@ -614,3 +614,59 @@ test("console: /api/line/chats 端點 (合併白名單狀態、空清單白話�
   assert.equal(nologin.ok, false);
   assert.equal(nologin.code, "NOT_LOGGED_IN");
 });
+
+test("bot: 被核心踢線後自動重連; 換 Token 後以新 Token 重連; 連不上時狀態誠實, 核心恢復後自癒", async (t) => {
+  const dir = await tmp();
+  const settings = new SettingsStore({ path: join(dir, "settings.json") });
+  const secrets = new MemorySecretStore();
+  const logger = new Logger({ dir: join(dir, "logs") });
+  const ai = createAiClient({});
+  const kb = new KnowledgeBase({ folder: "", indexPath: join(dir, "kb.json"), logger });
+
+  // 假核心: 只接受指定 Token 的 /api/ws 連線, 記錄每次連線帶的 Authorization
+  let acceptedToken = "tok-OLD-1111";
+  const seenAuth = [];
+  const sockets = new Set();
+  const wss = new WebSocketServer({ port: 0, verifyClient: (info, cb) => {
+    seenAuth.push(info.req.headers.authorization ?? "");
+    cb(info.req.headers.authorization === `Bearer ${acceptedToken}`, 401, "bad token");
+  } });
+  wss.on("connection", (s) => { sockets.add(s); s.on("close", () => sockets.delete(s)); });
+  await new Promise((r) => wss.on("listening", r));
+  const port = wss.address().port;
+  t.after(() => { for (const s of sockets) s.terminate(); wss.close(); });
+  settings.update({ lineApiUrl: `ws://127.0.0.1:${port}/api/ws` });
+
+  const waitUntil = async (pred, timeout = 5000) => {
+    const started = Date.now();
+    for (;;) { if (pred()) return; if (Date.now() - started > timeout) throw new Error("等待逾時"); await new Promise((r) => setTimeout(r, 25)); }
+  };
+
+  // 1) 舊 Token 連不上: connect 回 false、botConnected=false、狀態不是已連線 (誠實), 不假裝
+  await secrets.set(SECRET_NAMES.lineToken, "tok-WRONG-0000");
+  const bot = new HelperBot({ settings, secrets, ai, kb, logger, reconnectDelaysMs: [50, 100, 200] });
+  t.after(() => bot.disconnect());
+  assert.equal(await bot.connect(), false);
+  assert.equal(bot.status().botConnected, false);
+  assert.notEqual(bot.status().lineState, "已連線");
+
+  // 2) 核心恢復接受目前 Token 後, 靠退避排程自癒連上 (不用重開、不用手動重連)
+  acceptedToken = "tok-WRONG-0000";
+  await waitUntil(() => bot.status().botConnected === true);
+  assert.equal(bot.status().lineState, "已連線");
+
+  // 3) 被踢線 (模擬核心重啟/換發 Token 踢線): 伺服器端強制斷掉, bot 自動重連回來
+  for (const s of sockets) s.terminate();
+  await waitUntil(() => sockets.size === 0);
+  await waitUntil(() => bot.status().botConnected === true && sockets.size === 1);
+
+  // 4) 換 Token: 核心改只認新 Token 並踢掉舊連線 (上游換發行為), helper 存入新 Token 後 reconnect() 以新 Token 連上並驗證成功
+  acceptedToken = "tok-NEW-2222";
+  for (const s of sockets) s.terminate();
+  await secrets.set(SECRET_NAMES.lineToken, "tok-NEW-2222");
+  assert.equal(await bot.reconnect(), true);
+  assert.equal(bot.status().botConnected, true);
+  assert.equal(seenAuth[seenAuth.length - 1], "Bearer tok-NEW-2222");
+  bot.disconnect();
+  assert.equal(bot.status().botConnected, false);
+});

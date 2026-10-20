@@ -20,7 +20,7 @@ export function kbMissText() {
 }
 
 export class HelperBot {
-  constructor({ settings, secrets, ai, kb, logger, registry } = {}) {
+  constructor({ settings, secrets, ai, kb, logger, registry, reconnectDelaysMs } = {}) {
     this.settings = settings; // SettingsStore
     this.secrets = secrets;
     this.ai = ai;
@@ -36,6 +36,16 @@ export class HelperBot {
     this.selfName = "";
     this.connected = false;
     this.lineState = "未連線";
+    // 連線韌性: wantConnected 表示「應該保持連線」(有 Token 且未被要求斷線)。
+    // 核心在 Token 換發時會立刻踢掉所有機器人連線 (上游硬規則), 也可能因重啟/網路斷線;
+    // 只要 wantConnected 為真, 斷線就以退避間隔自動重連, 不再一次失敗就永久離線
+    // (2026-10-20 老吳實機: 換 Token 後 bot 被踢線且無人重連, 總覽還看不出來)。
+    this.wantConnected = false;
+    this.intentionalClose = new WeakSet(); // 被主動關閉的 socket: 其 close 事件不觸發重連排程
+    this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
+    this.reconnectDelaysMs = reconnectDelaysMs ?? [1000, 2000, 5000, 10000, 30000];
+    this.connectInFlight = null;
     this.pending = new Map();
     this.reqSeq = 0;
     this.stats = { date: "", answered: 0, triggered: 0, scamChecked: 0, scamWarned: 0 };
@@ -50,6 +60,10 @@ export class HelperBot {
     const s = this.cfg();
     return {
       connected: this.connected,
+      // botConnected 與 connected 同值, 欄位名講清楚「這是機器人與核心的連線, 不是帳號登入狀態」;
+      // 總覽要把「LINE 已登入 (核心 session)」與「機器人已連線 (bot WS)」分開顯示, 避免斷線看不出來。
+      botConnected: this.connected,
+      reconnecting: this.reconnectTimer != null,
       lineState: this.lineState,
       selfName: this.selfName,
       botName: s.botName,
@@ -89,24 +103,118 @@ export class HelperBot {
     throw lastErr;
   }
 
-  connect() {
-    const s = this.cfg();
-    const url = s.lineApiUrl;
-    return new Promise(async (resolve, reject) => {
-      const token = this.secrets ? await this.secrets.get(SECRET_NAMES.lineToken) : null;
-      if (!token) { this.logger?.warn("機器人", "尚未設定 LINE 機器人 Token, 機器人未連線 (控制台仍可使用)"); this.lineState = "未設定 Token"; return resolve(false); }
-      this.logger?.addSecret(token);
-      const ws = new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } });
-      this.ws = ws;
-      const onErr = (e) => { this.connected = false; this.lineState = "連線失敗"; reject(e); };
-      ws.once("error", onErr);
-      ws.on("open", () => { this.connected = true; this.lineState = "已連線"; this.logger?.info("機器人", "已連上 LINE 核心 /api/ws", { url }); resolve(true); });
-      ws.on("close", () => { this.connected = false; if (this.lineState === "已連線") this.lineState = "已斷線"; this.logger?.warn("機器人", "與 LINE 核心的連線已斷開"); });
-      ws.on("error", (e) => this.logger?.error("機器人", "WebSocket 錯誤", { error: String(e?.message ?? e) }));
-      ws.on("message", (data) => this.onFrame(data).catch((e) => this.logger?.error("機器人", "處理訊息失敗", { error: String(e?.message ?? e) })));
-    });
+  // 對外連線入口: 有 Token 就連, 並記住「應該保持連線」; 連不上不丟例外, 回 false 並排自動重試。
+  async connect() {
+    const token = this.secrets ? await this.secrets.get(SECRET_NAMES.lineToken) : null;
+    if (!token) {
+      this.wantConnected = false;
+      this.logger?.warn("機器人", "尚未設定 LINE 機器人 Token, 機器人未連線 (控制台仍可使用)");
+      this.lineState = "未設定 Token";
+      return false;
+    }
+    this.wantConnected = true;
+    const ok = await this.openSocket();
+    if (!ok) this.scheduleReconnect();
+    return ok;
   }
-  disconnect() { try { this.ws?.close(); } catch {} this.ws = null; this.connected = false; this.registry.flush(); }
+
+  // 開一條新 WS 連線並等它開通/失敗; 每次嘗試都重讀 Token (換發後排程中的重試會自動用新 Token 自癒)。
+  // 同時只允許一條在途連線; 已開通就直接回 true。socket 事件一律先確認還是不是目前這條,
+  // 避免舊 socket 的遲到 close 把新連線的狀態打掉 (換 Token 重連時最容易踩到)。
+  openSocket() {
+    if (this.connectInFlight) return this.connectInFlight;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) { this.connected = true; return Promise.resolve(true); }
+    const run = (async () => {
+      const token = this.secrets ? await this.secrets.get(SECRET_NAMES.lineToken) : null;
+      if (!token) { this.lineState = "未設定 Token"; return false; }
+      this.logger?.addSecret(token);
+      const url = this.cfg().lineApiUrl;
+      return await new Promise((resolve) => {
+        let settled = false;
+        const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+        const ws = new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } });
+        this.ws = ws;
+        ws.on("open", () => {
+          this.connected = true;
+          this.lineState = "已連線";
+          this.reconnectAttempt = 0;
+          this.logger?.info("機器人", "已連上 LINE 核心 /api/ws", { url });
+          done(true);
+        });
+        ws.on("error", (e) => {
+          this.logger?.error("機器人", "WebSocket 錯誤", { error: String(e?.message ?? e) });
+          done(false); // 開通前出錯 = 這次連線失敗; 開通後出錯只記 log, 由 close 事件處理後續
+        });
+        ws.on("close", () => {
+          const isCurrent = this.ws === ws;
+          if (isCurrent) { this.ws = null; this.connected = false; }
+          done(false);
+          if (this.intentionalClose.has(ws)) return; // 主動關閉 (disconnect/reconnect 換線), 不排重連
+          if (isCurrent && this.wantConnected) {
+            this.lineState = "已斷線";
+            this.logger?.warn("機器人", "與 LINE 核心的連線已斷開, 將自動重連");
+            this.scheduleReconnect();
+          }
+        });
+        ws.on("message", (data) => this.onFrame(data).catch((e) => this.logger?.error("機器人", "處理訊息失敗", { error: String(e?.message ?? e) })));
+      });
+    })();
+    this.connectInFlight = run;
+    run.finally(() => { if (this.connectInFlight === run) this.connectInFlight = null; }).catch(() => {});
+    return run;
+  }
+
+  // 退避重連排程: 間隔依序拉長 (1s/2s/5s/10s/30s 後固定 30s), 成功後歸零。重複呼叫不會重複排。
+  scheduleReconnect() {
+    if (this.reconnectTimer || !this.wantConnected) return;
+    const delays = this.reconnectDelaysMs.length ? this.reconnectDelaysMs : [30000];
+    const delay = delays[Math.min(this.reconnectAttempt, delays.length - 1)];
+    this.reconnectAttempt++;
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (!this.wantConnected) return;
+      const ok = await this.openSocket().catch(() => false);
+      if (!ok) {
+        this.logger?.warn("機器人", "自動重連尚未成功, 會繼續重試", { attempt: this.reconnectAttempt });
+        this.scheduleReconnect();
+      }
+    }, delay);
+    this.reconnectTimer.unref?.();
+  }
+
+  // Token 換發/手動換 Token 後用: 先主動關掉舊連線 (核心也會踢, 兩邊不衝突), 再以目前儲存的 Token
+  // 立刻重連並回傳驗證結果; 失敗時 log 明確記下, 並交給退避排程繼續自癒, 不靜默吞掉。
+  async reconnect() {
+    this.wantConnected = true;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.ws) {
+      this.intentionalClose.add(this.ws);
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+      this.connected = false;
+    }
+    this.reconnectAttempt = 0;
+    const ok = await this.openSocket().catch(() => false);
+    if (ok) {
+      this.logger?.info("機器人", "已用目前儲存的 Token 重新連上 LINE 核心");
+    } else {
+      this.logger?.warn("機器人", "重新連線失敗 (核心未就緒或 Token 尚未生效), 將自動重試");
+      this.scheduleReconnect();
+    }
+    return ok;
+  }
+
+  disconnect() {
+    this.wantConnected = false;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.ws) {
+      this.intentionalClose.add(this.ws);
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+    }
+    this.connected = false;
+    this.registry.flush();
+  }
 
   sendFrame(obj) { if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj)); }
   async paceSend() {

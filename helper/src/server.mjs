@@ -63,9 +63,11 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
     generateToken: lineEnv?.generateToken ?? (() => runCliToken({})),
     fetchChats: lineEnv?.fetchChats ?? null, // 測試可注入假的; null 表示用真的核心網頁通道
   };
+  // Token 換發/變更後: 用 bot.reconnect() 主動以新 Token 重連並驗證結果 (bot 內部會記成功/失敗原因,
+  // 失敗會自動退避重試); 這裡回傳是否已連上, 讓 API 回應能誠實告訴使用者目前狀態, 不再靜默吞掉。
   async function reconnectBot() {
-    if (!bot) return;
-    try { bot.disconnect(); await bot.connect().catch(() => {}); } catch {}
+    if (!bot) return false;
+    try { return await bot.reconnect(); } catch { return false; }
   }
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
@@ -129,7 +131,7 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         if (body?.line) delete body.line;
         await Promise.all(keyUpdates);
         settings.update(body);
-        if (lineTokenChanged) await reconnectBot();
+        if (lineTokenChanged) await reconnectBot().catch(() => {});
         if (kb && typeof body?.kb?.folder === "string") { kb.setFolder(body.kb.folder); kb.scan(); }
         const s = settings.get();
         logger?.info("設定", "設定已更新", { botName: s.botName, aiActive: s.ai.active, triggerMode: s.triggerMode });
@@ -204,10 +206,17 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
           const token = await line.generateToken();
           await secrets.set(SECRET_NAMES.lineToken, token);
           logger?.addSecret(token);
-          await reconnectBot();
+          // 核心在換發 Token 的當下就會踢掉機器人連線; 必須主動以新 Token 重連並驗證有沒有連上,
+          // 結果直接寫進回應訊息, 連不上就明說會自動重試 (2026-10-20 實機: 沒重連成功也沒人知道)。
+          const reconnected = await reconnectBot();
           const masked = maskSecret(token);
-          logger?.info("設定", "LINE Token 已自動產生並儲存", { last4: masked.last4 });
-          return json(res, 200, { ok: true, ...masked, message: "已產生新 Token 並自動儲存好了 (舊 Token 已失效)。機器人正在用新 Token 重新連線, 請看本頁最上方的 LINE 連線狀態。" });
+          logger?.info("設定", "LINE Token 已自動產生並儲存", { last4: masked.last4, botReconnected: reconnected });
+          return json(res, 200, {
+            ok: true, ...masked, botConnected: reconnected,
+            message: reconnected
+              ? "已產生新 Token 並自動儲存好了 (舊 Token 已失效), 機器人已用新 Token 重新連線完成。"
+              : "已產生新 Token 並自動儲存好了 (舊 Token 已失效), 但機器人暫時連不上核心, 系統會自動重試連線。請看總覽的「機器人連線」狀態; 若一直顯示未連線, 請重新啟動 AI寶。",
+          });
         } catch (e) {
           logger?.warn("設定", "LINE Token 自動產生失敗", { error: String(e?.message ?? e) });
           return json(res, 200, { ok: false, message: String(e?.message ?? e) });
