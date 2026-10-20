@@ -8,6 +8,7 @@ import { PROVIDER_DEFAULTS, SECRET_NAMES } from "./config.mjs";
 import { KB_LARGE_FOLDER_FILES } from "./kb.mjs";
 import { maskSecret } from "./secrets.mjs";
 import { applyCoreApiConfig, detectPackaged, readCoreApiStatus, removeCoreApiChat, runCliToken } from "./linecfg.mjs";
+import { syncJevCoreConfig } from "./jev.mjs";
 import { fetchCoreChannels, shapeChatList } from "./corechats.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -139,6 +140,12 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         await Promise.all(keyUpdates);
         settings.update(body);
         if (lineTokenChanged) await reconnectBot().catch(() => {});
+        // Jev 接通同步: 每次存檔後把核心 config.yaml 的 jev 區段與目前設定/金鑰對齊
+        // (啟用且有金鑰就寫入、停用或清除金鑰就清空; 只動 jev 區段, 安全規格同白名單寫入)。
+        // 同步失敗只記 log, 不擋設定存檔本身 (syncJevCoreConfig 內部已保證不寫壞檔案)。
+        await syncJevCoreConfig({ dataDir: line.dataDir, repoRoot: line.repoRoot, settings, secrets, logger })
+          .catch((e) => logger?.warn("防詐騙", "Jev 核心設定同步發生錯誤, 已保留原設定", { error: String(e?.message ?? e) }));
+        if (bot?.refreshJevState) await bot.refreshJevState().catch(() => {});
         // 知識庫掃描改在背景跑: 大資料夾掃描要很久, 設定回應不能等它 (舊版同步掃描把這支 API
         // 卡住 100+ 秒, App 端直接逾時跳 Network Error — 2026-10-20 實機定案之二)。
         let kbNotice = "";

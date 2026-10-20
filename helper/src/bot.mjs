@@ -7,8 +7,38 @@ import { evaluateTrigger, markAnswered, markTriggered, createTriggerState, local
 import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, scamVerdictText, scamWarningText, PerMinuteLimiter } from "./scam.mjs";
 import { SECRET_NAMES, DEFAULT_CREATOR_REPLY, DEFAULT_ROLE_PROMPT } from "./config.mjs";
+import { isValidJevToken } from "./jev.mjs";
 
 const COMPANY_HINTS = ["公司", "華葳", "內部", "規定", "請假", "加班", "影印", "列印", "印表機", "分機", "會議室", "系統", "帳號申請", "福利", "薪資", "考勤", "打卡", "公文", "簽呈", "部門", "同仁", "總公司", "工務所"];
+
+// Jev 手法分類 (核心 scam:result 的 tactic.kind) 對照本程式的中文手法名稱 (與核心 README 的對照一致)。
+export const JEV_TACTIC_LABELS = {
+  investment: "假投資/飆股群",
+  impersonation: "假冒機關/銀行/客服",
+  phishing: "釣魚連結",
+  shopping: "網購/解除分期付款",
+  friend: "冒充親友借錢",
+  romance: "感情詐騙",
+  job: "求職打工/租借帳戶",
+  prize: "中獎贈品",
+  loan: "貸款代辦",
+  other: "其他",
+};
+
+// Jev 判讀失敗原因的白話分類: 只依核心回的通用代碼分類, 不把上游原文或例外字串帶進 log 與畫面。
+export function classifyJevError(code) {
+  switch (String(code ?? "")) {
+    case "SCAM_CHECK_UNAVAILABLE": return "核心尚未啟用 Jev (金鑰可能還沒被核心載入, 請把 AI寶 完全結束再重新開啟)";
+    case "SCAM_CHECK_FAILED": return "TypeSafe 判讀服務這次沒有判讀成功";
+    case "UNKNOWN_CHAT": return "這個聊天室不在機器人可判讀的範圍內";
+    case "INVALID_REQUEST": return "這則訊息不在核心可判讀的範圍內 (可能已被收回或不是文字訊息)";
+    case "RATE_LIMITED": return "判讀次數超過每分鐘上限";
+    case "TIMEOUT": return "判讀等太久 (逾時)";
+    case "NOT_CONNECTED": return "機器人尚未連上核心";
+    case "BAD_RESULT": return "核心回傳的判讀結果格式不正確";
+    default: return "Jev 判讀連不上";
+  }
+}
 
 export function guidanceText(botName) {
   const name = botName || "我";
@@ -202,6 +232,15 @@ export class HelperBot {
     this.historyPrefetchedChats = new Set(); // 本次連線已補登過的聊天室 (重連時清空重補)
     this.historyPrefetchInFlight = new Set();
     this.stats = { date: "", answered: 0, triggered: 0, scamChecked: 0, scamWarned: 0 };
+    // Jev 接通狀態 (2026-10-21 真接通): 誠實原則 — 只有真的收到過核心 scam:result 才准說 ok。
+    // unconfigured = 沒啟用或還沒存金鑰; unverified = 已啟用且有金鑰, 但這次啟動還沒成功判讀過;
+    // ok = 已成功判讀 (jevLastOkAt 為最近一次的 ISO 時間); error = 最近一次 Jev 判讀失敗、已退回 AI
+    // (jevLastError 是白話分類, 不含上游原文)。jevKeyPrint 是「啟用+金鑰末4碼+模型」的指紋,
+    // 換金鑰或改設定後狀態要回到 unverified, 不拿舊的成功紀錄冒充新金鑰已通。
+    this.jevState = "unconfigured";
+    this.jevLastOkAt = null;
+    this.jevLastError = "";
+    this.jevKeyPrint = "";
     // 核心版本 (第 14 項): 連線時核心 hello 影格的 serverVersion (核心自己的版本回報,
     // 來源是核心 package.json, 不寫死); 總覽與關於頁顯示用。
     this.coreVersion = "";
@@ -288,7 +327,11 @@ export class HelperBot {
       aiActive: s.ai.active,
       aiModel: s.ai.providers[s.ai.active]?.model ?? "",
       kb: this.kb ? this.kb.status() : null,
-      scam: { enabled: s.scam.enabled, threshold: s.scam.threshold, checkedToday: this.stats.scamChecked, warnedToday: this.stats.scamWarned },
+      scam: {
+        enabled: s.scam.enabled, threshold: s.scam.threshold, checkedToday: this.stats.scamChecked, warnedToday: this.stats.scamWarned,
+        // Jev 誠實狀態 (防詐騙頁顯示用): state 四態 + 最近成功時間 + 最近失敗的白話原因
+        jevState: this.jevState, jevLastOkAt: this.jevLastOkAt, jevLastError: this.jevLastError,
+      },
       answeredToday: this.stats.answered,
       // 第 14 項: 核心實際版本 (hello 影格的 serverVersion; 未連線時為空字串, 介面顯示「—」)
       coreVersion: this.coreVersion,
@@ -642,10 +685,10 @@ export class HelperBot {
     if (!pre.hit) { this.logger?.debugLog("防詐騙", "預篩未命中, 不送判讀", { id: m.messageId }); return; }
     this.scamLimiter.limit = s.scam.perMinute ?? 10;
     if (!this.scamLimiter.tryTake()) { this.logger?.warn("防詐騙", "判讀次數達每分鐘上限, 本則略過", { id: m.messageId }); return; }
-    this.logger?.info("防詐騙", "預篩命中, 送 AI 判讀", { id: m.messageId, rules: pre.rules });
-    const verdict = await this.judge(m.text);
+    this.logger?.info("防詐騙", "預篩命中, 送判讀", { id: m.messageId, rules: pre.rules });
+    const verdict = await this.judgeMessage(m);
     this.stats.scamChecked++;
-    this.logger?.info("防詐騙", "判讀完成", { id: m.messageId, probability: verdict.probability, tactic: verdict.tactic, fallback: !!verdict.fallback, warned: verdict.probability >= s.scam.threshold });
+    this.logger?.info("防詐騙", "判讀完成", { id: m.messageId, probability: verdict.probability, tactic: verdict.tactic, source: verdict.source ?? "ai", fallback: !!verdict.fallback, warned: verdict.probability >= s.scam.threshold });
     if (verdict.probability >= s.scam.threshold) {
       this.stats.scamWarned++;
       this.persistDaily();
@@ -654,11 +697,110 @@ export class HelperBot {
     }
   }
 
-  async judge(text) {
+  // 依目前設定與已存金鑰刷新 Jev 狀態 (啟動時與設定存檔後由外部呼叫; 判讀路徑也會自行維護)。
+  async refreshJevState() {
     const s = this.cfg();
-    if (s.scam.jev?.enabled) this.logger?.warn("防詐騙", "Jev 選項已開啟但假資料版尚未接 Jev API, 改用所選 AI 判讀");
-    const { cfg, key } = await this.providerWithKey(s.ai.active);
-    return judgeScam({ text, aiChat: (args) => this.ai.chat(args), providerCfg: { baseUrl: cfg.baseUrl, model: cfg.model }, apiKey: key, logger: this.logger });
+    const key = this.secrets ? await this.secrets.get(SECRET_NAMES.jev).catch(() => null) : null;
+    const print = `${s.scam?.jev?.enabled ? 1 : 0}|${key ? String(key).slice(-4) : ""}|${s.scam?.jev?.model ?? ""}`;
+    if (!s.scam?.jev?.enabled || !key) {
+      this.jevState = "unconfigured";
+      this.jevKeyPrint = print;
+      this.jevLastError = "";
+      return this.jevState;
+    }
+    if (!isValidJevToken(key)) {
+      this.jevState = "error";
+      this.jevLastError = "金鑰格式不對 (只能是無空白的英數字與符號), 請重新貼上正確的金鑰";
+      this.jevKeyPrint = print;
+      return this.jevState;
+    }
+    if (print !== this.jevKeyPrint || this.jevState === "unconfigured") {
+      this.jevState = "unverified";
+      this.jevLastError = "";
+    }
+    this.jevKeyPrint = print;
+    return this.jevState;
+  }
+
+  // 向核心要求 Jev 判讀一則訊息 (機器人 API 的 scam:check; 核心以自己快取的那則原文送 TypeSafe,
+  // 只回機率與手法, 金鑰與原文都不經 helper)。逾時給 20 秒 (核心對 TypeSafe 的逾時是 15 秒)。
+  async scamCheck(chatId, messageId) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw Object.assign(new Error("NOT_CONNECTED"), { code: "NOT_CONNECTED" });
+    }
+    return new Promise((resolve, reject) => {
+      const requestId = `h${++this.reqSeq}-${Date.now()}`;
+      const timer = setTimeout(() => { this.pending.delete(requestId); reject(Object.assign(new Error("TIMEOUT"), { code: "TIMEOUT" })); }, 20000);
+      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
+      this.sendFrame({ type: "scam:check", requestId, chatId, messageId });
+    });
+  }
+
+  // AI 判讀 (既有路徑): 所選 AI 判讀 + 解析失敗時規則備援 (judgeScam 內含)。
+  async judgeWithAi(text) {
+    const { cfg, key } = await this.providerWithKey(this.cfg().ai.active);
+    const v = await judgeScam({ text, aiChat: (args) => this.ai.chat(args), providerCfg: { baseUrl: cfg.baseUrl, model: cfg.model }, apiKey: key, logger: this.logger });
+    return { ...v, source: "ai" };
+  }
+
+  // 判讀「群組裡的一則實際訊息」: Jev 啟用且金鑰可用時優先走核心 scam:check;
+  // 任一失敗 (核心未載入金鑰、TypeSafe 失敗、逾時、未連線…) 自動退回 AI 判讀,
+  // 防詐騙不會因為 Jev 故障而整段失效。成功時另以影子方式跑一次 AI 判讀留同場比試紀錄。
+  async judgeMessage(m) {
+    const s = this.cfg();
+    const jevOn = !!s.scam?.jev?.enabled;
+    const key = jevOn && this.secrets ? await this.secrets.get(SECRET_NAMES.jev).catch(() => null) : null;
+    if (jevOn && key && isValidJevToken(key)) {
+      try {
+        const frame = await this.scamCheck(m.channelId, m.messageId);
+        const a = frame?.analysis;
+        const p = Number(a?.probability);
+        if (!Number.isFinite(p) || p < 0 || p > 1) throw Object.assign(new Error("BAD_RESULT"), { code: "BAD_RESULT" });
+        const verdict = { probability: p, tactic: JEV_TACTIC_LABELS[a?.tactic?.kind] ?? "其他", reason: "", fallback: false, source: "jev" };
+        this.jevState = "ok";
+        this.jevLastOkAt = new Date().toISOString();
+        this.jevLastError = "";
+        this.jevKeyPrint = `1|${String(key).slice(-4)}|${s.scam?.jev?.model ?? ""}`;
+        void this.shadowAiJudge(m, verdict);
+        return verdict;
+      } catch (e) {
+        const code = String(e?.code ?? e?.message ?? "UNKNOWN");
+        const why = classifyJevError(code);
+        this.jevState = "error";
+        this.jevLastError = why;
+        this.logger?.warn("防詐騙", "Jev 判讀失敗, 已自動改用 AI 判讀", { id: m.messageId, reason: why });
+      }
+    } else if (jevOn) {
+      // 有開 Jev 但還不能用 (沒存金鑰或格式不對): 照舊用 AI, 狀態如實刷新, 不假裝有在走 Jev
+      await this.refreshJevState();
+      if (!key) this.logger?.debugLog("防詐騙", "Jev 已啟用但尚未設定金鑰, 本則改用 AI 判讀", { id: m.messageId });
+    }
+    return this.judgeWithAi(m.text);
+  }
+
+  // 影子比試 (2026-10-21 老吳裁示, 供日後決定長期由誰當家): Jev 成功判讀的同則訊息,
+  // 另以 AI 判讀算一次分, 兩邊分數記在同一行 log; 只記錄, 不影響任何回覆與運作,
+  // AI 影子計算失敗就靜默略過 (不刷警告、不擋正常判讀)。
+  async shadowAiJudge(m, jevVerdict) {
+    try {
+      const ai = await this.judgeWithAi(m.text);
+      this.logger?.info("防詐騙", "Jev 與 AI 同場比試 (影子紀錄, 不影響判讀結果)", {
+        id: m.messageId,
+        jev: jevVerdict.probability, jevTactic: jevVerdict.tactic,
+        ai: ai.probability, aiTactic: ai.tactic, aiFallback: !!ai.fallback,
+        used: "jev",
+      });
+    } catch { /* 影子失敗靜默略過 */ }
+  }
+
+  // 手動判讀 (同事貼上文字問「這是詐騙嗎」): Jev 協定只能判讀核心快取裡的實際訊息,
+  // 使用者自貼的文字不在快取裡, 一律走 AI; 只有目標就是訊息本則時才走 judgeMessage。
+  async judgeForManual(target, m) {
+    if (target === m.text) return this.judgeMessage(m);
+    if (this.cfg().scam?.jev?.enabled) {
+      this.logger?.info("防詐騙", "手動判讀的文字是使用者自貼的內容, 不在核心的訊息快取裡, 改用 AI 判讀", { id: m.messageId });
+    }
+    return this.judgeWithAi(target);
   }
 
   async handleTrigger(m, s) {
@@ -715,7 +857,7 @@ export class HelperBot {
       this.scamLimiter.limit = s.scam.perMinute ?? 10;
       if (!this.scamLimiter.tryTake()) { await this.sendText(m.channelId, "判讀次數暫時到上限了, 請等一分鐘再問我。", m.messageId).catch(() => {}); return; }
       this.logger?.info("防詐騙", "手動判讀請求", { id: m.messageId, targetLen: target.length });
-      const v = await this.judge(target);
+      const v = await this.judgeForManual(target, m);
       this.stats.scamChecked++;
       await this.sendText(m.channelId, scamVerdictText(v), m.messageId).catch(() => {});
       return;

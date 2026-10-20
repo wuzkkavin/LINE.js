@@ -7,6 +7,7 @@ import { SettingsStore, SECRET_NAMES } from "./config.mjs";
 import { createAiClient } from "./ai.mjs";
 import { KnowledgeBase } from "./kb.mjs";
 import { HelperBot } from "./bot.mjs";
+import { syncJevCoreConfig } from "./jev.mjs";
 import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { createConsoleServer, listenConsole } from "./server.mjs";
 
@@ -31,6 +32,12 @@ if (settings.get().kb.folder) void kb.scan(); // 背景分段掃描, 不擋控�
 // 訊息寄件者登記簿持久化在 data 目錄: 重啟後仍認得機器人先前發過的訊息, 引用續答不中斷
 const registry = new MessageSenderRegistry({ path: join(dataDir, "message-senders.json"), logger });
 const bot = new HelperBot({ settings, secrets, ai, kb, logger, registry, dailyStatePath: join(dataDir, "daily-state.json") });
+// Jev 接通: 啟動時先把核心 config.yaml 的 jev 區段與目前設定/金鑰對齊 (上次執行期間改的存檔當下
+// 就已同步, 這裡是補上「程式沒開時設定被改」或核心設定檔後來才產生的情況), 並刷新 bot 的 Jev 狀態,
+// 防詐騙頁顯示的狀態才誠實。同步失敗只記 log, 不擋啟動。
+await syncJevCoreConfig({ dataDir, repoRoot: join(here, "..", ".."), settings, secrets, logger })
+  .catch((e) => logger.warn("防詐騙", "Jev 核心設定同步發生錯誤, 已保留原設定", { error: String(e?.message ?? e) }));
+await bot.refreshJevState().catch(() => {});
 const server = createConsoleServer({ settings, secrets, ai, kb, bot, logger, lineEnv: { dataDir } });
 const port = Number(process.env.HELPER_PORT || 3790);
 await listenConsole(server, port);
