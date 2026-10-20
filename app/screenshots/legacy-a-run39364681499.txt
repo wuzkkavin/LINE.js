@@ -1,0 +1,3 @@
+scenario=a_old_shell_vs_gen0_residue
+old_app_exited=True
+residue_present=True

@@ -1,0 +1,5 @@
+scenario=c_new_shell_vs_gen1_residue
+app_exited=True
+ports_free=True
+gen1_pids_left=0
+cleanup_ok=True
