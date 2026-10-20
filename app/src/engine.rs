@@ -77,9 +77,9 @@ enum SvcClass {
 enum StackVersion {
     /// 與本殼同一個建置
     SameBuild,
-    /// 自家產品但不同建置 (附對方的 ENGINE_ID)
+    /// 自家產品但不同建置 (附對方的 ENGINE_ID; 獨立執行形態以雜湊或大小標記)
     OtherBuild(String),
-    /// 判讀不出 (映像不在引擎目錄底下 — 例如獨立雙擊執行的引擎 exe — 或非 Windows 環境):
+    /// 判讀不出 (映像不是自家引擎命名 — 例如 stub 的 pwsh 託管者 — 或非 Windows 環境):
     /// 不干預, 回到只看回應形狀的既有分類。
     Unknown,
 }
@@ -114,18 +114,93 @@ fn running_stack_version() -> StackVersion {
         for port in [CORE_PORT, HELPER_PORT] {
             for pid in crate::platform::listening_pids(port) {
                 if let Some(p) = crate::platform::process_image_path(pid) {
-                    if let Some(id) = engine_id_of_image(&p) {
-                        return if id == ENGINE_ID {
-                            StackVersion::SameBuild
-                        } else {
-                            StackVersion::OtherBuild(id)
-                        };
+                    let v = stack_version_of_image(&p);
+                    if v != StackVersion::Unknown {
+                        return v;
                     }
                 }
             }
         }
     }
     StackVersion::Unknown
+}
+
+/// 映像檔名是否像自家引擎 (獨立執行形態的判讀前提): 殼解開的 engine.exe、
+/// 網頁版世代的 AI寶.exe、CI 歷史建置的 *-engine.exe、Ubuntu 的 aibao。
+/// 其他映像 (pwsh/node 等託管者) 無法以檔案判讀建置 → 回 Unknown 不干預。
+fn looks_like_family_engine(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    name == "engine.exe"
+        || name == "ai寶.exe"
+        || name == "aibao"
+        || name == "aibao.exe"
+        || name.ends_with("-engine.exe")
+}
+
+/// 讀檔算 FNV-1a 64 (與 build.rs 產生 ENGINE_ID 的方式一致), 回完整戳記字串。
+fn fnv_id_of_file(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in &bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(format!("{:016x}-{}", hash, bytes.len()))
+}
+
+/// 單一映像路徑的建置判定:
+/// 1. 在殼的引擎目錄底下 (殼管理的引擎) → 目錄名即戳記, 直接比對。
+/// 2. 獨立執行形態 (自家引擎命名、任意路徑 — 例如雙擊舊網頁版 AI寶.exe 佔埠,
+///    或 CI 情境把歷史引擎 exe 直接拉起): 先比檔案大小 (歷代 payload 大小皆不同,
+///    一擊判異); 大小相同才讀全檔算雜湊確認同版/異版, 結果以 (路徑,大小,修改時間)
+///    快取, 避免反覆讀 100+MB 大檔。
+/// 3. 其餘 → Unknown (不干預)。
+fn stack_version_of_image(path: &std::path::Path) -> StackVersion {
+    if let Some(id) = engine_id_of_image(path) {
+        return if id == ENGINE_ID {
+            StackVersion::SameBuild
+        } else {
+            StackVersion::OtherBuild(id)
+        };
+    }
+    if !looks_like_family_engine(path) {
+        return StackVersion::Unknown;
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return StackVersion::Unknown,
+    };
+    let size = meta.len();
+    if size as usize != ENGINE_BYTES.len() {
+        return StackVersion::OtherBuild(format!("standalone-{size}"));
+    }
+    let mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    static CACHE: std::sync::Mutex<Option<(std::path::PathBuf, u64, u128, StackVersion)>> =
+        std::sync::Mutex::new(None);
+    if let Ok(c) = CACHE.lock() {
+        if let Some((p, s, m, v)) = c.as_ref() {
+            if p == path && *s == size && *m == mtime_nanos {
+                return v.clone();
+            }
+        }
+    }
+    let v = match fnv_id_of_file(path) {
+        Some(id) if id == ENGINE_ID => StackVersion::SameBuild,
+        Some(id) => StackVersion::OtherBuild(id),
+        None => StackVersion::Unknown,
+    };
+    if let Ok(mut c) = CACHE.lock() {
+        *c = Some((path.to_path_buf(), size, mtime_nanos, v.clone()));
+    }
+    v
 }
 
 /// 版本不符的 log 節流: probe 會被 tick 每 4 秒呼叫, 同一個對方建置只記一次, 換了才再記。
