@@ -160,8 +160,7 @@ mod imp {
         // profile 放程式資料目錄 (不跟著 exe 亂跑): 全新 profile 沒有 cookie 也沒關係,
         // 核心根頁面會在同一個回應裡 Set-Cookie, 頁面自己就能連上 (見檔頭查證)。
         let mut context = wry::WebContext::new(Some(profile_dir.clone()));
-        let webview = wry::WebViewBuilder::new()
-            .with_web_context(&mut context)
+        let webview = wry::WebViewBuilder::new_with_web_context(&mut context)
             .with_url(super::CHAT_URL)
             .with_bounds(rect_of(bounds))
             .build_as_child(&parent)
