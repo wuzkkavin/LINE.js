@@ -121,6 +121,9 @@ struct App {
     chats_slot: Slot<Value>,
     group_chats: Vec<Value>,
     chats_loaded: bool,
+    wl_slot: Slot<Value>,
+    whitelist: Vec<Value>,
+    wl_loaded: bool,
     line_cfg_status: Slot<Value>,
     reindex_slot: Slot<Value>,
     save_slot: Slot<Value>,
@@ -413,6 +416,9 @@ impl App {
             chats_slot: Arc::new(Mutex::new(None)),
             group_chats: Vec::new(),
             chats_loaded: false,
+            wl_slot: Arc::new(Mutex::new(None)),
+            whitelist: Vec::new(),
+            wl_loaded: false,
             line_cfg_status: Arc::new(Mutex::new(None)),
             reindex_slot: Arc::new(Mutex::new(None)),
             save_slot: Arc::new(Mutex::new(None)),
@@ -1047,6 +1053,20 @@ impl App {
             if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) && self.chats_loaded {
                 self.spawn_chats_load(ctx);
             }
+            // 加入/移除後白名單管理清單也要同步重讀
+            if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) && self.wl_loaded {
+                self.spawn_whitelist_load(ctx);
+            }
+        }
+        // 白名單管理清單讀取
+        if let Some(v) = self.wl_slot.lock().unwrap().take() {
+            self.busy.insert("wl".into(), false);
+            if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+                self.whitelist = v.get("chats").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+                self.wl_loaded = true;
+            } else if let Some(m) = v.get("message").and_then(|m| m.as_str()) {
+                self.page_msg.insert("wl".into(), m.to_string());
+            }
         }
         // 群組清單讀取
         if let Some(v) = self.chats_slot.lock().unwrap().take() {
@@ -1117,6 +1137,43 @@ impl App {
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
             let r = helper_api::line_config_apply(&chat_id);
+            *slot.lock().unwrap() = Some(match r {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// 背景讀取已儲存白名單清單 (helper /api/line/whitelist), 結果進 wl_slot 由 poll 收。
+    fn spawn_whitelist_load(&mut self, ctx: &egui::Context) {
+        if self.busy.get("wl").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("wl".into(), true);
+        let slot = self.wl_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = helper_api::line_whitelist();
+            *slot.lock().unwrap() = Some(match r {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// 背景把某個聊天室移出白名單 (helper /api/line/config-remove), 結果進 apply_slot 由 poll 收
+    /// (與加入共用同一條訊息通道與「需完全結束重開才生效」的提示)。
+    fn start_remove(&mut self, ctx: &egui::Context, chat_id: String) {
+        if self.busy.get("apply").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("apply".into(), true);
+        let slot = self.apply_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = helper_api::line_config_remove(&chat_id);
             *slot.lock().unwrap() = Some(match r {
                 Ok(v) => v,
                 Err(e) => serde_json::json!({ "ok": false, "message": e }),
@@ -1578,6 +1635,45 @@ impl App {
             });
             if let Some(m) = self.page_msg.get("apply") {
                 ui.label(m.clone());
+            }
+            ui.add_space(8.0);
+            // 目前白名單 (修復項 8): 已儲存的 chats 逐筆列出與移除, 不能只給計數;
+            // 名稱由 helper 對照核心快照解析, 核心讀不到時顯示 ID 並註明待讀取, 清單本身照樣列。
+            ui.label(egui::RichText::new("目前白名單 (已儲存的群組)").strong());
+            if !self.wl_loaded && !self.busy.get("wl").copied().unwrap_or(false) {
+                self.spawn_whitelist_load(&ctx);
+            }
+            let busy_wl = self.busy.get("wl").copied().unwrap_or(false);
+            if ui.button(if busy_wl { "讀取中…" } else { "重新讀取白名單" }).clicked() && !busy_wl {
+                self.spawn_whitelist_load(&ctx);
+            }
+            if let Some(m) = self.page_msg.get("wl") {
+                ui.label(m.clone());
+            }
+            if self.wl_loaded {
+                if self.whitelist.is_empty() {
+                    ui.label("白名單目前是空的: 還沒有任何群組被加入, 機器人不會在任何群組回應。");
+                }
+                let wl = self.whitelist.clone();
+                let busy_apply_now = self.busy.get("apply").copied().unwrap_or(false);
+                for c in &wl {
+                    let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let resolved = c.get("nameResolved").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    ui.horizontal(|ui| {
+                        if resolved && !name.is_empty() {
+                            ui.label(name.clone());
+                            ui.label(egui::RichText::new(format!("({id})")).weak().small());
+                        } else {
+                            ui.label(id.clone());
+                            ui.label(egui::RichText::new("(名稱待讀取: 核心清單讀不到時先顯示代號)").weak());
+                        }
+                        if ui.add_enabled(!busy_apply_now, egui::Button::new("移除")).clicked() {
+                            self.start_remove(&ctx, id.clone());
+                        }
+                    });
+                }
+                ui.label(egui::RichText::new("移除後要把 AI寶 完全關閉再重新開啟才會生效 (與加入相同)。").weak());
             }
             ui.add_space(8.0);
             // 步驟二: Token

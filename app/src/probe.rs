@@ -96,6 +96,22 @@ pub fn run_probe() -> i32 {
         Some(body) => rec(format!("helper_line_chats_route=fail:{}", sanitize(&body.chars().take(120).collect::<String>()))),
         None => rec("helper_line_chats_route=fail:no-response".to_string()),
     }
+    // 4d) 白名單清單端點實測 (修復項 8): GET /api/line/whitelist 必須 200 且回 chats 陣列 (逐筆, 不是計數);
+    // 回 404/無 chats 代表端點不在。
+    match engine::http_get_text_long(engine::HELPER_PORT, "/api/line/whitelist", 40) {
+        Some(body) => {
+            let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+            let wl_ok = parsed
+                .as_ref()
+                .and_then(|v| v.get("chats"))
+                .map(|c| c.is_array())
+                .unwrap_or(false);
+            rec(format!("helper_line_whitelist_route={}", if wl_ok { "ok".to_string() } else { format!("fail:{}", sanitize(&body.chars().take(120).collect::<String>())) }));
+        }
+        None => {
+            rec("helper_line_whitelist_route=fail:no-response".to_string());
+        }
+    }
     // 5) WS 登入往返
     let events = core_ws::probe_login_roundtrip(true, Duration::from_secs(90));
     for e in &events {

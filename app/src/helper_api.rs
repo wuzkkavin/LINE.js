@@ -94,6 +94,19 @@ pub fn line_config_apply(chat_id: &str) -> Result<serde_json::Value, String> {
     post_json("/api/line/config-apply", serde_json::json!({ "chatId": chat_id }), 20)
 }
 
+/// 已儲存白名單逐筆清單 (含名稱解析狀態); 核心快照可能慢, 用較長逾時比照 line_chats。
+pub fn line_whitelist() -> Result<serde_json::Value, String> {
+    match agent(40).get(&url("/api/line/whitelist")).call() {
+        Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| format!("回應解析失敗: {e}")),
+        Err(ureq::Error::Status(_, resp)) => Err(format!("服務回應錯誤: {}", resp.status())),
+        Err(e) => Err(format!("連不上設定服務: {e}")),
+    }
+}
+
+pub fn line_config_remove(chat_id: &str) -> Result<serde_json::Value, String> {
+    post_json("/api/line/config-remove", serde_json::json!({ "chatId": chat_id }), 20)
+}
+
 pub fn line_generate_token() -> Result<serde_json::Value, String> {
     post_json("/api/line/generate-token", serde_json::json!({}), 60)
 }

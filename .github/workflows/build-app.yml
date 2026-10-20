@@ -109,6 +109,7 @@ jobs:
           if ($result -notmatch 'helper_list_models_route=ok') { throw '探針未確認 /api/list-models 路由存在 (實機曾發生 404)' }
           if ($result -notmatch 'helper_test_ai_route=ok') { throw '探針未確認 /api/test-ai 路由存在且邏輯有跑' }
           if ($result -notmatch 'helper_line_chats_route=ok') { throw '探針未確認 /api/line/chats 路由存在且未登入定案正確' }
+          if ($result -notmatch 'helper_line_whitelist_route=ok') { throw '探針未確認 /api/line/whitelist 路由存在且回逐筆清單' }
           if ($result -notmatch 'helper_status_identity=True') { throw '探針未確認 helper 身分標記' }
 
       - name: GUI 冒煙 — 啟動、截圖、結束序列
@@ -535,11 +536,14 @@ jobs:
           Start-Sleep -Seconds 2
           if (-not (Wait-PortsFree 60)) { throw '情境D-red: 清場後埠未釋放' }
 
-          Write-Host '=== 情境 (d-green): 探測跨界 × 新殼 — 預期身分未定重試後接手, 不得判 Foreign ==='
+          Write-Host '=== 情境 (d-green): 探測跨界 × 新殼 (--autostart 冷開機路徑) — 預期身分未定重試後接手, 不得判 Foreign ==='
+          # 用 --autostart 啟動: 開機自啟動是老吳追加的正式驗收項; --autostart 與雙擊共用同一套
+          # 引擎啟動/探測邏輯 (main.rs App::new 無條件呼叫 mgr.start(), --autostart 只改視窗隱藏),
+          # 在此以自啟動路徑覆蓋「開機時系統忙碌、helper 回應慢」的冷開機時序。
           $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'scenD-data'
           $stubProcD2 = Start-Process pwsh -ArgumentList '-File', $stubD -PassThru
           Start-Sleep -Seconds 2
-          $appD = Start-Process $newApp -PassThru
+          $appD = Start-Process $newApp -ArgumentList '--autostart' -PassThru
           $logD = Join-Path $env:HWLINEHELPER_HOME 'logs\shell.log'
           $adoptedD = $false; $flapSeenD = $false
           foreach ($i in 1..45) {
@@ -558,7 +562,7 @@ jobs:
           Start-Process $newApp -ArgumentList '--quit' -Wait
           $exitedD = $appD.WaitForExit(120000)
           $freeD = Wait-PortsFree 30
-          @("scenario=d_new_shell_probe_straddle", "flapping_seen=$flapSeenD", "foreign_locked=$foreignD", "adopted=$adoptedD", "app_exited=$exitedD", "ports_free=$freeD", "cleanup_ok=$($exitedD -and $freeD)") | Set-Content (Join-Path $ev 'legacy-d.txt')
+          @("scenario=d_new_shell_probe_straddle", "launch=--autostart", "flapping_seen=$flapSeenD", "foreign_locked=$foreignD", "adopted=$adoptedD", "app_exited=$exitedD", "ports_free=$freeD", "cleanup_ok=$($exitedD -and $freeD)") | Set-Content (Join-Path $ev 'legacy-d.txt')
           @("scenario=d_new_shell_probe_straddle", "flapping_seen=$flapSeenD", "foreign_locked=$foreignD", "adopted=$adoptedD", "app_exited=$exitedD", "ports_free=$freeD") | Write-Host
           if ($stubProcD2 -and -not $stubProcD2.HasExited) { Stop-Process -Id $stubProcD2.Id -Force }
           if (-not ($exitedD -and $freeD)) { throw '情境D-green: 新殼結束後埠未釋放或 App 未結束' }
