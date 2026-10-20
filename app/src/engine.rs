@@ -13,6 +13,16 @@ pub const ENGINE_ID: &str = env!("AIBAO_ENGINE_ID");
 pub const CORE_PORT: u16 = 3789;
 pub const HELPER_PORT: u16 = 3790;
 
+/// 埠被外來程式佔用時的白話訊息 (顯示在主視窗狀態區, 要讓使用者知道下一步怎麼做)。
+pub const FOREIGN_PORT_MESSAGE: &str = "連接埠被其他程式佔用了: 在這台電腦上回應的不是本程式的服務 (很可能是舊版 AI寶.exe 還開著)。請先完全關閉舊版 AI寶 — 只關主視窗還不夠, 要到工作管理員結束 AI寶.exe, 或在舊版的瀏覽器控制台頁面關閉後確認程式已結束 — 再重新開啟本程式。";
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PortState {
+    Free,
+    Own,
+    Foreign,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineState {
     NotStarted,
@@ -116,17 +126,53 @@ impl EngineManager {
         http_status(CORE_PORT, "/").is_some() && http_status(HELPER_PORT, "/api/status").is_some()
     }
 
+    /// 3790 上的是不是「新版」helper: /api/status 必須帶 service 身分標記。
+    /// 為什麼要驗: 舊版 AI寶.exe (網頁版) 的 helper 也佔同一個 3790 埠、也有 /api/status,
+    /// 但沒有 /api/list-models、測試連線還是舊邏輯 — 不驗身分就會把舊的當成自己的,
+    /// 使用者按「取得可用模型」得到 HTTP 404、按「測試連線」被舊邏輯誤判 (2026-10-20 老吳實機踩到)。
+    fn helper_is_ours() -> bool {
+        match http_get_text(HELPER_PORT, "/api/status") {
+            Some(text) => serde_json::from_str::<serde_json::Value>(&text)
+                .map(|v| v.get("service").and_then(|s| s.as_str()) == Some("aibao-helper"))
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// 埠的狀態: 沒人用 / 是新版引擎 / 被別的程式佔用 (多半是舊版 AI寶.exe)。
+    fn probe_ports() -> PortState {
+        let core = http_status(CORE_PORT, "/").is_some();
+        let helper = http_status(HELPER_PORT, "/api/status").is_some();
+        if !core && !helper {
+            return PortState::Free;
+        }
+        if core && Self::helper_is_ours() {
+            return PortState::Own;
+        }
+        PortState::Foreign
+    }
+
     /// 啟動引擎。冪等: 已在跑就直接回報目前狀態。
     pub fn start(&mut self) -> Result<(), String> {
         match self.state {
             EngineState::Running | EngineState::ExternalRunning | EngineState::Starting => return Ok(()),
             _ => {}
         }
-        // 已有引擎在跑 (不是我們啟的): 不重複啟動, 只接管狀態顯示
-        if Self::ports_alive() {
-            self.state = EngineState::ExternalRunning;
-            shell::log_line("偵測到引擎已在執行 (非本程式啟動), 只顯示狀態");
-            return Ok(());
+        // 已有引擎在跑 (不是我們啟的): 先驗身分 — 是新版引擎才接管狀態顯示;
+        // 是外來程式 (多半是舊版 AI寶.exe) 就明確擋下並說明, 不能把舊服務當成自己的用。
+        match Self::probe_ports() {
+            PortState::Own => {
+                self.state = EngineState::ExternalRunning;
+                shell::log_line("偵測到引擎已在執行 (非本程式啟動), 只顯示狀態");
+                return Ok(());
+            }
+            PortState::Foreign => {
+                let msg = FOREIGN_PORT_MESSAGE.to_string();
+                self.state = EngineState::Failed(msg.clone());
+                shell::log_line("偵測到連接埠被外來程式佔用 (身分驗證不符), 已擋下並提示使用者");
+                return Err(msg);
+            }
+            PortState::Free => {}
         }
         let exe = Self::ensure_extracted()?;
         self.state = EngineState::Starting;
@@ -163,9 +209,14 @@ impl EngineManager {
         match self.state {
             EngineState::Starting | EngineState::Running => {
                 if self.proc_exited() {
-                    // 監督者結束但埠還在 = 有別人接手或舊服務還在; 埠不在 = 引擎真的停了
+                    // 監督者結束但埠還在: 要驗身分 — 是新版引擎才算「別人接手」;
+                    // 是外來程式 (舊版 AI寶.exe) 就明確標示, 不能當成自己的引擎顯示。
                     if Self::ports_alive() {
-                        self.state = EngineState::ExternalRunning;
+                        if Self::helper_is_ours() {
+                            self.state = EngineState::ExternalRunning;
+                        } else {
+                            self.state = EngineState::Failed(FOREIGN_PORT_MESSAGE.to_string());
+                        }
                     } else {
                         self.state = EngineState::Failed("引擎已停止 (監督者行程結束)".to_string());
                         self.pid = None;
@@ -173,8 +224,15 @@ impl EngineManager {
                     return;
                 }
                 if self.state == EngineState::Starting && Self::ports_alive() {
-                    self.state = EngineState::Running;
-                    shell::log_line("引擎就緒: 核心 3789 與 helper 3790 皆回應");
+                    if Self::helper_is_ours() {
+                        self.state = EngineState::Running;
+                        shell::log_line("引擎就緒: 核心 3789 與 helper 3790 皆回應 (身分驗證通過)");
+                    } else {
+                        // 雙埠都有回應、但 3790 不是新版 helper: 自己的 helper 綁埠失敗, 埠被外來程式佔用
+                        self.state = EngineState::Failed(FOREIGN_PORT_MESSAGE.to_string());
+                        shell::log_line("引擎啟動時發現連接埠被外來程式佔用 (身分驗證不符)");
+                        return;
+                    }
                 }
                 if self.state == EngineState::Starting {
                     if let Some(t) = self.started_at {
