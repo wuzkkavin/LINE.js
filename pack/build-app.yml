@@ -358,7 +358,7 @@ jobs:
       - name: 殘留情境三組
         shell: pwsh
         run: |
-          $newApp = (Resolve-Path 'dl-app/AI寶.exe').Path
+          $newApp = (Resolve-Path 'dl-app/out/AI寶.exe').Path
           $gen0 = (Resolve-Path 'dl-legacy/gen0-engine.exe').Path
           $gen1 = (Resolve-Path 'dl-legacy/gen1-engine.exe').Path
           $gen2 = (Resolve-Path 'dl-legacy/app-gen2.exe').Path
