@@ -6,7 +6,7 @@ import { dirname } from "node:path";
 import { evaluateTrigger, markAnswered, markTriggered, createTriggerState, localDateKey } from "./trigger.mjs";
 import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, scamVerdictText, scamWarningText, PerMinuteLimiter } from "./scam.mjs";
-import { SECRET_NAMES, DEFAULT_CREATOR_REPLY } from "./config.mjs";
+import { SECRET_NAMES, DEFAULT_CREATOR_REPLY, DEFAULT_ROLE_PROMPT } from "./config.mjs";
 
 const COMPANY_HINTS = ["公司", "華葳", "內部", "規定", "請假", "加班", "影印", "列印", "印表機", "分機", "會議室", "系統", "帳號申請", "福利", "薪資", "考勤", "打卡", "公文", "簽呈", "部門", "同仁", "總公司", "工務所"];
 
@@ -19,6 +19,38 @@ export function limitText(botName) {
 }
 export function kbMissText() {
   return "這個問題我在公司的知識庫裡查不到，所以不敢亂答。建議你問一下資訊部同事，或請管理員把相關文件放進知識庫資料夾，我下次就能回答了。";
+}
+
+// --- 回答範圍段落 (2026-10-21 老吳定案) ---
+// settings.ai.scopePrompt 非空才組段落注入 system prompt; 清空 = 回傳空字串 = 不限制範圍。
+// bot 每則訊息都以當下設定組裝 prompt (handleTrigger 的 s 為即時設定), 改值儲存後下一則即生效, 不需重連。
+export function buildScopeSection(scopePrompt) {
+  const v = typeof scopePrompt === "string" ? scopePrompt.trim() : "";
+  return v ? `回答範圍 (務必遵守):\n${v}` : "";
+}
+
+// --- 回答符號強制清理 (2026-10-21 老吳追加) ---
+// LINE 不渲染 Markdown, prompt 自律不可靠 (實機仍露出 ** 粗體符號), 改由程式在送出前強制清理:
+// 移除 ** 與 __ 粗體標記、行首 # 標題符號改純文字 (保留內容)、表格分隔列整列移除、
+// 其餘含 | 的行改用「・」分隔。只作用於送進群組的 AI 回答文字, 不動知識庫原文與 log。
+export function cleanAnswerText(text) {
+  if (typeof text !== "string") return text;
+  const out = [];
+  for (const rawLine of text.split("\n")) {
+    let line = rawLine;
+    // 表格分隔列 (只含 |、-、: 與空白, 且同時含 | 與 -) 整列刪除
+    if (/^[\s|:-]+$/.test(line) && line.includes("|") && line.includes("-")) continue;
+    // 行首標題符號 (#{1,6}) 移除, 保留文字內容
+    line = line.replace(/^\s{0,3}#{1,6}\s*/, "");
+    // 粗體標記移除 (保留文字內容)
+    line = line.replace(/\*\*/g, "").replace(/__/g, "");
+    // 表格資料列: 去掉頭尾的 |, 中間的 | 換成「・」
+    if (line.includes("|")) {
+      line = line.replace(/^\s*\|/, "").replace(/\|\s*$/, "").replace(/\s*\|\s*/g, "・");
+    }
+    out.push(line);
+  }
+  return out.join("\n");
 }
 
 // --- 長回答交付 (2026-10-20 驗收修復, 老吳新規格) ---
@@ -207,9 +239,17 @@ export class HelperBot {
   }
 
   // 活動紀錄一筆 (第 12 項): kind 見 activitySnapshot 的白話對照; question 只留前 30 字。
-  recordActivity({ kind, m, answerChars = null, ms = null, detail = "" }) {
+  // answerText (2026-10-21): 已回答事件附回答全文供管理介面查閱; 只存記憶體環形緩衝
+  // (不落盤、重啟清空, 與 question 同隱私規格), 超過 2000 字截斷並以 answerTruncated 註明。
+  recordActivity({ kind, m, answerChars = null, ms = null, detail = "", answerText = null }) {
     const now = new Date();
     const p2 = (n) => String(n).padStart(2, "0");
+    let answer = null;
+    let answerTruncated = false;
+    if (typeof answerText === "string" && answerText.length) {
+      answerTruncated = answerText.length > 2000;
+      answer = answerTruncated ? answerText.slice(0, 2000) : answerText;
+    }
     this.activity.unshift({
       at: now.toISOString(),
       // 本機時間字串 (使用者時區): App 面板直接顯示, 不必在殼端做時區換算
@@ -220,6 +260,7 @@ export class HelperBot {
       senderName: m?.senderName ?? "",
       question: typeof m?.text === "string" ? m.text.slice(0, 30) : "",
       answerChars, ms, detail,
+      answer, answerTruncated,
     });
     if (this.activity.length > 50) this.activity.length = 50;
   }
@@ -662,7 +703,7 @@ export class HelperBot {
       markAnswered(this.triggerState);
       this.stats.answered++;
       this.persistDaily();
-      this.recordActivity({ kind: "answered", m, answerChars: reply.length });
+      this.recordActivity({ kind: "answered", m, answerChars: reply.length, answerText: reply });
       const mem0 = this.memory.get(m.channelId) ?? [];
       this.memory.set(m.channelId, [...mem0, { role: "user", content: question }, { role: "assistant", content: reply }].slice(-(s.ai.memoryTurns ?? 6) * 2));
       this.logger?.info("機器人回覆", "已回覆創造者固定答覆 (未呼叫 AI)", { id: m.messageId });
@@ -684,19 +725,25 @@ export class HelperBot {
     const companyLike = COMPANY_HINTS.some((h) => question.includes(h));
     this.logger?.info("知識庫", hits.length ? "知識庫命中" : "知識庫未命中", { id: m.messageId, chunks: hits.map((h) => h.chunkId) });
     if (!hits.length && companyLike) {
-      await this.sendText(m.channelId, kbMissText(), m.messageId).catch(() => {});
+      const missText = kbMissText();
+      await this.sendText(m.channelId, missText, m.messageId).catch(() => {});
       markAnswered(this.triggerState);
       this.stats.answered++;
       this.persistDaily();
-      this.recordActivity({ kind: "answered", m, answerChars: kbMissText().length });
+      this.recordActivity({ kind: "answered", m, answerChars: missText.length, answerText: missText });
       return;
     }
     const mem = this.memory.get(m.channelId) ?? [];
     const nameLine = s.botName ? `你的名字是「${s.botName}」, 同事這樣叫你時就是在叫你。` : "";
     // 人設注入 (第 3 項): 非空欄位逐項寫入 system prompt, 年紀由出生日自動計算, 並附空欄位誠實回答規則
     const personaSection = buildPersonaSection(s.persona);
+    // 回答範圍注入 (2026-10-21): scopePrompt 非空才有段落; 清空 = 不限制範圍 (見 buildScopeSection)
+    const scopeSection = buildScopeSection(s.ai?.scopePrompt);
+    // 角色定位 (2026-10-21 改為可編輯欄位): 以 ai.rolePrompt 取代舊寫死首句, 放在組裝後的最前面;
+    // 欄位異常為空時退回出廠預設 (正常路徑下儲存時已自動回復預設, 這裡是最後防線)。
+    const roleSection = typeof s.ai?.rolePrompt === "string" && s.ai.rolePrompt.trim() ? s.ai.rolePrompt.trim() : DEFAULT_ROLE_PROMPT;
     const messages = [
-      { role: "system", content: `${s.ai.systemPrompt}\n${nameLine}\n${personaSection}\n${LINE_FORMAT_RULE}` },
+      { role: "system", content: `${roleSection}\n${s.ai.systemPrompt}\n${nameLine}${scopeSection ? `\n${scopeSection}` : ""}\n${personaSection}\n${LINE_FORMAT_RULE}` },
       ...mem,
     ];
     if (hits.length) {
@@ -730,6 +777,13 @@ export class HelperBot {
       const sources = [...new Set(hits.map((h) => h.file))];
       answer += `\n\n(參考來源: ${sources.join("、")})`;
     }
+    // 符號強制清理 (2026-10-21 追加 B): 送出前把 ** / ### / 表格符號清掉, 只作用於送進群組的文字;
+    // 對話記憶也存清理後的版本 (群組裡實際看到的那一份)。有變更才記 log (前後字數)。
+    const cleanedAnswer = cleanAnswerText(answer);
+    if (cleanedAnswer !== answer) {
+      this.logger?.info("機器人回覆", "回答符號清理", { id: m.messageId, before: answer.length, after: cleanedAnswer.length });
+      answer = cleanedAnswer;
+    }
     // 交付: 短答覆直接送文字; 超過一則訊息字數上限的長答覆改送文字檔 (deliverAnswer 內處理,
     // 含白話說明與分段兜底), 不再像以前那樣被核心拒收後整則消失或被 AI 額度切成半句。
     const delivery = await this.deliverAnswer(m, answer, question).catch((e) => {
@@ -739,7 +793,7 @@ export class HelperBot {
     const count = markAnswered(this.triggerState);
     this.stats.answered++;
     this.persistDaily();
-    this.recordActivity({ kind: aiFailedKind || "answered", m, answerChars: answer.length, ms: aiMs });
+    this.recordActivity({ kind: aiFailedKind || "answered", m, answerChars: answer.length, ms: aiMs, answerText: aiFailedKind ? null : answer });
     const turns = [...mem, { role: "user", content: question }, { role: "assistant", content: answer }].slice(-(s.ai.memoryTurns ?? 6) * 2);
     this.memory.set(m.channelId, turns);
     this.logger?.info("機器人回覆", "已回覆", { id: m.messageId, chars: answer.length, today: count, kbHits: hits.length, delivery });

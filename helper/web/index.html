@@ -69,6 +69,12 @@ button:disabled { opacity: .55; cursor: wait; }
 .savebar button { background: var(--green); font-size: 16px; padding: 11px 30px; }
 #saveMsg { font-size: 14px; color: var(--dark); }
 pre.log { background: #0d2b21; color: #c9e8d5; border-radius: 12px; padding: 12px; font-size: 12px; max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+.chatrow { display: flex; align-items: center; gap: 10px; padding: 8px 2px; border-bottom: 1px solid var(--line); }
+.chatrow .cname { font-weight: 600; font-size: 14.5px; }
+.chatrow .csub { font-size: 12.5px; color: var(--muted); margin-top: 1px; }
+.chatrow .caction { margin-left: auto; flex: none; min-width: 108px; text-align: right; }
+.chatrow .caction button { min-width: 100px; }
+.chatrow .cbadge { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12.5px; background: var(--green-soft); color: var(--dark); border: 1px solid #bfe6cd; }
 .checkline { display: flex; gap: 8px; align-items: center; margin-top: 12px; font-size: 14.5px; color: var(--ink); }
 .checkline input { width: 18px; height: 18px; accent-color: var(--green); }
 a.btn { text-decoration: none; }
@@ -209,6 +215,12 @@ a.btn { text-decoration: none; }
     <div class="hint">三家都填了 Key 也可以, 用哪一家由下面的單選決定。Key 只存在這台電腦的機密存放區, 不會寫進設定檔, 也不會顯示出來 (只看得到末 4 碼)。</div>
     <div id="providers"></div>
     <label class="checkline"><input type="checkbox" id="aiFallback"> 啟用自動備援 (使用中的 AI 失敗時, 自動改用下一家)</label>
+    <label for="rolePrompt">角色定位</label>
+    <textarea id="rolePrompt" style="min-height:64px"></textarea>
+    <div class="hint">清空後儲存，會自動回復成出廠預設的角色定位。例：也可以改成「你是華葳集成的資訊小老師，專門陪同事學電腦」這類你想要的身分描述。</div>
+    <label for="scopePrompt">回答範圍</label>
+    <textarea id="scopePrompt"></textarea>
+    <div class="hint">清空這個欄位＝不限制範圍，什麼問題都回答。例：也可以改成「離題問題只簡短回答一句，並提醒對方你主要負責電腦學習協助」這類比較寬鬆的寫法。</div>
     <label for="systemPrompt">回答規則 (系統提示詞)</label>
     <textarea id="systemPrompt"></textarea>
   </section>
@@ -357,6 +369,8 @@ async function loadAll() {
   $("lineKeyState").textContent = s.line?.set ? `已設定 (末 4 碼 ${s.line.last4}), 要更換直接在左邊欄位輸入新 Token 按儲存` : "尚未設定, 請先完成步驟一、二, 再回來產生 Token";
   loadLineCfg();
   $("aiFallback").checked = !!s.ai.fallback;
+  $("rolePrompt").value = s.ai.rolePrompt || "";
+  $("scopePrompt").value = s.ai.scopePrompt || "";
   $("systemPrompt").value = s.ai.systemPrompt || "";
   $("scamEnabled").checked = !!s.scam.enabled;
   $("scamThreshold").value = s.scam.threshold;
@@ -423,7 +437,30 @@ async function loadLineCfg() {
   } catch { $("lineCfgState").textContent = "白名單狀態讀取失敗, 請重新整理頁面"; }
   loadWhitelist();
 }
-// 已儲存白名單逐筆清單 + 移除 (修復項 8): 名稱由後端對照核心快照解析, 讀不到名稱就顯示 ID 並註明。
+// 共用列式排版 (2026-10-21 版面整理): 左側名稱 + 類型・人數小字, 右側固定欄位放按鈕;
+// 畫面不顯示原始 chat ID, 名稱讀不到就顯示「未命名群組」。
+function chatRowEl(c) {
+  const row = document.createElement("div");
+  row.className = "chatrow";
+  const main = document.createElement("div");
+  const name = document.createElement("div");
+  name.className = "cname";
+  name.textContent = c.nameResolved && c.name && c.name !== "(未命名)" ? c.name : "未命名群組";
+  const sub = document.createElement("div");
+  sub.className = "csub";
+  if (c.nameResolved) {
+    const kind = ({ group: "群組", room: "聊天室", square: "社群" })[c.kind] || "聊天室";
+    sub.textContent = c.memberCount ? `${kind}・${c.memberCount} 人` : kind;
+  } else {
+    sub.textContent = "名稱與資料待讀取";
+  }
+  main.append(name, sub);
+  const action = document.createElement("div");
+  action.className = "caction";
+  row.append(main, action);
+  return { row, action };
+}
+// 已儲存白名單逐筆清單 + 移除: 名稱/類型/人數由後端對照核心快照解析, 讀不到名稱顯示「未命名群組」。
 async function loadWhitelist() {
   const box = $("wlList");
   if (!box) return;
@@ -437,11 +474,7 @@ async function loadWhitelist() {
     title.textContent = "目前白名單 (已儲存):";
     box.appendChild(title);
     for (const c of r.chats) {
-      const row = document.createElement("div");
-      row.className = "hint";
-      const label = c.nameResolved && c.name ? `${c.name} (${c.id})` : `${c.id} (名稱待讀取: 核心清單讀不到時先顯示代號)`;
-      const span = document.createElement("span");
-      span.textContent = label + " ";
+      const { row, action } = chatRowEl(c);
       const b = document.createElement("button");
       b.type = "button"; b.className = "ghost"; b.textContent = "移除";
       b.addEventListener("click", async () => {
@@ -454,7 +487,7 @@ async function loadWhitelist() {
         } catch { $("whitelistMsg").textContent = "移除失敗: 連不上控制台服務"; $("whitelistMsg").style.color = "var(--err)"; }
         b.disabled = false;
       });
-      row.append(span, b);
+      action.appendChild(b);
       box.appendChild(row);
     }
   } catch { box.innerHTML = ""; }
@@ -503,7 +536,7 @@ function collect() {
       maritalStatus: $("personaMaritalStatus").value.trim(),
       intro: $("personaIntro").value.trim(),
     },
-    ai: { active: document.querySelector("input[name=aiActive]:checked")?.value || "openai", fallback: $("aiFallback").checked, providers, systemPrompt: $("systemPrompt").value },
+    ai: { active: document.querySelector("input[name=aiActive]:checked")?.value || "openai", fallback: $("aiFallback").checked, providers, rolePrompt: $("rolePrompt").value, scopePrompt: $("scopePrompt").value, systemPrompt: $("systemPrompt").value },
     scam: { enabled: $("scamEnabled").checked, threshold: Number($("scamThreshold").value) || 0.8, perMinute: Number($("scamPerMinute").value) || 10, jev: { enabled: $("jevEnabled").checked, model: $("jevModel").value.trim(), ...($("jevKey").value.trim() ? { apiKey: $("jevKey").value.trim() } : {}) } },
     kb: { folder: $("kbFolder").value.trim() },
     log: { debug: $("logDebug").checked, retentionDays: Number($("logRetention").value) || 14 },
@@ -549,21 +582,17 @@ async function loadChats() {
     msg.style.color = r.ok ? "var(--dark)" : "var(--err)";
     if (r.ok) {
       for (const c of r.chats || []) {
-        const row = document.createElement("div");
-        row.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line, #ddd)";
-        const label = document.createElement("span");
-        label.textContent = `${c.name} (${CHAT_KIND_LABEL[c.kind] || c.kind}${c.memberCount ? `・${c.memberCount} 人` : ""})`;
-        row.appendChild(label);
+        const { row, action } = chatRowEl({ ...c, nameResolved: true });
         if (c.whitelisted) {
           const badge = document.createElement("span");
+          badge.className = "cbadge";
           badge.textContent = "已在白名單";
-          badge.style.color = "var(--dark)";
-          row.appendChild(badge);
+          action.appendChild(badge);
         } else {
           const b = document.createElement("button");
           b.type = "button"; b.className = "ghost"; b.textContent = "加入白名單";
           b.onclick = async () => { b.disabled = true; await applyWhitelist(c.id, msg); };
-          row.appendChild(b);
+          action.appendChild(b);
         }
         box.appendChild(row);
       }

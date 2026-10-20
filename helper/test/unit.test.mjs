@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Logger } from "../src/logger.mjs";
 import { FileSecretStore, MemorySecretStore, WindowsSecretStore, createSecretStore, maskSecret } from "../src/secrets.mjs";
-import { SettingsStore, SECRET_NAMES, DEFAULT_CREATOR_REPLY } from "../src/config.mjs";
+import { SettingsStore, SECRET_NAMES, DEFAULT_CREATOR_REPLY, DEFAULT_SCOPE_PROMPT, DEFAULT_ROLE_PROMPT, DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT } from "../src/config.mjs";
 import { createAiClient, DEFAULT_LIST_MODELS_TIMEOUT_MS } from "../src/ai.mjs";
 import { createTriggerState, evaluateTrigger, markAnswered, markTriggered, localDateKey } from "../src/trigger.mjs";
 import { KnowledgeBase } from "../src/kb.mjs";
@@ -14,7 +14,7 @@ import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, ruleFallb
 import { createConsoleServer } from "../src/server.mjs";
 import { parseApiSection, applyApiConfig, applyCoreApiConfig, readCoreApiStatus, isValidChatId } from "../src/linecfg.mjs";
 import { MessageSenderRegistry } from "../src/msgregistry.mjs";
-import { HelperBot, isCreatorIntent, calculateAge, buildPersonaSection, QUOTE_HISTORY_PAGES, answerFilename, splitLongText, TEXT_SEND_LIMIT, LINE_FORMAT_RULE } from "../src/bot.mjs";
+import { HelperBot, isCreatorIntent, calculateAge, buildPersonaSection, buildScopeSection, cleanAnswerText, QUOTE_HISTORY_PAGES, answerFilename, splitLongText, TEXT_SEND_LIMIT, LINE_FORMAT_RULE } from "../src/bot.mjs";
 import { coreEndpoints, fetchCoreChannels, shapeChatList } from "../src/corechats.mjs";
 import { WebSocketServer } from "ws";
 import { createAiClient as aiFactory } from "../src/ai.mjs";
@@ -678,8 +678,8 @@ test("console: /api/line/whitelist 列出白名單 (名稱解析/核心不可用
   assert.equal(wl.ok, true);
   assert.equal(wl.coreAvailable, true);
   assert.equal(wl.chats.length, 2);
-  assert.deepEqual(wl.chats[0], { id: gid, name: "已解析的群", nameResolved: true });
-  assert.deepEqual(wl.chats[1], { id: gid2, name: null, nameResolved: false });
+  assert.deepEqual(wl.chats[0], { id: gid, name: "已解析的群", nameResolved: true, kind: "group", memberCount: 3 });
+  assert.deepEqual(wl.chats[1], { id: gid2, name: null, nameResolved: false, kind: null, memberCount: null });
 
   // 核心不可用: 清單照樣列出, 名稱全降級為 ID
   behavior = { status: "unreachable" };
@@ -1243,4 +1243,140 @@ test("activity: /api/bot/activity 回傳新到舊、上限 50、欄位完整 (�
   assert.equal(r.events[0].senderName, "同事55");
   assert.equal(r.status.answeredToday, 0);
   assert.equal(typeof r.status.dailyLimit, "number");
+});
+
+test("activity: 回答全文欄位 (已回答帶 answer; 超過 2000 字截斷註明; 未回答為 null)", async () => {
+  const dir = await tmp();
+  const logger = new Logger({ dir: join(dir, "logs") });
+  const settings = new SettingsStore({ path: join(dir, "settings.json"), logger });
+  const bot = new HelperBot({ settings, secrets: new MemorySecretStore(), ai: createAiClient({}), logger });
+  bot.recordActivity({ kind: "answered", m: { channelId: "c1", senderName: "甲", text: "問題一" }, answerText: "答".repeat(2500) });
+  bot.recordActivity({ kind: "answered", m: { channelId: "c1", senderName: "乙", text: "問題二" }, answerText: "短回答" });
+  bot.recordActivity({ kind: "cooldown", m: { channelId: "c1", senderName: "丙", text: "問題三" } });
+  const snap = bot.activitySnapshot(); // 新到舊
+  assert.equal(snap[0].kind, "cooldown");
+  assert.equal(snap[0].answer, null, "未回答事件不帶回答");
+  assert.equal(snap[0].answerTruncated, false);
+  assert.equal(snap[1].answer, "短回答");
+  assert.equal(snap[1].answerTruncated, false);
+  assert.equal(snap[2].answer.length, 2000, "回答全文上限 2000 字");
+  assert.equal(snap[2].answerTruncated, true, "截斷要註明");
+});
+
+test("bot: 已回答事件的 answer 是實際送出的回答; 只打名字的引導事件沒有 answer (e2e)", async (t) => {
+  const h = await startBotHarness(t);
+  h.inject("a1", "u-a1", "AI寶，什麼是 VPN？");
+  await h.waitSent((f) => f.replyTo === "a1", "answer");
+  const answered = await waitUntilUnit(() => h.bot.activitySnapshot().find((a) => a.kind === "answered"), 4000, "answered activity");
+  assert.equal(answered.answer, "這是一般回答。");
+  h.inject("a2", "u-a2", "AI寶");
+  await h.waitSent((f) => f.replyTo === "a2", "guidance");
+  const guide = await waitUntilUnit(() => h.bot.activitySnapshot().find((a) => a.kind === "name_only"), 4000, "name_only activity");
+  assert.equal(guide.answer, null);
+});
+
+test("bot: 回答範圍三態 (預設含出廠段落 / 改值下一則即生效 / 清空不注入且其他段落不受影響)", async (t) => {
+  const h = await startBotHarness(t, { settingsOver: { triggerMode: "relaxed", cooldownSec: 0 } });
+  const ask = async (id, sender) => {
+    h.inject(id, sender, "AI寶，請問 VPN 怎麼連？");
+    await h.waitSent((f) => f.replyTo === id, id);
+    return h.aiBodies.at(-1).messages.find((x) => x.role === "system").content;
+  };
+  let sys = await ask("s1", "u-s1");
+  assert.ok(sys.includes("回答範圍 (務必遵守):"), "預設應有範圍段落標題");
+  assert.ok(sys.includes(DEFAULT_SCOPE_PROMPT), "預設應含出廠範圍文字逐字");
+  h.settings.update({ ai: { scopePrompt: "只能回答 Excel 的問題。" } });
+  sys = await ask("s2", "u-s2");
+  assert.ok(sys.includes("只能回答 Excel 的問題。"), "改值後下一則訊息即用新值 (免重連)");
+  assert.ok(!sys.includes(DEFAULT_SCOPE_PROMPT), "舊範圍文字不應殘留");
+  h.settings.update({ ai: { scopePrompt: "" } });
+  assert.equal(h.settings.get().ai.scopePrompt, "", "範圍清空要保留空字串 (不可被回復預設)");
+  sys = await ask("s3", "u-s3");
+  assert.ok(!sys.includes("回答範圍 (務必遵守):"), "清空後不注入範圍段落");
+  assert.ok(sys.includes(LINE_FORMAT_RULE), "格式規則段落不受影響");
+  assert.ok(sys.includes("你的個人設定:"), "人設段落不受影響");
+  assert.equal(buildScopeSection(""), "");
+  assert.equal(buildScopeSection("  "), "");
+});
+
+test("bot: 角色定位三態 (預設在最前面 / 自訂取代 / 清空儲存自動回復預設) 且與範圍、人設、格式並存", async (t) => {
+  const h = await startBotHarness(t, { settingsOver: { triggerMode: "relaxed", cooldownSec: 0 } });
+  const ask = async (id, sender) => {
+    h.inject(id, sender, "AI寶，請問 VPN 怎麼連？");
+    await h.waitSent((f) => f.replyTo === id, id);
+    return h.aiBodies.at(-1).messages.find((x) => x.role === "system").content;
+  };
+  let sys = await ask("r1", "u-r1");
+  assert.ok(sys.startsWith(DEFAULT_ROLE_PROMPT), "出廠角色定位應在組裝後的最前面");
+  assert.equal(sys.split(DEFAULT_ROLE_PROMPT).length - 1, 1, "角色定位只出現一次 (沒有跟舊首句重複)");
+  assert.ok(sys.includes(DEFAULT_SCOPE_PROMPT), "範圍段落並存");
+  assert.ok(sys.includes("你的個人設定:"), "人設段落並存");
+  assert.ok(sys.includes(LINE_FORMAT_RULE), "格式規則並存");
+  assert.ok(sys.includes("一律用繁體中文"), "其餘既有規則行不變");
+  h.settings.update({ ai: { rolePrompt: "你是測試用的小老師，專門陪同事學 Excel。" } });
+  sys = await ask("r2", "u-r2");
+  assert.ok(sys.startsWith("你是測試用的小老師，專門陪同事學 Excel。"), "自訂角色定位取代預設");
+  assert.ok(!sys.includes(DEFAULT_ROLE_PROMPT), "預設角色定位不應殘留");
+  h.settings.update({ ai: { rolePrompt: "" } });
+  assert.equal(h.settings.get().ai.rolePrompt, DEFAULT_ROLE_PROMPT, "清空儲存後自動回復出廠預設");
+  sys = await ask("r3", "u-r3");
+  assert.ok(sys.startsWith(DEFAULT_ROLE_PROMPT), "回復預設後組裝結果回到出廠角色定位");
+});
+
+test("config: 角色定位拆分遷移 (舊出廠全文 / 首句後改過 / 全自訂不動 / 新版存檔不遷移)", async () => {
+  const { writeFileSync } = await import("node:fs");
+  // 1) 舊出廠全文: 首句拆到 rolePrompt, systemPrompt 只留其餘規則行
+  const d1 = await tmp(); const p1 = join(d1, "settings.json");
+  writeFileSync(p1, JSON.stringify({ ai: { systemPrompt: LEGACY_DEFAULT_SYSTEM_PROMPT } }));
+  const s1 = new SettingsStore({ path: p1 });
+  assert.equal(s1.get().ai.rolePrompt, DEFAULT_ROLE_PROMPT);
+  assert.equal(s1.get().ai.systemPrompt, DEFAULT_SYSTEM_PROMPT);
+  // 2) 以出廠首句開頭、後面被改過: 只拆首句, 其餘逐字保留
+  const d2 = await tmp(); const p2 = join(d2, "settings.json");
+  writeFileSync(p2, JSON.stringify({ ai: { systemPrompt: DEFAULT_ROLE_PROMPT + "\n自訂規則第一行\n自訂規則第二行" } }));
+  const s2 = new SettingsStore({ path: p2 });
+  assert.equal(s2.get().ai.rolePrompt, DEFAULT_ROLE_PROMPT);
+  assert.equal(s2.get().ai.systemPrompt, "自訂規則第一行\n自訂規則第二行");
+  // 3) 全自訂 (不含出廠首句): systemPrompt 逐字不動, rolePrompt 補出廠預設
+  const d3 = await tmp(); const p3 = join(d3, "settings.json");
+  const fullCustom = "完全自訂的提示詞\n第二行也是自訂";
+  writeFileSync(p3, JSON.stringify({ ai: { systemPrompt: fullCustom } }));
+  const s3 = new SettingsStore({ path: p3 });
+  assert.equal(s3.get().ai.systemPrompt, fullCustom, "全自訂內容不得被覆蓋或刪減");
+  assert.equal(s3.get().ai.rolePrompt, DEFAULT_ROLE_PROMPT);
+  // 4) 新版存檔已有 rolePrompt: 不遷移, 兩欄都照存檔
+  const d4 = await tmp(); const p4 = join(d4, "settings.json");
+  writeFileSync(p4, JSON.stringify({ ai: { rolePrompt: "我的角色", systemPrompt: LEGACY_DEFAULT_SYSTEM_PROMPT } }));
+  const s4 = new SettingsStore({ path: p4 });
+  assert.equal(s4.get().ai.rolePrompt, "我的角色");
+  assert.equal(s4.get().ai.systemPrompt, LEGACY_DEFAULT_SYSTEM_PROMPT);
+});
+
+test("bot: cleanAnswerText 清掉粗體/標題/表格符號且內容完整保留", () => {
+  const dirty = "### 連線步驟\n先打開 **設定** 頁面，再按 __連線__。\n| 項目 | 內容 |\n|---|---|\n| 伺服器 | vpn.example.com |\n一般文字裡的 # 字元不在行首，不動它";
+  const clean = cleanAnswerText(dirty);
+  assert.ok(!clean.includes("**"), "不得殘留 **");
+  assert.ok(!clean.includes("__"), "不得殘留 __");
+  assert.ok(!clean.includes("|"), "不得殘留 |");
+  assert.ok(!clean.includes("###"), "不得殘留 ###");
+  assert.ok(!clean.includes("|---|---|"), "表格分隔列整列移除");
+  assert.ok(clean.startsWith("連線步驟"), "標題改純文字保留內容");
+  assert.ok(clean.includes("先打開 設定 頁面，再按 連線。"));
+  assert.ok(clean.includes("伺服器・vpn.example.com"), "表格列改用 ・ 分隔");
+  assert.ok(clean.includes("一般文字裡的 # 字元不在行首，不動它"), "行內 # 不誤傷");
+  assert.equal(cleanAnswerText("普通回答，沒有符號。"), "普通回答，沒有符號。", "無符號文字原樣通過");
+});
+
+test("bot: AI 回答含 Markdown 符號時, 實際送出的文字已強制清理 (e2e)", async (t) => {
+  const md = "### 回答\n這是 **重點** 說明。\n| A | B |\n|---|---|\n| 1 | 2 |";
+  const h = await startBotHarness(t, { aiHandler: () => ({ body: { model: "stub", choices: [{ message: { role: "assistant", content: md } }] } }) });
+  h.inject("c1", "u-c1", "AI寶，請問怎麼設定？");
+  const sent = await h.waitSent((f) => f.replyTo === "c1", "cleaned answer");
+  assert.ok(!sent.text.includes("**"), "送出文字不得含 **");
+  assert.ok(!sent.text.includes("|"), "送出文字不得含 |");
+  assert.ok(!sent.text.includes("#"), "送出文字不得含 #");
+  assert.ok(sent.text.includes("重點"), "內容保留");
+  assert.ok(sent.text.includes("1・2"), "表格內容以 ・ 保留");
+  const ev = await waitUntilUnit(() => h.bot.activitySnapshot().find((a) => a.kind === "answered"), 4000, "answered activity");
+  assert.equal(ev.answer, sent.text, "活動紀錄的 answer 是清理後實際送出的文字");
 });

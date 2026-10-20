@@ -214,7 +214,10 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         // 已儲存白名單逐筆列出 (修復項 8): 只給計數看不到內容、不能管理; 名稱用核心快照對照解析,
         // 核心讀不到時退回只給 ID 並標記 nameResolved=false, 清單本身永遠要列得出來。
         const status = readCoreApiStatus(line);
-        let nameById = new Map();
+        // 名稱連同類型/人數一起解析 (2026-10-21 版面整理): 資料本來就在同一份核心快照裡,
+        // 舊版只留名稱、把 kind/memberCount 丟掉, 介面只能顯示 ID 補位; 現在三欄一起帶,
+        // 純呈現擴充, 白名單的讀寫路徑與行為不變。
+        let infoById = new Map();
         let coreAvailable = false;
         try {
           const r = line.fetchChats
@@ -222,14 +225,19 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
             : await fetchCoreChannels({ lineApiUrl: settings.get().lineApiUrl });
           if (r.status === "ok") {
             coreAvailable = true;
-            for (const c of shapeChatList(r.channels, [])) nameById.set(c.id, c.name);
+            for (const c of shapeChatList(r.channels, [])) infoById.set(c.id, c);
           }
         } catch { /* 核心不可用: 名稱留空, 清單照樣回 */ }
-        const chats = (status.chats ?? []).map((id) => ({
-          id,
-          name: nameById.get(id) ?? null,
-          nameResolved: nameById.has(id),
-        }));
+        const chats = (status.chats ?? []).map((id) => {
+          const info = infoById.get(id);
+          return {
+            id,
+            name: info?.name ?? null,
+            nameResolved: !!info,
+            kind: info?.kind ?? null,
+            memberCount: info?.memberCount ?? null,
+          };
+        });
         return json(res, 200, { ok: true, apiEnabled: status.apiEnabled, coreAvailable, chats });
       }
       if (req.method === "POST" && path === "/api/line/config-apply") {
