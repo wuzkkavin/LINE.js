@@ -101,10 +101,16 @@ a.btn { text-decoration: none; }
     <div class="hint">打開核心登入頁, 用手機 LINE 掃畫面上的 QR 碼, 再輸入畫面上的 PIN 碼。<strong>一定要用次要帳號登入, 不要用主帳號。</strong></div>
     <div style="margin-top:8px"><a class="btn" href="http://127.0.0.1:3789/" target="_blank" rel="noopener"><button type="button">開啟核心登入頁</button></a></div>
     <h3>步驟二: 把機器人加入群組, 並把群組加入白名單</h3>
-    <div class="hint">先在手機 LINE 把剛登入的次要帳號邀請進要使用 AI寶 的群組。接著打開核心頁面, 點進那個群組的聊天室, 用頁面上的「複製聊天室 ID」功能複製群組 ID, 貼到下面欄位, 按「加入白名單並啟用 API」。</div>
-    <label for="chatIdInput">群組 ID (聊天室 ID)</label>
-    <input type="text" id="chatIdInput" placeholder="範例:c0123456789abcdef0123456789abcdef" autocomplete="off">
-    <div style="margin-top:8px"><button type="button" class="ghost" id="btnWhitelist">加入白名單並啟用 API</button><span class="test-result" id="whitelistMsg"></span></div>
+    <div class="hint">先在手機 LINE 把剛登入的次要帳號邀請進要使用 AI寶 的群組。然後回來按「讀取我的群組清單」, 群組會自己列出來, 用點的加入白名單就好, 不用自己找代號。</div>
+    <div style="margin-top:8px"><button type="button" class="ghost" id="btnLoadChats">讀取我的群組清單</button><span class="test-result" id="chatsMsg"></span></div>
+    <div id="chatList" style="margin-top:8px"></div>
+    <details style="margin-top:10px">
+      <summary>進階: 手動貼上群組 ID (清單讀不到時才需要)</summary>
+      <div class="hint">備用方法: 在核心頁面點進群組的聊天室, 用「複製聊天室 ID」取得 ID 後貼到這裡。</div>
+      <label for="chatIdInput">群組 ID (聊天室 ID)</label>
+      <input type="text" id="chatIdInput" placeholder="範例:c0123456789abcdef0123456789abcdef" autocomplete="off">
+      <div style="margin-top:8px"><button type="button" class="ghost" id="btnWhitelist">加入白名單並啟用 API</button><span class="test-result" id="whitelistMsg"></span></div>
+    </details>
     <div class="hint" id="lineCfgState">白名單狀態讀取中…</div>
     <div class="hint">白名單改好之後, 要把 AI寶 <strong>完全關閉再重新開啟</strong>才會生效; 重開後再繼續步驟三。</div>
     <h3>步驟三: 取得機器人 Token</h3>
@@ -413,15 +419,53 @@ $("btnKb").onclick = async () => {
   $("kbMsg").textContent = r.message || "";
   loadAll();
 };
-$("btnWhitelist").onclick = async () => {
-  const btn = $("btnWhitelist"); btn.disabled = true;
-  const msg = $("whitelistMsg"); msg.textContent = "處理中…"; msg.style.color = "";
+async function applyWhitelist(chatId, msg) {
+  msg.textContent = "處理中…"; msg.style.color = "";
   try {
-    const r = await (await fetch("/api/line/config-apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chatId: $("chatIdInput").value.trim() }) })).json();
+    const r = await (await fetch("/api/line/config-apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chatId }) })).json();
     msg.textContent = r.message || "";
     msg.style.color = r.ok ? "var(--dark)" : "var(--err)";
-    if (r.ok) loadLineCfg();
-  } catch { msg.textContent = "處理失敗: 連不上控制台服務, 請重新整理頁面"; msg.style.color = "var(--err)"; }
+    if (r.ok) { loadLineCfg(); loadChats(); }
+    return r.ok;
+  } catch { msg.textContent = "處理失敗: 連不上控制台服務, 請重新整理頁面"; msg.style.color = "var(--err)"; return false; }
+}
+const CHAT_KIND_LABEL = { group: "群組", room: "聊天室", square: "社群" };
+async function loadChats() {
+  const btn = $("btnLoadChats"); btn.disabled = true;
+  const msg = $("chatsMsg"); msg.textContent = "讀取中… (需要幾秒鐘)"; msg.style.color = "";
+  const box = $("chatList"); box.innerHTML = "";
+  try {
+    const r = await (await fetch("/api/line/chats")).json();
+    msg.textContent = r.message || "";
+    msg.style.color = r.ok ? "var(--dark)" : "var(--err)";
+    if (r.ok) {
+      for (const c of r.chats || []) {
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line, #ddd)";
+        const label = document.createElement("span");
+        label.textContent = `${c.name} (${CHAT_KIND_LABEL[c.kind] || c.kind}${c.memberCount ? `・${c.memberCount} 人` : ""})`;
+        row.appendChild(label);
+        if (c.whitelisted) {
+          const badge = document.createElement("span");
+          badge.textContent = "已在白名單";
+          badge.style.color = "var(--dark)";
+          row.appendChild(badge);
+        } else {
+          const b = document.createElement("button");
+          b.type = "button"; b.className = "ghost"; b.textContent = "加入白名單";
+          b.onclick = async () => { b.disabled = true; await applyWhitelist(c.id, msg); };
+          row.appendChild(b);
+        }
+        box.appendChild(row);
+      }
+    }
+  } catch { msg.textContent = "讀取失敗: 連不上控制台服務, 請重新整理頁面"; msg.style.color = "var(--err)"; }
+  btn.disabled = false;
+}
+$("btnLoadChats").onclick = loadChats;
+$("btnWhitelist").onclick = async () => {
+  const btn = $("btnWhitelist"); btn.disabled = true;
+  await applyWhitelist($("chatIdInput").value.trim(), $("whitelistMsg"));
   btn.disabled = false;
 };
 $("btnLineKeySave").onclick = async () => {

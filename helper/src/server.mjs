@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { PROVIDER_DEFAULTS, SECRET_NAMES } from "./config.mjs";
 import { maskSecret } from "./secrets.mjs";
 import { applyCoreApiConfig, detectPackaged, readCoreApiStatus, runCliToken } from "./linecfg.mjs";
+import { fetchCoreChannels, shapeChatList } from "./corechats.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(here, "..", "web");
@@ -60,6 +61,7 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
     repoRoot: lineEnv?.repoRoot ?? join(here, "..", ".."),
     packaged: lineEnv?.packaged ?? detectPackaged(),
     generateToken: lineEnv?.generateToken ?? (() => runCliToken({})),
+    fetchChats: lineEnv?.fetchChats ?? null, // 測試可注入假的; null 表示用真的核心網頁通道
   };
   async function reconnectBot() {
     if (!bot) return;
@@ -157,6 +159,32 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
       }
       if (req.method === "GET" && path === "/api/line/config-status") {
         return json(res, 200, { ok: true, ...readCoreApiStatus(line) });
+      }
+      if (req.method === "GET" && path === "/api/line/chats") {
+        // 用選的加入白名單: 透過核心網頁通道讀已登入帳號的聊天室清單 (corechats.mjs), 合併白名單狀態。
+        const status = readCoreApiStatus(line);
+        const r = line.fetchChats
+          ? await line.fetchChats()
+          : await fetchCoreChannels({ lineApiUrl: settings.get().lineApiUrl });
+        if (r.status === "not-logged-in") {
+          return json(res, 200, { ok: false, code: "NOT_LOGGED_IN", message: "LINE 還沒有登入完成。請先完成 LINE 登入 (用次要帳號掃 QR), 再回來讀取群組清單。" });
+        }
+        if (r.status === "unreachable") {
+          return json(res, 200, { ok: false, code: "CORE_UNREACHABLE", message: "連不上 LINE 核心服務。請確認 AI寶 引擎正在執行, 等幾秒再試一次。" });
+        }
+        if (r.status !== "ok") {
+          return json(res, 200, { ok: false, code: "CORE_TIMEOUT", message: "等核心回應等太久了。請稍等幾秒, 再按一次「讀取我的群組清單」。" });
+        }
+        const chats = shapeChatList(r.channels, status.chats);
+        logger?.info("設定", "LINE 群組清單讀取", { count: chats.length });
+        return json(res, 200, {
+          ok: true,
+          apiEnabled: status.apiEnabled,
+          chats,
+          message: chats.length
+            ? `讀到了 ${chats.length} 個群組/聊天室, 點你要用的那個按「加入白名單」。`
+            : "這個帳號目前還沒有加入任何群組。請先用手機 LINE 把這個次要帳號邀請進你要用的群組, 再回來按一次「讀取我的群組清單」。",
+        });
       }
       if (req.method === "POST" && path === "/api/line/config-apply") {
         const body = await readBody(req);

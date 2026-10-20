@@ -14,6 +14,8 @@ import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, ruleFallb
 import { createConsoleServer } from "../src/server.mjs";
 import { parseApiSection, applyApiConfig, applyCoreApiConfig, readCoreApiStatus, isValidChatId } from "../src/linecfg.mjs";
 import { HelperBot } from "../src/bot.mjs";
+import { coreEndpoints, fetchCoreChannels, shapeChatList } from "../src/corechats.mjs";
+import { WebSocketServer } from "ws";
 import { createAiClient as aiFactory } from "../src/ai.mjs";
 
 async function tmp() { return mkdtemp(join(tmpdir(), "helper-unit-")); }
@@ -422,4 +424,112 @@ test("console: 設定 API 遮罩、頁面有粉圓字體與動態標題, 診斷�
   const fontRes = await fetch(base + "/assets/font.ttf");
   assert.equal(fontRes.status, 200);
   assert.ok((await fontRes.arrayBuffer()).byteLength > 1000000);
+});
+
+test("corechats: 網頁通道讀清單 (假核心): refresh 後的新清單優先, shape 過濾個人並標白名單", async (t) => {
+  const gid = "c" + "a".repeat(32);
+  const rid = "r" + "d".repeat(32);
+  const uid = "u" + "e".repeat(32);
+  const snap1 = [{ channelId: gid, kind: "group", name: "舊快照", memberCount: 3 }];
+  const snap2 = [
+    { channelId: uid, kind: "user", name: "路人甲" },
+    { channelId: rid, kind: "room", name: "多人聊天室" },
+    { channelId: gid, kind: "group", name: "公司測試群", memberCount: 5 },
+  ];
+  let sawCookie = false;
+  const http = createServer((req, res) => {
+    res.writeHead(200, { "Set-Cookie": "linejs_browser=stubcookie; Path=/; HttpOnly", "Content-Type": "text/html" });
+    res.end("<html>stub core</html>");
+  });
+  const wss = new WebSocketServer({ server: http, path: "/ws" });
+  wss.on("connection", (sock, req) => {
+    sawCookie = String(req.headers.cookie ?? "").includes("linejs_browser=stubcookie");
+    const send = (o) => sock.send(JSON.stringify(o));
+    send({ type: "hello", protocol: 2, serverVersion: "stub" });
+    send({ type: "auth:state", state: "ready" });
+    send({ type: "auth:ready", profile: { id: uid, name: "測試帳號" } });
+    send({ type: "channels", channels: snap1 });
+    sock.on("message", (data) => {
+      try {
+        const f = JSON.parse(data.toString());
+        if (f.type === "channels:refresh") send({ type: "channels", channels: snap2 });
+      } catch {}
+    });
+  });
+  await new Promise((r) => http.listen(0, "127.0.0.1", r));
+  t.after(() => { wss.close(); http.close(); });
+  const port = http.address().port;
+  const ep = coreEndpoints(`ws://127.0.0.1:${port}/api/ws`);
+  assert.equal(ep.pageWsUrl, `ws://127.0.0.1:${port}/ws`);
+  assert.equal(ep.authority, `127.0.0.1:${port}`);
+  const r = await fetchCoreChannels({ lineApiUrl: `ws://127.0.0.1:${port}/api/ws`, timeoutMs: 5000, refreshWaitMs: 2500 });
+  assert.equal(r.status, "ok");
+  assert.deepEqual(r.channels, snap2, "應採用 refresh 後送來的第二份清單");
+  assert.equal(sawCookie, true, "連核心網頁通道應帶 linejs_browser cookie");
+  const shaped = shapeChatList(r.channels, [gid]);
+  assert.equal(shaped.length, 2, "個人 (user) 不列入白名單候選");
+  assert.deepEqual(shaped[0], { id: gid, name: "公司測試群", kind: "group", memberCount: 5, whitelisted: true });
+  assert.deepEqual(shaped[1], { id: rid, name: "多人聊天室", kind: "room", memberCount: null, whitelisted: false });
+});
+
+test("corechats: 核心未登入 (auth:state idle) 回 not-logged-in; 連不上回 unreachable", async (t) => {
+  const http = createServer((req, res) => {
+    res.writeHead(200, { "Set-Cookie": "linejs_browser=stubcookie; Path=/" });
+    res.end("ok");
+  });
+  const wss = new WebSocketServer({ server: http, path: "/ws" });
+  wss.on("connection", (sock) => {
+    sock.send(JSON.stringify({ type: "hello", protocol: 2, serverVersion: "stub" }));
+    sock.send(JSON.stringify({ type: "auth:state", state: "idle" }));
+  });
+  await new Promise((r) => http.listen(0, "127.0.0.1", r));
+  t.after(() => { wss.close(); http.close(); });
+  const port = http.address().port;
+  const r1 = await fetchCoreChannels({ lineApiUrl: `ws://127.0.0.1:${port}/api/ws`, timeoutMs: 4000, settleMs: 150 });
+  assert.equal(r1.status, "not-logged-in");
+  // 找一個確定沒人聽的埠: 開了就關
+  const probe = createServer();
+  await new Promise((r) => probe.listen(0, "127.0.0.1", r));
+  const deadPort = probe.address().port;
+  await new Promise((r) => probe.close(r));
+  const r2 = await fetchCoreChannels({ lineApiUrl: `ws://127.0.0.1:${deadPort}/api/ws`, timeoutMs: 3000 });
+  assert.equal(r2.status, "unreachable");
+});
+
+test("console: /api/line/chats 端點 (合併白名單狀態、空清單白話、未登入代碼)", async (t) => {
+  const dir = await tmp();
+  const { writeFileSync } = await import("node:fs");
+  const gid = "c" + "a".repeat(32);
+  const gid2 = "c" + "b".repeat(32);
+  writeFileSync(join(dir, "config.yaml"), `api:\n  enabled: false\n  chats:\n    - ${gid}\n`);
+  const settings = new SettingsStore({ path: join(dir, "settings.json") });
+  const secrets = new MemorySecretStore();
+  const logger = new Logger({ dir: join(dir, "logs") });
+  const ai = createAiClient({});
+  const kb = new KnowledgeBase({ folder: "", indexPath: join(dir, "kb.json"), logger });
+  const bot = new HelperBot({ settings, secrets, ai, kb, logger });
+  let behavior = { status: "ok", channels: [
+    { channelId: gid, kind: "group", name: "已在名單", memberCount: 7 },
+    { channelId: gid2, kind: "group", name: "新群組" },
+  ] };
+  const server = createConsoleServer({ settings, secrets, ai, kb, bot, logger, lineEnv: { dataDir: dir, repoRoot: join(dir, "nope"), packaged: true, fetchChats: async () => behavior } });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const got = await (await fetch(base + "/api/line/chats")).json();
+  assert.equal(got.ok, true);
+  assert.equal(got.apiEnabled, false);
+  assert.equal(got.chats.length, 2);
+  assert.equal(got.chats[0].whitelisted, true);
+  assert.equal(got.chats[1].whitelisted, false);
+  assert.match(got.message, /讀到了 2 個/);
+  behavior = { status: "ok", channels: [] };
+  const empty = await (await fetch(base + "/api/line/chats")).json();
+  assert.equal(empty.ok, true);
+  assert.deepEqual(empty.chats, []);
+  assert.match(empty.message, /邀請/);
+  behavior = { status: "not-logged-in" };
+  const nologin = await (await fetch(base + "/api/line/chats")).json();
+  assert.equal(nologin.ok, false);
+  assert.equal(nologin.code, "NOT_LOGGED_IN");
 });
