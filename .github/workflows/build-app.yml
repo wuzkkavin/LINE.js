@@ -97,6 +97,14 @@ jobs:
         run: |
           $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-probe-data'
           $env:AIBAO_PROBE_OUT = Join-Path $pwd 'probe-result.txt'
+          # 凍結 runtime 回歸情境 (2026-10-20 實機定案): 預置事故形狀的舊 runtime 目錄
+          # (鍵為舊 package 版本字串 1.8.0+0.1.0, 含完成標記與毒化內容)。
+          # 舊版 build 以版本字串為鍵會直接沿用它 → 子行程跑舊碼、探針路由全滅 (紅燈);
+          # 新版以內容雜湊為鍵會忽略並清掉它、解開自己的目錄 (綠燈)。
+          $staleDir = Join-Path $env:HWLINEHELPER_HOME 'runtime/1.8.0+0.1.0'
+          New-Item -ItemType Directory -Force (Join-Path $staleDir 'helper/src') | Out-Null
+          Set-Content -Path (Join-Path $staleDir '.extracted-ok') -Value 'files=1'
+          Set-Content -Path (Join-Path $staleDir 'helper/src/main.mjs') -Value 'STALE-OLD-CODE'
           $exe = (Resolve-Path 'out/AI寶.exe').Path
           $proc = Start-Process -FilePath $exe -ArgumentList '--probe-login' -Wait -PassThru -RedirectStandardOutput probe-stdout.txt -RedirectStandardError probe-stderr.txt
           Write-Host "probe exit code: $($proc.ExitCode)"
@@ -110,6 +118,11 @@ jobs:
           if ($result -notmatch 'helper_test_ai_route=ok') { throw '探針未確認 /api/test-ai 路由存在且邏輯有跑' }
           if ($result -notmatch 'helper_line_chats_route=ok') { throw '探針未確認 /api/line/chats 路由存在且未登入定案正確' }
           if ($result -notmatch 'helper_line_whitelist_route=ok') { throw '探針未確認 /api/line/whitelist 路由存在且回逐筆清單' }
+          # 凍結 runtime 情境的事後斷言: 舊目錄必須被清掉, 且新目錄鍵含內容雜湊
+          if (Test-Path $staleDir) { throw '凍結的舊 runtime 目錄未被清除 (新版引擎仍可能沿用舊碼)' }
+          $runtimeDirs = Get-ChildItem (Join-Path $env:HWLINEHELPER_HOME 'runtime') -Directory | Where-Object { $_.Name -match '\+[0-9a-f]{12}$' }
+          if (-not $runtimeDirs) { throw '未產生內容雜湊鍵的 runtime 目錄' }
+          Write-Host "runtime 目錄 (新版): $($runtimeDirs.Name -join ', ')"
           if ($result -notmatch 'helper_status_identity=True') { throw '探針未確認 helper 身分標記' }
 
       - name: GUI 冒煙 — 啟動、截圖、結束序列

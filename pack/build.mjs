@@ -16,6 +16,7 @@ import { execFile, spawn } from "node:child_process";
 import { cpSync, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import * as esbuild from "esbuild";
@@ -111,7 +112,18 @@ function collectAssets(coreVer, helperVer) {
     copyTree(join(helperDir, "assets", name), join(stagingDir, "helper", "assets", name));
   }
   const files = listFiles(stagingDir).filter((f) => f !== "manifest.json");
-  const manifest = { version: `${coreVer}+${helperVer}`, files };
+  // runtime 版本 = 人類可讀版本 + 全部資產的內容雜湊 (2026-10-20 實機定案的凍結事故修復):
+  // 舊作法只用 package 版本字串 (如 1.8.0+0.1.0) 當 runtime 目錄鍵, 而啟動器看到
+  // .extracted-ok 就不再重解 — package 版本沒變時, 之後每個新版 exe 在使用者機器上
+  // 都繼續跑第一次解開的舊 core/helper 快照 (引用續答、白名單、錯誤白話等修復全數
+  // 「CI 綠、實機紅」就是這樣來的)。改成內容雜湊: 任一資產位元組不同就是新目錄,
+  // 舊目錄由啟動器的 cleanupRuntimeDir 自動清除, 不可能再凍結在舊碼。
+  const hash = createHash("sha256");
+  for (const f of files) {
+    hash.update(f);
+    hash.update(readFileSync(join(stagingDir, ...f.split("/"))));
+  }
+  const manifest = { version: `${coreVer}+${helperVer}+${hash.digest("hex").slice(0, 12)}`, files };
   writeFileSync(join(stagingDir, "manifest.json"), JSON.stringify(manifest, null, 2));
   log(`資產蒐集完成: ${files.length} 個檔案, runtime 版本 ${manifest.version}`);
   return manifest;

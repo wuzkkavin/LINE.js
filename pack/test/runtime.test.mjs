@@ -55,6 +55,27 @@ test("runtime: 三個行程並發 ensureRuntime 同一資料目錄, 全員成功
   assert.equal(readFileSync(join(dataDir, "config.example.yaml"), "utf8"), expectedContent("core/config.example.yaml"));
 });
 
+test("runtime: 資料目錄已有舊版凍結 runtime 時, 新版必須解開新目錄並清掉舊目錄 (2026-10-20 實機凍結事故回歸)", async () => {
+  // 事故形狀: 舊版啟動器以 package 版本字串 (1.8.0+0.1.0) 為 runtime 目錄鍵, 解開一次後
+  // 之後所有新版 exe 都沿用那份舊快照 — 使用者機器上的 helper 凍結在沒有新功能的舊碼,
+  // 修復全數「CI 綠、實機紅」。修法: 目錄鍵改為內容雜湊 (build.mjs), 每份不同內容各自
+  // 一個目錄; 本測試預置事故形狀的舊目錄 (含完成標記與毒化內容), 驗證新版 ensureRuntime
+  // 不重用它、解開自己的目錄、且把舊目錄清掉。
+  const { ensureRuntime, runtimeVersionDir } = await import("../launcher/runtime.mjs");
+  const { makeStubSea } = await import("./fixtures/stub-sea.mjs");
+  const { writeFileSync } = await import("node:fs");
+  const dataDir = mkdtempSync(join(tmpdir(), "aibao-runtime-stale-"));
+  const paths = dataPaths(dataDir);
+  const staleDir = join(paths.runtimeDir, "1.8.0+0.1.0");
+  mkdirSync(join(staleDir, "helper", "src"), { recursive: true });
+  writeFileSync(join(staleDir, ".extracted-ok"), "files=1\n");
+  writeFileSync(join(staleDir, "helper", "src", "main.mjs"), "STALE-OLD-CODE");
+  const versionDir = await ensureRuntime(makeStubSea(), paths, () => {});
+  assert.equal(versionDir, runtimeVersionDir(paths, STUB_VERSION), "應解開目前版本的目錄, 不是舊目錄");
+  assert.equal(readFileSync(join(versionDir, "helper", "src", "main.mjs"), "utf8"), expectedContent("helper/src/main.mjs"));
+  assert.equal(existsSync(staleDir), false, "舊版凍結目錄應被 cleanup 清除");
+});
+
 test("runtime: 再次呼叫 ensureRuntime 走標記快路徑, 結果不變", async () => {
   const dataDir = mkdtempSync(join(tmpdir(), "aibao-runtime-again-"));
   const first = await runWorker(dataDir);
