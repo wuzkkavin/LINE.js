@@ -2,7 +2,7 @@
 
 # LINE.js
 
-A local TypeScript LINE web client that connects to LINE using the pinned [@evex/linejs v3.4.2](https://github.com/evex-dev/linejs/tree/v3.4.2), synchronizes channels and messages over WebSocket, and serves the web interface over HTTP on the same port.
+A local TypeScript LINE web client that connects to LINE using the pinned [@evex/linejs v3.5.0](https://jsr.io/@evex/linejs/3.5.0), synchronizes channels and messages over WebSocket, and serves the web interface over HTTP on the same port.
 
 > Development status: QR login/logout, session reuse, channel lists (friends and chats tabs, profile pictures), live and historical messages, sending text/images/videos/stickers (including pasting images or videos and selecting stickers from owned packs), inline display of received images/GIFs/videos/voice messages, others' read receipts, sending read receipts and unread counts, OpenChat administrator badges, links in messages, system messages (such as 「XX 新增 OO 至群組」 (XX added OO to the group)), a full-screen disconnection overlay, a mobile hamburger menu, the bot API (`/api/ws`), the terminal interface (CLI), and version update notifications are available. Gate 1 acceptance using a secondary account to scan the QR code still awaits confirmation from 小語.
 
@@ -18,7 +18,7 @@ This project uses unofficial LINE APIs and may cause account restrictions or ban
 
 ```mermaid
 flowchart LR
-    LINE[LINE service] <--> Provider[LineProvider adapter\n@evex/linejs 3.4.2]
+    LINE[LINE service] <--> Provider[LineProvider adapter\n@evex/linejs 3.5.0]
     Provider <--> Backend[Node TypeScript backend\nsession and in-memory cache]
     Backend <-->|WebSocket messages and channels| Browser[Vite / vanilla TypeScript web interface]
     Backend <-->|Same-port HTTP static pages and media| Browser
@@ -33,9 +33,9 @@ The OpenChat adapter additionally keeps a 10-minute in-memory history cache, bou
 - Node.js **≥ 22** and npm.
 - Network access to JSR, npm, and LINE.
 - A secondary LINE account that can scan a QR code and confirm a PIN.
-- Both `@evex/linejs` and `@evex/linejs-types` are pinned to **3.4.2** (JSR); all other direct dependencies must also have pinned versions.
+- Both `@evex/linejs` and `@evex/linejs-types` are pinned to **3.5.0** (JSR; this upgrade was explicitly authorized by the user); all other direct dependencies must also have pinned versions.
 
-Upstream 3.4.2's Thrift dependency contains a high-severity vulnerability. This project pins the patched `thrift@0.23.0` through `overrides`, without changing the LINE package versions. Patch reference: [CVE-2026-41636](https://github.com/advisories/GHSA-r67j-r569-jrwp). Compatibility of login reuse, channel lists, and live messages has been verified with a real LINE account.
+Previously, upstream 3.4.2's Thrift dependency contained a high-severity vulnerability. This project pins the patched `thrift@0.23.0` through `overrides` and retains that override after upgrading to 3.5.0. Patch reference: [CVE-2026-41636](https://github.com/advisories/GHSA-r67j-r569-jrwp). Previous real-account verification of login reuse, channel lists, and live messages applied to 3.4.2, **not to a real LINE Gate for 3.5.0**; this upgrade has not been verified with a real LINE account.
 
 ## Installation and startup
 
@@ -62,10 +62,10 @@ Open `http://127.0.0.1:3789`. If `session.json` can be reused, you enter the cha
 - **Scam probability check** (requires `jev.token`; see [Configuration](#configuration)): right-click (or long-press) a **text message from someone else** and choose 「詐騙機率分析」 (Scam probability check). A dialog shows the scam probability and a reading (> 80% very likely a scam, ≤ 20% unlikely, anything between is uncertain, check carefully). Above 20% it also lists the closest scam kind with its confidence (fake investment／stock-tip groups, impersonating an agency／bank／customer service, phishing links, online shopping／"cancel installments", impersonating friends or family to borrow money, romance, jobs／renting out accounts, prizes, loans, other). The option is not offered for your own messages, taken-back, undecryptable, system or non-text messages, and the menu item is absent when no key is set. Every check sends that one text to TypeSafe and is billed; the result is only a model estimate.
 - **Desktop notifications**: clicking 「通知」 (Notifications) at the top right asks the browser for permission and turns them on (the button switches to the accent color; the choice is kept in the browser's localStorage; click again to turn off). Only new messages from others are notified, and only while the page is not in the foreground; each chat shows at most one notification, replaced by its newest message; clicking it returns to the page with that chat open, and it closes once the chat is read. The notification content (sender and message preview) appears in the operating system's notification center. A secure context is required (`127.0.0.1`/`localhost` or HTTPS); on other http addresses the button is hidden.
 - **Drafts**: when you switch chats, unsent text (including @ mentions and the reply target) stays with its chat and comes back when you return. Drafts live only in page memory and are cleared by reloading or logging out. A staged picture or video is not kept.
-- **Message search**: searches messages already loaded across chats, newest first by message time. New messages, history, and take-backs keep the results visible rather than replacing them with the ordinary timeline. Search itself neither fetches more history nor sends read receipts.
+- **Message search and retention**: searches currently retained messages, newest first. Counts and matches are complete, but only visible rows plus overscan have DOM. Arrow keys, Home/End and Enter/Space navigate results. The frontend retains at most 500 messages per chat and 10,000 overall, evicting least-recently-used non-current chats when needed; the UI shows limits, retained counts and evictions. A contiguous history window moves upward so older messages remain reachable. 「最新訊息」 (Latest), or leaving a historical window and reopening the chat, fetches the latest page. Reply jumps and mention candidates cover retained messages only. Search neither fetches history nor sends read receipts; ordinary chats acknowledge only while the page is visible, at the bottom of the latest window with the newest message visible.
 - **History retry and reaction updates**: the first failed history load offers a retry button. Reaction updates replace only the reaction chips without recreating images, videos, or voice messages.
 - **Logout cleanup**: clears search, chat contents, profile information, the image viewer, dialogs, and the account's desktop notifications, while preserving notification preferences.
-- **Disconnection overlay and heartbeat**: if the WebSocket connection to the local service is interrupted, 「與伺服器斷線」 (Disconnected from the server) covers the entire screen. It disappears automatically on reconnection, and messages are resynchronized (using the full snapshot sent on connection: one frame per chat, merged and redrawn once by the page). The page sends a `ping` every 30 seconds and gives up on the connection (and reconnects) if no `pong` arrives within 10 seconds; when the page returns to the foreground it probes at once and skips any reconnect backoff (browsers throttle timers in background tabs). The server additionally checks with WebSocket protocol-level Pings every 30 seconds and closes connections that miss two rounds. Disconnects are recorded: the browser console prints `LINE.js 連線中斷` (time, close code/reason or 「no pong」, seconds connected, foreground/background, online state) and the service log prints `WS_CLOSED page|bot code=… after=…s` (`heartbeat-timeout` for heartbeat failures), without headers, cookies or Tokens.
+- **Disconnection overlay and heartbeat**: if the WebSocket connection to the local service is interrupted, 「與伺服器斷線」 (Disconnected from the server) covers the entire screen. It disappears automatically on reconnection, and messages are resynchronized (the complete snapshot is sent in batches per chat and merged for rendering). The page sends a `ping` every 30 seconds and gives up on the connection (and reconnects) if no `pong` arrives within 10 seconds; when the page returns to the foreground it probes at once and skips any reconnect backoff (browsers throttle timers in background tabs). The server additionally checks with WebSocket protocol-level Pings every 30 seconds and closes connections that miss two rounds. Disconnects are recorded: the browser console prints `LINE.js 連線中斷` (time, close code/reason or 「no pong」, seconds connected, foreground/background, online state) and the service log prints `WS_CLOSED page|bot code=… after=…s` (`heartbeat-timeout` for heartbeat failures), without headers, cookies or Tokens.
 - **Keyboard**: in the chat list, ↑/↓ move between rows, Home/End jump to the ends, and Enter or Space opens a chat; ↓ in the search box above the list moves into it, and ↑ on the first row returns to the search box. Ctrl/⌘+K opens message search (the browser's own Ctrl/⌘+F is untouched).
 - **Mobile layout**: at window widths ≤ 720px, the chat and friends lists move into a left drawer, opened with the 「☰」 hamburger button at the top left of the conversation header (click the backdrop or press Esc to close; selecting a chat closes it automatically). The drawer opens by default if no chat is selected. The desktop layout is unchanged.
 
@@ -92,16 +92,17 @@ SessionStorage in `src/line/session.ts` follows the linejs FileStorage contract,
 - LINE device: defaults to `ANDROIDSECONDARY`.
 - History page size: 50 by default, at most 100 per request.
 - Per-channel message cache: up to 500 messages; media LRU cache: 200MB by default.
-- WS frame: at most 256KB; text: at most 8000 characters.
+- Client-to-server WS frame: at most 256KB; text: at most 8000 characters.
 - Sending: at most 5 sends per second per WS connection. Media uploads: at most 10MB per image (PNG/JPEG/GIF), at most 50MB per video (MP4/MOV; configurable with `limits.uploadVideoMaxBytes`, capped at 200MB; the entire video is temporarily held in memory), and at most 5 uploads per minute per connection.
 - Received media and files: at most 50MB each (`limits.downloadMaxBytes`); larger items show only a type label (a file download fails).
+- Media download scheduling: at most 4 actual upstream requests and 64 FIFO waiters globally; identical IDs share work. A full queue returns the existing HTTP 404 and can be retried later. Take-back/logout cancels waiters and rejects old results; started work retains its slot until the upstream settles, without pretending the download was aborted.
 - Bot API: disabled by default; `api.enabled`, `api.chats` (required, at least one chat room id), and `api.sendsPerMinute` (20 by default, ≤120). See [Bot API](#bot-apiapiws) for details.
 - Scam check (optional): put a [TypeSafe](https://console.typesafe.ai/keys) API key in `jev.token` and restart; right-clicking (long-pressing on touch screens) **a text message from someone else** in the web interface then offers 「詐騙機率分析」 (Scam probability check), which uses TypeSafe's Jev decision model to estimate the probability that it is a scam (> 80% likely, ≤ 20% unlikely, uncertain in between) and the kind of scam it most resembles. When a new analysis is needed, only that one message's text is sent to `api.typesafe.ai` (the server uses its own cached copy, never text supplied by the page; no sender or chat information). Actual upstream requests are billed by TypeSafe, and each web connection may run at most 10 checks per minute. Bots can also check messages in `api.chats` with `scam:check` on the [Bot API](#bot-apiapiws) (at most 10 per minute across all bots). The key stays on the server: it is never sent to the page or logged. `jev.model` defaults to the pinned `jev-1.13.0`. The result is a model estimate for reference only. Leave `token` empty or omit it to disable the feature.
 - Faster analysis: within one signed-in session, concurrent web/API checks of **exactly identical text** share one upstream request. Successful results remain valid for 5 minutes from completion; repeat checks return directly without sending the text again. The memory-only LRU holds at most 256 entries, including pending requests, indexed by text hashes without an extra plaintext copy or disk persistence. Failures are not cached; logout/account changes clear it. Message eligibility, chat permissions and existing rate limits still apply to every check. If the text changes, is withdrawn or leaves the message cache while waiting, the request returns `INVALID_REQUEST`, not an outdated result. The model, questions and full text are unchanged; first-time analysis of new content still depends on Jev/network latency, with no real-upstream latency guarantee.
 
 ## Protocol
 
-Same-port `ws://<host>:<port>/ws` (default `ws://127.0.0.1:3789/ws`; the web interface automatically uses `wss://` behind a TLS reverse proxy or with a custom domain), with JSON frames. The per-frame limit is set by `limits.frameMaxBytes` (≤256KB). An upgrade requires all of the following: path `/ws`, the host in `Origin` (`http` or `https`) matching `Host`, and the HttpOnly/SameSite=Strict browser cookie issued by the homepage; otherwise it returns 403. Reverse proxies must forward WebSocket upgrade headers and preserve the original `Host` (nginx: `proxy_set_header Host $host;`, `proxy_set_header Upgrade $http_upgrade;`, `proxy_set_header Connection "upgrade";`). See [section 4 of PLAN.md](PLAN.md) for complete payloads (PLAN.md is in Chinese).
+Same-port `ws://<host>:<port>/ws` (default `ws://127.0.0.1:3789/ws`; the web interface automatically uses `wss://` behind a TLS reverse proxy or with a custom domain), with JSON frames. The client-to-server frame limit is set by `limits.frameMaxBytes` (≤256KB). An upgrade requires all of the following: path `/ws`, the host in `Origin` (`http` or `https`) matching `Host`, and the HttpOnly/SameSite=Strict browser cookie issued by the homepage; otherwise it returns 403. Reverse proxies must forward WebSocket upgrade headers and preserve the original `Host` (nginx: `proxy_set_header Host $host;`, `proxy_set_header Upgrade $http_upgrade;`, `proxy_set_header Connection "upgrade";`). See [section 4 of PLAN.md](PLAN.md) for complete payloads (PLAN.md is in Chinese).
 
 Available:
 
@@ -110,11 +111,11 @@ Available:
 | Server → Client | `hello` | Protocol version 2 and server version; on receipt, the frontend clears its local cache and waits for a full snapshot |
 | Server → Client | `auth:state` | `restoring`／`idle`／`authenticating`／`ready`／`error` |
 | Server → Client | `auth:qr` / `auth:pin` | One-time delivery, only to the connection that initiated `auth:start` |
-| Server → Client | `auth:ready` | Login completion and account data; a snapshot (`channels`, plus in-memory messages as one `messages` frame per chat) is sent on connection |
+| Server → Client | `auth:ready` | Login completion and account data; a snapshot (`channels`, plus `messages` frames batched per chat) is sent on connection |
 | Server → Client | `channels` | Channel snapshot; resent when channels are added or refreshed. Channels carry `lastMessage` (the last message, used as the list preview) and `lastMessageAt` |
 | Server → Client | `channel` | `{ channel }`: one channel changed (a new message, edit or take-back changed its preview, or a read cleared its unread count); pages only |
 | Server → Client | `chat:checked` | `{ chatId }`: this account read the chat on another device (the phone); the page clears its unread count; pages only |
-| Server → Client | `messages` | Connect-time message snapshot: `{ chatId, messages }`, one frame per chat (old messages, never counted as unread) |
+| Server → Client | `messages` | Connect-time snapshot: `{ chatId, messages }`; a chat may span multiple frames, merged by ID (old messages, never counted as unread) |
 | Server → Client | `message` / `message:edit` | Live messages and overwrites of existing messages |
 | Server → Client | `message:unsend` | `{ chatId, messageId }`: the message was taken back; show a placeholder (`Message.unsent: true`, no content) |
 | Server → Client | `message:reactions` | `{ chatId, messageId, reactions? }`: the message's reactions changed (`{ counts, mine? }`; omitted means nobody reacts). Pages only |
@@ -325,6 +326,78 @@ The same checks run automatically in GitHub Actions (`.github/workflows/ci.yml`)
 
 Tests use `node --test` and a Mock Provider; mocks do not replace real LINE acceptance. Gate 1 requires scanning with a secondary account and receiving a real message within 60 seconds; Gates 2–4 additionally verify web synchronization, history, sending, and media. See [PLAN.md](PLAN.md) for all Gates and acceptance criteria.
 
+Third performance-audit fixes (protocol remains 2):
+
+- Administrator queries share only in-flight work for the same chat within one account session. Entries are removed on success or failure; completed role lists are not cached. Each connection still independently passes authorization, consumes its rate budget and receives its mention grant. A new query immediately revokes the previous grant, and old-account results cannot affect replacement queries.
+- Talk summary pagination and OpenChat statuses run concurrently. Each refresh still runs at most 5 OpenChat status requests, filling free slots immediately rather than waiting for a whole batch. Partial failures remain best effort, and account changes stop scheduling old work.
+- The web UI defers channel sorting until rendering; a batch of increments sorts once while data and unread updates still run per event. Direct rendering, tabs, reconnects and logout resets remain supported. Equal activity/name keys retain their order from before the batch.
+
+Typecheck, build and all 305 tests passed. Single before/after measurements used the production adapter/HTTP/WS with isolated upstreams, and Chromium:
+
+| Scenario | Before | After |
+|---|---|---|
+| Upstream calls for 4 bots querying the same 3-page OpenChat concurrently | 12 member + 4 own-membership calls | 3 member + 1 own-membership calls |
+| Summaries with an 80ms talk request and 10 OpenChat statuses (first 180ms, others 10ms) | About 275ms | About 182ms, OpenChat concurrency still peaks at 5 |
+| Browser sorting for 5,000 channels and 100 increments | 100 sorts, about 47.1ms total | 1 sort, about 0.7ms |
+
+Real WS Token authentication additionally verified complete administrator lists and MENTION metadata, no inherited grant after reconnect, immediate revocation on refresh and latest-query-only grants. Browser checks covered order, previews, unread counts, filtering, tabs, direct interaction while rendering was deferred, reconnect and logout/login. No real LINE account or paid AI was used; these isolated observations do not establish real upstream latency, a performance guarantee or Gate acceptance.
+
+Second performance-audit fixes (protocol remains 2):
+
+- Browser snapshots target 256KiB batches, advancing only after each send completes; concurrent increments are queued in order after the snapshot. Queued increments and socket buffering share the 8MiB limit, and a send stalled for 30 seconds disconnects. A single message is not split: one larger than the target gets its own batch, still subject to the 8MiB protection. Bots still receive no replay. Logout/account changes/disconnection/shutdown invalidate replay work.
+- Search uses a variable-height virtual list; frontend retention and media scheduling use the limits above, without disk persistence or weaker authorization/content checks.
+
+Typecheck, build and all 298 tests passed. Production HTTP/WS with isolated upstreams and actual Chromium interactions produced:
+
+| Scenario | Before | After |
+|---|---|---|
+| Replay: 20 chats × 500 messages × 2KB text | Close 1006, incomplete delivery | All 10,000 delivered, connection stays open, concurrent edits/take-backs correct |
+| Initial result DOM for 5,000 search matches | 5,000 rows | 13 rows, complete count and head/middle/tail navigation |
+| Upstream concurrency for 30 distinct media IDs | 30 | 4 |
+
+Also verified: scrolling through all 2,500 history messages with at most 500 retained in the chat; live traffic while reading history sends no erroneous read receipt, and Latest returns to recent messages; 25 chats plus 700 new messages remain within 10,000 retained messages. Search edits/take-backs, mobile width, keyboard jumps and logout cleanup passed. A single search observation used about 9.08ms script and 3.05ms layout; this is not a multi-run performance guarantee. No real LINE account or paid AI was used, and this does not establish Gate acceptance.
+
+Current performance-audit fixes:
+
+- Member lookups share in-flight requests for the same source/ID and prefetch concurrently while preserving per-chat delivery order. At most 5 real requests run globally; timed-out requests retain their slots until they settle, and late or old-account results cannot populate profiles.
+- The web UI batches rendering by animation frame without merging or dropping events. It retains message ID indexes, date/search-text caches and sorted read positions, and reuses search nodes. History prepends anchor by message ID even when new messages arrive concurrently or grouping replaces DOM nodes.
+- OpenChat caches add an ID index and binary-search cursors/insertion points, preserving unsends, reactions, live-event precedence and existing bounds.
+- API channel snapshots directly look up authorized IDs instead of scanning every chat, preserving stable timestamp/name ties.
+- Single-chunk media uploads/downloads avoid an extra copy; multi-chunk paths use the already-counted length. E2EE, content detection, actual-byte limits and Range rules remain unchanged; downloads are not converted to streaming.
+
+Local isolated measurements: member lookups use a fixed 80ms upstream delay. API preparation compares the previous full scan against indexed lookup for 5,000 chats/3 authorized IDs, using 200 operations per round and the median of 5 rounds after warmup. Chromium uses the production HTTP/WS server, injecting 100 messages after the initial 50 messages and history have settled; the Layout counts below are a single controlled observation:
+
+| Measurement | Before | After |
+|---|---:|---:|
+| 3 distinct members in one chat: last delivery (ms) | 245.08 | 82.09 |
+| Same member in 3 chats: upstream requests | 3 | 1 |
+| API channel preparation, 200 operations (ms) | 22.48 | 0.12 |
+| 100 messages: browser Layout count | 206 | 3 |
+
+Typecheck, build and all 285 tests passed. Actual browser checks covered complete ordered delivery, image DOM preservation, concurrent edits/reactions, scroll anchoring with simultaneous history/live messages, search updates/node reuse, own-send bottom scrolling, read updates, chat switching and logout cleanup, plus the actual image-upload route. Main-world visibility simulation verified no read receipt while hidden and acknowledgement after returning; this does not verify every browser's background throttling. Upstreams were isolated; no real LINE account or paid AI API was used, and these results do not establish real-network latency or Gate acceptance.
+
+API channel synchronization verified: API connections filter by `api.chats` before sorting. Bot-only services skip the full browser snapshot; mixed connections reuse the browser's sorted result. Ordering, fields, payload size and protocol remain unchanged, with no new potentially stale cache. Typecheck, build and all 279 tests passed, covering stable ties, empty scopes, live updates, unsends, clearing and API-only synchronization.
+
+Local production HTTP/WS hub with Bearer Token authentication and an isolated provider, 5,000 chats with 3 allowed for the API: median of 30 connections after 5 warmups. Data preparation uses the median of 5 rounds of 200 operations, checking contents throughout:
+
+| Measurement | Before (ms) | After (ms) |
+|---|---:|---:|
+| API connection start to receiving channels | 3.18 | 0.52 |
+| Channel data preparation, 200 operations | 591.77 | 25.92 |
+
+This improves channel synchronization processing latency, not bandwidth or every API request by the same ratio. No real LINE account was used; this does not establish Gate acceptance.
+
+Packet-processing optimization verified: each broadcast is JSON/UTF-8 encoded once and shared by web and authorized API connections; channel-list broadcasts sort once before filtering API-visible chats. Text frames and protocol version 2 remain unchanged, with no event coalescing or dropping and no changes to validation, rate limits or slow-client backpressure protection. Typecheck, build and all 277 tests passed, including new burst coverage for web-only, API-only and mixed connections, Unicode, edit/unsend ordering, deduplication and chat isolation.
+
+Actual local HTTP/WS cookie/Token-authenticated measurement: 1 web-protocol connection and 4 bots, 4,000 messages containing Chinese/emoji per round, waiting for each connection's pong every 40 messages; medians of 5 rounds after warmup. Backend processing is cumulative synchronous `handleMessage` time; completion includes receipt and parsing of messages and pongs by all connections (milliseconds):
+
+| Text length (UTF-16) | Backend: before | Backend: after | Completion: before | Completion: after |
+|---|---:|---:|---:|---:|
+| 100 | 74.18 | 62.60 | 107.04 | 97.93 |
+| 2000 | 195.54 | 111.70 | 298.03 | 212.87 |
+
+Measurements use the production HTTP/WS hub and an isolated LINE provider, excluding LINE upstream latency, AI inference and browser rendering. Text frames, contents, ordering and counts were checked on every connection. No real LINE account was used; this does not establish Gate acceptance.
+
 Scam-analysis acceleration verified: typecheck, build and all 273 tests passed, covering request coalescing, exact text matching, expiration, LRU eviction, failure retries, authorization, rate limits and logout/account isolation. An actual HTTP/WS cookie- and Token-authenticated smoke run used the production JevClient with an isolated upstream delayed by 200ms: concurrent web/API checks of identical text followed by a repeat check reduced upstream calls from 3 to 1 and repeat latency from about 203ms to 0.46ms. This is not actual TypeSafe latency; no paid API or real LINE account was used, and this does not establish Gate acceptance.
 
 Verified for this change (scam check): typecheck, build, all 200 tests passing, and zero vulnerabilities from `npm audit --audit-level=high`. Headless Chromium with an isolated provider (and a fake analyzer) confirmed that 「詐騙機率分析」 appears in the context menu only for other people's text messages, the result dialog's content and single button, and that later confirmation dialogs still show their cancel button. Calling the real TypeSafe endpoint with an invalid key returned 401 (endpoint and authentication scheme are correct). **Not verified**: a real result with a valid key (none was available), and use on a real LINE account.
@@ -400,4 +473,4 @@ See [SECURITY.md](SECURITY.md) (in English) for the security policy and reportin
 
 See [AGENTS.md](AGENTS.md) (in Chinese) for engineering and security rules, and [PLAN.md](PLAN.md) for the full agreed plan. Commit in feature-based batches, excluding personal configuration and credentials; do not rewrite the existing `LICENSE` or `.nojekyll`.
 
-This work, **LINE.js**, is licensed under **Apache-2.0**, as specified by the root [LICENSE](LICENSE). The consumed packages **@evex/linejs** and **@evex/linejs-types** are licensed under **MIT**, independently of this work; see the [upstream license](https://github.com/evex-dev/linejs/blob/v3.4.2/LICENSE). This repository is for cloning only; no npm/JSR package is published.
+This work, **LINE.js**, is licensed under **Apache-2.0**, as specified by the root [LICENSE](LICENSE). The consumed packages **@evex/linejs** and **@evex/linejs-types** are licensed under **MIT**, independently of this work; see the [upstream license](https://github.com/evex-dev/linejs/blob/v3.5.0/LICENSE). This repository is for cloning only; no npm/JSR package is published.

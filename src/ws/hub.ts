@@ -16,6 +16,8 @@ import { PROTOCOL_VERSION, type ClientFrame, type ListenState, type ServerFrame 
 import { parseChatRead, parseChatRequest, parseHistory, parseMessageRequest, parseReact, parseSend, requestIdOf } from "./requests.js";
 
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+const REPLAY_FRAME_BYTES = 256 * 1024;
+const REPLAY_STALL_MS = 30_000;
 const HISTORY_PER_SECOND = 10;
 const NEW_CHANNEL_REFRESH_MS = 1000;
 const MAX_BOT_CONNECTIONS = 4;
@@ -123,6 +125,17 @@ export function createHub(options: HubOptions): Hub {
   // Exact text only, shared after authorization; hashes avoid retaining another copy of private text.
   // Pending and completed entries share a bounded LRU, cleared at every account boundary.
   const scamCache = new Map<string, { result: Promise<ScamAnalysis>; expires: number }>();
+  // Replay snapshots precede every later event on that socket. Only live encoded output is queued,
+  // with the same byte budget as ws; cached snapshots are references, encoded one chunk at a time.
+  const replays = new Map<WebSocket, {
+    frames: Generator<string>;
+    pending: (string | Buffer)[];
+    head: number;
+    bytes: number;
+    account: number;
+    timer?: NodeJS.Timeout;
+    next?: NodeJS.Immediate;
+  }>();
   // Sockets that answered the last ping (browsers and the ws client both reply to pings on their own).
   const alive = new WeakSet<WebSocket>();
   const timedOut = new WeakSet<WebSocket>();
@@ -148,6 +161,7 @@ export function createHub(options: HubOptions): Hub {
     // code and a length-capped reason: no headers, cookies or tokens.
     const openedAt = Date.now();
     socket.on("close", (code, reason) => {
+      cancelReplay(socket);
       const why = timedOut.has(socket) ? "heartbeat-timeout" : `code=${code}${reason.length > 0 ? ` reason=${reason.toString("utf8").slice(0, 100).replace(/\s+/g, " ")}` : ""}`;
       console.info(`WS_CLOSED ${kind} ${why} after=${Math.round((Date.now() - openedAt) / 1000)}s`);
     });
@@ -157,28 +171,116 @@ export function createHub(options: HubOptions): Hub {
     sendData(socket, JSON.stringify(frame));
   }
 
-  /** Sends an already serialized frame: a broadcast is turned into JSON once, not once per connection. */
-  function sendData(socket: WebSocket, data: string): void {
+  /** Buffers hold UTF-8 JSON, but the wire protocol remains text (not binary). */
+  function sendData(socket: WebSocket, data: string | Buffer): void {
     if (socket.readyState !== WebSocket.OPEN) return;
-    if (socket.bufferedAmount > MAX_BUFFERED_BYTES) {
+    const replay = replays.get(socket);
+    const bytes = typeof data === "string" ? Buffer.byteLength(data) : data.length;
+    if (socket.bufferedAmount + (replay?.bytes ?? 0) + bytes > MAX_BUFFERED_BYTES) {
+      cancelReplay(socket);
       socket.terminate();
       return;
     }
-    socket.send(data);
+    if (replay) {
+      replay.pending.push(data);
+      replay.bytes += bytes;
+    } else {
+      socket.send(data, { binary: false });
+    }
   }
 
-  function sendEach(clients: Iterable<WebSocket>, frame: ServerFrame): void {
-    let data: string | undefined;
-    for (const socket of clients) sendData(socket, (data ??= JSON.stringify(frame)));
+  function cancelReplay(socket: WebSocket): void {
+    const replay = replays.get(socket);
+    if (!replay) return;
+    replays.delete(socket);
+    clearTimeout(replay.timer);
+    clearImmediate(replay.next);
+    replay.frames.return(undefined);
+  }
+
+  /** Keep `messages` merge semantics, but bound each batch rather than each chat. */
+  function* replayFrames(chats: { chatId: string; messages: readonly Message[] }[]): Generator<string> {
+    for (const { chatId, messages } of chats) {
+      const prefix = `{"type":"messages","chatId":${JSON.stringify(chatId)},"messages":[`;
+      let parts: string[] = [];
+      let bytes = Buffer.byteLength(prefix) + 2;
+      for (const message of messages) {
+        const part = JSON.stringify(message);
+        const size = Buffer.byteLength(part);
+        if (parts.length > 0 && bytes + size + 1 > REPLAY_FRAME_BYTES) {
+          yield `${prefix}${parts.join(",")}]}`;
+          parts = [];
+          bytes = Buffer.byteLength(prefix) + 2;
+        }
+        bytes += size + (parts.length > 0 ? 1 : 0);
+        parts.push(part);
+      }
+      if (parts.length > 0) yield `${prefix}${parts.join(",")}]}`;
+    }
+  }
+
+  function pumpReplay(socket: WebSocket): void {
+    const replay = replays.get(socket);
+    if (!replay) return;
+    if (socket.readyState !== WebSocket.OPEN || replay.account !== generation || login.state !== "ready") {
+      cancelReplay(socket);
+      return;
+    }
+    const snapshot = replay.frames.next();
+    let data: string | Buffer;
+    if (!snapshot.done) {
+      data = snapshot.value;
+    } else if (replay.head < replay.pending.length) {
+      data = replay.pending[replay.head++]!;
+      replay.bytes -= typeof data === "string" ? Buffer.byteLength(data) : data.length;
+      // Release consumed buffers without letting a long-lived producer grow the backing array forever.
+      if (replay.head >= 1024 || replay.head === replay.pending.length) {
+        replay.pending.splice(0, replay.head);
+        replay.head = 0;
+      }
+    } else {
+      cancelReplay(socket);
+      return;
+    }
+    const bytes = typeof data === "string" ? Buffer.byteLength(data) : data.length;
+    if (socket.bufferedAmount + replay.bytes + bytes > MAX_BUFFERED_BYTES) {
+      cancelReplay(socket);
+      socket.terminate();
+      return;
+    }
+    // A paused receiver may never complete a write; do not pin snapshots indefinitely.
+    replay.timer = setTimeout(() => {
+      if (replays.get(socket) !== replay) return;
+      cancelReplay(socket);
+      socket.terminate();
+    }, REPLAY_STALL_MS);
+    socket.send(data, { binary: false }, (error) => {
+      if (replays.get(socket) !== replay) return;
+      clearTimeout(replay.timer);
+      if (error) {
+        cancelReplay(socket);
+        socket.terminate();
+        return;
+      }
+      replay.next = setImmediate(() => pumpReplay(socket));
+    });
+  }
+
+  /** Reuse one encoding across recipients; the returned buffer belongs only to this broadcast. */
+  function sendEach(clients: Iterable<WebSocket>, frame: ServerFrame, data?: Buffer): Buffer | undefined {
+    for (const socket of clients) {
+      if (socket.readyState === WebSocket.OPEN) sendData(socket, (data ??= Buffer.from(JSON.stringify(frame))));
+    }
+    return data;
   }
 
   function broadcast(frame: ServerFrame): void {
     sendEach(wss.clients, frame);
   }
 
-  /** Frames every kind of client may see: sign-in state and LINE connection state, never secrets. */
+  /** Only public state or events in botScope may reach both groups; never secrets. */
   function broadcastAll(frame: ServerFrame): void {
-    sendEach([...wss.clients, ...botWss.clients], frame);
+    sendEach(botWss.clients, frame, sendEach(wss.clients, frame));
   }
 
   function broadcastBots(frame: ServerFrame): void {
@@ -187,12 +289,17 @@ export function createHub(options: HubOptions): Hub {
 
   /** A bot sees only the chats listed in `api.chats`. */
   function botChannels(): Channel[] {
-    return store.snapshotChannels().filter((channel) => botScope.has(channel.channelId));
+    return store.snapshotChannels(botScope);
   }
 
   function broadcastChannels(): void {
-    broadcast({ type: "channels", channels: store.snapshotChannels() });
-    broadcastBots({ type: "channels", channels: botChannels() });
+    // API-only services need no full, sorted browser snapshot.
+    const channels = wss.clients.size > 0 ? store.snapshotChannels() : undefined;
+    if (channels) broadcast({ type: "channels", channels });
+    if (botWss.clients.size > 0) broadcastBots({
+      type: "channels",
+      channels: channels ? channels.filter((channel) => botScope.has(channel.channelId)) : botChannels(),
+    });
   }
 
   function apiState(): ServerFrame {
@@ -222,19 +329,15 @@ export function createHub(options: HubOptions): Hub {
       for (const bot of botWss.clients) bot.close(1008);
       if (token) send(socket, { type: "api:token", token });
       broadcast(apiState());
-    } catch (error) {
-      logFailure("API_TOKEN_FAILED", error);
+    } catch {
+      // Upstream errors can contain credentials; log only our operation code.
+      console.error("API_TOKEN_FAILED");
       fail(socket, "API_FAILED", requestId);
     }
   }
 
   function fail(socket: WebSocket, code: keyof typeof GENERIC, requestId?: string): void {
     send(socket, { type: "error", ...(requestId ? { requestId } : {}), code, message: GENERIC[code] });
-  }
-
-  // Internal causes stay in the local log (security rule 8); clients only ever get a generic code.
-  function logFailure(code: string, error: unknown): void {
-    console.error(code, error instanceof Error ? `${error.name}: ${error.message}`.slice(0, 200) : "unknown");
   }
 
   async function handleHistory(socket: WebSocket, frame: Record<string, unknown>, scope?: ReadonlySet<string>): Promise<void> {
@@ -256,9 +359,9 @@ export function createHub(options: HubOptions): Hub {
       send(socket, { type: "history", requestId, chatId, messages, hasMore: page.hasMore, ...(page.cursor ? { cursor: page.cursor } : {}) });
       // Receipts are an extra: a failure here must not turn a good history page into an error. Bots get none.
       if (!before && !scope) void sendReadSnapshot(socket, chatId, channel.kind);
-    } catch (error) {
+    } catch {
       if (account !== generation) return;
-      logFailure("HISTORY_FAILED", error);
+      console.error("HISTORY_FAILED");
       fail(socket, "HISTORY_FAILED", requestId);
     }
   }
@@ -290,12 +393,14 @@ export function createHub(options: HubOptions): Hub {
     }
   }
 
-  function rememberRead(chatId: string, position: ReadPosition): void {
+  function rememberRead(chatId: string, position: ReadPosition): boolean {
     const readers = seenReads.get(chatId) ?? new Map<string, bigint>();
     const id = BigInt(position.messageId);
     const known = readers.get(position.readerId);
-    if (known === undefined || id > known) readers.set(position.readerId, id);
+    if (known !== undefined && id <= known) return false;
+    readers.set(position.readerId, id);
     seenReads.set(chatId, readers);
+    return true;
   }
 
   async function sendReadSnapshot(socket: WebSocket, chatId: string, kind: ChannelKind): Promise<void> {
@@ -308,18 +413,19 @@ export function createHub(options: HubOptions): Hub {
       fetching = provider.fetchReadPositions({ channelId: chatId, kind }).then(
         // A logout while LINE was answering clears readFetches: the old account's receipts are dropped.
         (positions) => { if (readFetches.get(chatId)?.done === fetching) for (const position of positions) rememberRead(chatId, position); },
-        (error: unknown) => {
+        () => {
           // A failure is not remembered: the next open asks LINE again.
           if (readFetches.get(chatId)?.done === fetching) readFetches.delete(chatId);
-          logFailure("READ_RANGE_FAILED", error);
+          console.error("READ_RANGE_FAILED");
         },
       );
       readFetches.set(chatId, { at: Date.now(), done: fetching });
     }
     await fetching;
-    if (account !== generation) return;
-    const positions = [...(seenReads.get(chatId) ?? [])].map(([readerId, id]) => ({ readerId, messageId: String(id) }));
-    if (positions.length > 0 && login.state === "ready") send(socket, { type: "read", chatId, positions });
+    if (account !== generation || login.state !== "ready" || socket.readyState !== WebSocket.OPEN) return;
+    const positions: ReadPosition[] = [];
+    seenReads.get(chatId)?.forEach((id, readerId) => positions.push({ readerId, messageId: String(id) }));
+    if (positions.length > 0) send(socket, { type: "read", chatId, positions });
   }
 
   async function handleSend(socket: WebSocket, frame: Record<string, unknown>, scope?: ReadonlySet<string>): Promise<void> {
@@ -335,10 +441,18 @@ export function createHub(options: HubOptions): Hub {
     if (request.kind === "text") {
       // Cached speakers remain taggable; a bot may also tag admins it just queried in this chat.
       if (request.mentions.length > 0) {
-        const speakers = new Set(store.messagesOf(request.chatId).map((message) => message.senderId));
+        if (channel.kind === "user") return fail(socket, "INVALID_REQUEST", request.requestId);
         const admins = scope && channel.kind === "square" ? adminMentions.get(socket)?.get(request.chatId) : undefined;
-        if (channel.kind === "user" || !request.mentions.every((mention) => speakers.has(mention.userId) || admins?.has(mention.userId))) {
-          return fail(socket, "INVALID_REQUEST", request.requestId);
+        let missing: Set<string> | undefined;
+        for (const { userId } of request.mentions) {
+          if (!admins?.has(userId)) (missing ??= new Set<string>()).add(userId);
+        }
+        if (missing) {
+          for (const message of store.messagesOf(request.chatId)) {
+            missing.delete(message.senderId);
+            if (missing.size === 0) break;
+          }
+          if (missing.size > 0) return fail(socket, "INVALID_REQUEST", request.requestId);
         }
       }
       // A reply must point at a message this server has shown in the same chat.
@@ -362,9 +476,9 @@ export function createHub(options: HubOptions): Hub {
       // In OpenChat this account speaks under a member id of its own; remember it so its messages can be taken back.
       if (channel.kind === "square") ownSquareSenders.set(request.chatId, message.senderId);
       send(socket, { type: "sent", requestId: request.requestId, messageId: message.messageId });
-    } catch (error) {
+    } catch {
       if (account !== generation) return;
-      logFailure("SEND_FAILED", error);
+      console.error("SEND_FAILED");
       fail(socket, "SEND_FAILED", request.requestId);
     }
   }
@@ -385,9 +499,9 @@ export function createHub(options: HubOptions): Hub {
       if (account !== generation || login.state !== "ready") return;
       // LINE may or may not echo the take-back to this device: show it now (a later echo changes nothing).
       takeBack(chatId, messageId);
-    } catch (error) {
+    } catch {
       if (account !== generation) return;
-      logFailure("UNSEND_FAILED", error);
+      console.error("UNSEND_FAILED");
       fail(socket, "UNSEND_FAILED", requestId);
     }
   }
@@ -408,9 +522,9 @@ export function createHub(options: HubOptions): Hub {
       if (account !== generation || login.state !== "ready") return;
       // LINE echoes nothing to this device for talk chats: show the change now.
       updateReactions(chatId, messageId, withMyReaction(store.get(messageId, chatId)?.reactions, reaction));
-    } catch (error) {
+    } catch {
       if (account !== generation) return;
-      logFailure("REACT_FAILED", error);
+      console.error("REACT_FAILED");
       fail(socket, "REACT_FAILED", requestId);
     }
   }
@@ -494,8 +608,8 @@ export function createHub(options: HubOptions): Hub {
     const placeholder = store.unsend(messageId, chatHint);
     if (!placeholder) return;
     const frame: ServerFrame = { type: "message:unsend", chatId: placeholder.channelId, messageId };
-    broadcast(frame);
-    if (botScope.has(placeholder.channelId)) broadcastBots(frame);
+    if (botScope.has(placeholder.channelId)) broadcastAll(frame);
+    else broadcast(frame);
     broadcastChannel(placeholder.channelId, placeholder.channelId === chatHint ? before : undefined);
   }
 
@@ -509,8 +623,9 @@ export function createHub(options: HubOptions): Hub {
       clearTimeout(refreshTimer);
       refreshTimer = setTimeout(() => { void refreshChannels(); }, NEW_CHANNEL_REFRESH_MS);
     }
-    broadcast({ type: kind === "edit" ? "message:edit" : "message", message: stored });
-    if (botScope.has(message.channelId)) broadcastBots({ type: kind === "edit" ? "message:edit" : "message", message: stored });
+    const frame: ServerFrame = { type: kind === "edit" ? "message:edit" : "message", message: stored };
+    if (botScope.has(message.channelId)) broadcastAll(frame);
+    else broadcast(frame);
     // The list entry follows: activity order and preview move with the newest message.
     if (before) broadcastChannel(message.channelId, before);
   }
@@ -534,11 +649,11 @@ export function createHub(options: HubOptions): Hub {
       // Anyone opening the page later (or another tab now) must not see the badge of a chat that was just read.
       store.clearUnread(chatId);
       broadcastChannel(chatId, channel);
-    } catch (error) {
+    } catch {
       if (account !== generation || markedRead.get(chatId) !== id) return;
       if (known === undefined) markedRead.delete(chatId);
       else markedRead.set(chatId, known);
-      logFailure("READ_MARK_FAILED", error);
+      console.error("READ_MARK_FAILED");
     }
   }
 
@@ -549,9 +664,9 @@ export function createHub(options: HubOptions): Hub {
     try {
       const packages = await provider.fetchStickerPackages();
       if (account === generation && login.state === "ready") send(socket, { type: "stickers", requestId, packages });
-    } catch (error) {
+    } catch {
       if (account !== generation) return;
-      logFailure("STICKERS_FAILED", error);
+      console.error("STICKERS_FAILED");
       fail(socket, "STICKERS_FAILED", requestId);
     }
   }
@@ -577,9 +692,9 @@ export function createHub(options: HubOptions): Hub {
         if (account !== generation || login.state !== "ready") return;
         store.setChannels(channels);
         broadcastChannels();
-      } catch (error) {
+      } catch {
         if (account !== generation) return;
-        logFailure("CHANNELS_FAILED", error);
+        console.error("CHANNELS_FAILED");
         broadcast({ type: "error", code: "CHANNELS_FAILED", message: GENERIC.CHANNELS_FAILED });
       } finally {
         if (account === generation) refreshing = undefined;
@@ -591,15 +706,19 @@ export function createHub(options: HubOptions): Hub {
   function sendReady(socket: WebSocket): void {
     send(socket, { type: "auth:ready", profile: provider.getProfile() });
     sendChannels(socket);
-    // One frame per chat (at most `cache.messagesPerChannel` messages), not one per message: a reconnect
-    // with thousands of cached messages must not cost the page thousands of frames and re-renders.
-    for (const chatId of store.chatsWithMessages()) send(socket, { type: "messages", chatId, messages: store.messagesOf(chatId) });
+    // Copy the bounded cache's arrays now: later upserts mutate them. Live/edit/unsend frames are
+    // delivered after this snapshot, in arrival order, so no stale snapshot can undo a newer event.
+    cancelReplay(socket);
+    const chats = store.chatsWithMessages().map((chatId) => ({ chatId, messages: store.messagesOf(chatId).slice() }));
+    replays.set(socket, { frames: replayFrames(chats), pending: [], head: 0, bytes: 0, account: generation });
+    pumpReplay(socket);
   }
 
   login.subscribe((state) => {
     if (state !== "ready") {
       // Logged out or failed: nothing from the previous account may stay in memory or on screen.
       generation += 1;
+      for (const socket of replays.keys()) cancelReplay(socket);
       refreshing = undefined;
       lastListChange = 0;
       clearTimeout(refreshTimer);
@@ -810,8 +929,7 @@ export function createHub(options: HubOptions): Hub {
       }, wait);
     },
     handleRead(chatId, position) {
-      if (!store.hasChannel(chatId)) return;
-      rememberRead(chatId, position);
+      if (!store.hasChannel(chatId) || !rememberRead(chatId, position)) return;
       broadcast({ type: "read", chatId, positions: [position] });
     },
     setUpdate(info) {
@@ -819,6 +937,7 @@ export function createHub(options: HubOptions): Hub {
       if (info) broadcast(updateFrame(info));
     },
     close() {
+      for (const socket of replays.keys()) cancelReplay(socket);
       clearInterval(heartbeat);
       clearTimeout(refreshTimer);
       clearTimeout(listChangeTimer);

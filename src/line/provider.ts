@@ -5,6 +5,7 @@ import type { Message as LineMessage, SquareMessage as LineSquareMessage } from 
 import { avatarMediaId, mp4DurationMs, sniffImage, sniffMedia, type AvatarHost, type MediaBytes } from "../media/service.js";
 import type { Channel, ChannelRef, ChatAdmin, ChatAdmins, HistoryPage, MemberRole, Mention, Message, Profile, ReactionKind, Reactions, ReadPosition, StickerPackage } from "../model/dto.js";
 import { withMyReaction } from "../model/store.js";
+import { discardResponse, readResponseText } from "../response.js";
 import { memberRole, mentionMetadata, parseMentions, replyTarget } from "./members.js";
 import { parseEmojis } from "./emoji.js";
 import { parseCheckedOperation, parseReadOperation, parseReadRanges, parseUnsendOperation } from "./read.js";
@@ -138,11 +139,24 @@ const DEFAULT_DOWNLOAD_BYTES = 50 * 1024 * 1024;
 
 interface SquareHistory {
   at: number;
+  byId: Map<string, Message>;
   messages: Message[];
   origins: Map<string, LineMessage>;
   updates: Map<string, { unsent?: boolean; reactions?: Reactions }>;
   liveUpdates: Set<string>;
   loading?: Promise<Message[]>;
+}
+
+// Let the lookup cap stop candidate preparation before traversing the remaining messages.
+function* talkMemberMids(entries: Iterable<{ raw: LineMessage }>): Generator<string> {
+  for (const { raw } of entries) {
+    yield raw.from;
+    yield* chatEventMids(raw.contentMetadata);
+  }
+}
+
+function* squareMemberMids(entries: Iterable<{ raw: LineSquareMessage }>): Generator<string> {
+  for (const { raw } of entries) yield raw.message.from;
 }
 
 export class EvexLineProvider implements LineProvider {
@@ -157,11 +171,17 @@ export class EvexLineProvider implements LineProvider {
   // Names and pictures keyed by mid. LINE events carry only mids, so these are learned from the
   // friend list, profile lookups and (for OpenChat history) the sender names inside events.
   private profiles = new Map<string, MemberProfile>();
-  // mid -> time before which a failed lookup is not retried.
+  // source:mid -> time before which a failed lookup is not retried.
   private lookupMisses = new Map<string, number>();
+  private lookupFlights = new Map<string, Promise<void>>();
+  private lookupQueue = new Set<{ run: () => void; cancel: () => void }>();
+  private lookupJobs = new Set<{ run: () => void; cancel: () => void }>();
+  // Slots are released only when the actual LINE request settles, not when our waiter times out.
+  private activeLookups = 0;
   // Per chat, the tail of its delivery chain: one slow member lookup holds back only its own chat.
   private deliveries = new Map<string, Promise<void>>();
   private squareCache = new Map<string, SquareHistory>();
+  private adminFlights = new Map<string, { client: Client; promise: Promise<ChatAdmins> }>();
   private stickerPackages?: { at: number; packages: StickerPackage[] };
   // Messages whose media the browser may ask for, newest last. Requests are only honoured for
   // messages seen here, so the browser cannot use this session to probe arbitrary LINE objects.
@@ -189,6 +209,12 @@ export class EvexLineProvider implements LineProvider {
     });
     base.on("log", ({ type }) => {
       // Never forward upstream log data: it can contain authentication material.
+      if (type === "[LEGY/PUSH] fetchMyEvents failed") {
+        // 3.5.0 keeps the push connection alive and retries on the next square push,
+        // but missed events mean even an in-flight OpenChat history walk is stale.
+        if (this.base === base) this.squareCache.clear();
+        return;
+      }
       if (type !== "LegyPusherError" && type !== "LegyPusherError_cannot_init") return;
       setImmediate(() => {
         // Live events may have been missed: the OpenChat history cache can no longer be trusted as current.
@@ -243,12 +269,14 @@ export class EvexLineProvider implements LineProvider {
     if (this.stopped) throw new Error("LOGIN_STOPPED");
     const client = new Client(base);
     this.client = client;
+    this.adminFlights.clear();
     const profile = this.getProfile();
     this.rememberProfile(profile.userId, profile.displayName, profile.pictureId, true);
     // Sender lookups are asynchronous; chaining per chat keeps each chat's messages in arrival order.
     const deliver = (chatId: string, source: "talk" | "square", senderMid: string, convert: () => Message, kind: "new" | "edit", extraMids: string[] = []) => {
+      const members = this.resolveMembers(client, source, [senderMid, ...extraMids]);
       const next = (this.deliveries.get(chatId) ?? Promise.resolve()).then(async () => {
-        await this.resolveMembers(client, source, [senderMid, ...extraMids]);
+        await members;
         if (this.client !== client) return;
         let message: Message;
         try {
@@ -386,25 +414,26 @@ export class EvexLineProvider implements LineProvider {
     const fileId = fields.mediaId?.startsWith("file-") ? fields.mediaId : undefined;
     // Only a numeric id may become a sticker media id: it is later spliced into a CDN URL path.
     const mediaId = fileId ? undefined : fields.mediaId ?? (stickerId && /^\d{1,12}$/.test(stickerId) ? `sticker-${stickerId}${fields.metadata?.STKOPT === "A" ? "-a" : ""}` : undefined);
-    const mentions = isText && text ? parseMentions(fields.metadata, text) : [];
-    const emojis = isText && text ? parseEmojis(fields.metadata, text) : [];
+    const mentions = isText && text && fields.metadata?.MENTION ? parseMentions(fields.metadata, text) : undefined;
+    const emojis = isText && text && fields.metadata?.REPLACE ? parseEmojis(fields.metadata, text) : undefined;
     const parsed = isText ? undefined : messageCard(contentType, fields.metadata, fields.location);
     const card = parsed?.kind === "file" && fileId ? { ...parsed, fileId } : parsed;
+    const profile = this.profiles.get(fields.senderId);
     return {
       messageId: String(fields.id),
       channelId: fields.channelId,
       channelKind: fields.channelKind,
       senderId: fields.senderId,
-      senderName: this.profiles.get(fields.senderId)?.name ?? UNKNOWN_MEMBER,
-      ...(this.profiles.get(fields.senderId)?.pictureId ? { senderPictureId: this.profiles.get(fields.senderId)!.pictureId } : {}),
-      ...(this.profiles.get(fields.senderId)?.role ? { senderRole: this.profiles.get(fields.senderId)!.role } : {}),
+      senderName: profile?.name ?? UNKNOWN_MEMBER,
+      ...(profile?.pictureId ? { senderPictureId: profile.pictureId } : {}),
+      ...(profile?.role ? { senderRole: profile.role } : {}),
       ...(isText && text ? { text } : fields.eventText ? { text: fields.eventText } : {}),
       contentType: isChatEvent(contentType) ? "CHATEVENT" : contentType,
       createdAt: Number.isFinite(created) && created > 0 ? created : Date.now(),
       ...(mediaId ? { mediaId } : {}),
       ...(fields.replyTo ? { replyTo: fields.replyTo } : {}),
-      ...(mentions.length > 0 ? { mentions } : {}),
-      ...(emojis.length > 0 ? { emojis } : {}),
+      ...(mentions?.length ? { mentions } : {}),
+      ...(emojis?.length ? { emojis } : {}),
       ...(card ? { card } : {}),
       ...(fields.reactions ? { reactions: fields.reactions } : {}),
       // Fail closed: an E2EE payload without readable text is a placeholder, never a guess.
@@ -423,11 +452,17 @@ export class EvexLineProvider implements LineProvider {
         signal: AbortSignal.timeout(STICKER_TIMEOUT_MS),
         redirect: "error",
       });
-      if (response.status === 404 || response.status === 403) continue;
-      if (!response.ok) throw new Error("STICKER_FETCH_FAILED");
-      if (!response.headers.get("content-type")?.startsWith("image/png")) throw new Error("STICKER_BAD_TYPE");
-      const bytes = Buffer.from(await response.arrayBuffer());
-      if (bytes.length === 0 || bytes.length > STICKER_MAX_BYTES) throw new Error("STICKER_BAD_SIZE");
+      if (!response.ok) {
+        await discardResponse(response);
+        if (response.status === 404 || response.status === 403) continue;
+        throw new Error("STICKER_FETCH_FAILED");
+      }
+      if (!response.headers.get("content-type")?.startsWith("image/png")) {
+        await discardResponse(response);
+        throw new Error("STICKER_BAD_TYPE");
+      }
+      const bytes = await this.readMediaBytes(response, STICKER_MAX_BYTES);
+      if (!bytes || bytes.length === 0) throw new Error("STICKER_BAD_SIZE");
       return { mime: "image/png", bytes };
     }
     return undefined;
@@ -440,11 +475,14 @@ export class EvexLineProvider implements LineProvider {
   async fetchAvatar(host: AvatarHost, hash: string, full: boolean): Promise<MediaBytes | undefined> {
     const origin = host === "profile" ? "https://profile.line-scdn.net" : "https://obs.line-scdn.net";
     const response = await fetch(`${origin}/${hash}${full ? "" : "/preview"}`, { signal: AbortSignal.timeout(STICKER_TIMEOUT_MS), redirect: "error" });
-    if (response.status === 404 || response.status === 403) return undefined;
-    if (!response.ok) throw new Error("AVATAR_FETCH_FAILED");
-    const bytes = Buffer.from(await response.arrayBuffer());
-    const mime = sniffImage(bytes);
-    if (!mime || bytes.length > STICKER_MAX_BYTES) throw new Error("AVATAR_BAD_CONTENT");
+    if (!response.ok) {
+      await discardResponse(response);
+      if (response.status === 404 || response.status === 403) return undefined;
+      throw new Error("AVATAR_FETCH_FAILED");
+    }
+    const bytes = await this.readMediaBytes(response, STICKER_MAX_BYTES);
+    const mime = bytes && sniffImage(bytes);
+    if (!bytes || !mime) throw new Error("AVATAR_BAD_CONTENT");
     return { mime, bytes };
   }
 
@@ -454,11 +492,14 @@ export class EvexLineProvider implements LineProvider {
         signal: AbortSignal.timeout(STICKER_TIMEOUT_MS),
         redirect: "error",
       });
-      if (response.status === 404 || response.status === 403) continue;
-      if (!response.ok) throw new Error("STICKER_PACK_FETCH_FAILED");
-      const bytes = Buffer.from(await response.arrayBuffer());
-      const mime = sniffImage(bytes);
-      if (!mime || bytes.length > STICKER_MAX_BYTES) throw new Error("STICKER_PACK_BAD_CONTENT");
+      if (!response.ok) {
+        await discardResponse(response);
+        if (response.status === 404 || response.status === 403) continue;
+        throw new Error("STICKER_PACK_FETCH_FAILED");
+      }
+      const bytes = await this.readMediaBytes(response, STICKER_MAX_BYTES);
+      const mime = bytes && sniffImage(bytes);
+      if (!bytes || !mime) throw new Error("STICKER_PACK_BAD_CONTENT");
       return { mime, bytes };
     }
     return undefined;
@@ -470,10 +511,13 @@ export class EvexLineProvider implements LineProvider {
       signal: AbortSignal.timeout(STICKER_TIMEOUT_MS),
       redirect: "error",
     });
-    if (response.status === 404 || response.status === 403) return undefined;
-    if (!response.ok) throw new Error("EMOJI_FETCH_FAILED");
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (sniffImage(bytes) !== "image/png" || bytes.length > STICKER_MAX_BYTES) throw new Error("EMOJI_BAD_CONTENT");
+    if (!response.ok) {
+      await discardResponse(response);
+      if (response.status === 404 || response.status === 403) return undefined;
+      throw new Error("EMOJI_FETCH_FAILED");
+    }
+    const bytes = await this.readMediaBytes(response, STICKER_MAX_BYTES);
+    if (!bytes || sniffImage(bytes) !== "image/png") throw new Error("EMOJI_BAD_CONTENT");
     return { mime: "image/png", bytes };
   }
 
@@ -491,6 +535,7 @@ export class EvexLineProvider implements LineProvider {
       true,
       "/TSHOP4",
     );
+    if (this.client !== client || this.stopped) return [];
     const owned = parseOwnedProducts(result);
     const packages: StickerPackage[] = [];
     for (let offset = 0; offset < owned.length; offset += PACK_META_CONCURRENCY) {
@@ -500,9 +545,10 @@ export class EvexLineProvider implements LineProvider {
         if (stickerIds.length === 0) return undefined;
         return { packageId: product.packageId, name: meta?.name || product.name || `貼圖包 ${product.packageId}`, stickerIds, animated: meta?.animated ?? false };
       }));
+      if (this.client !== client || this.stopped) return [];
       for (const entry of batch) if (entry) packages.push(entry);
     }
-    if (this.client === client) this.stickerPackages = { at: Date.now(), packages };
+    this.stickerPackages = { at: Date.now(), packages };
     return packages;
   }
 
@@ -512,9 +558,12 @@ export class EvexLineProvider implements LineProvider {
         signal: AbortSignal.timeout(STICKER_TIMEOUT_MS),
         redirect: "error",
       });
-      if (!response.ok) return undefined;
-      const text = await response.text();
-      return text.length > 1_000_000 ? undefined : parsePackageMeta(JSON.parse(text));
+      if (!response.ok) {
+        await discardResponse(response);
+        return undefined;
+      }
+      const text = await readResponseText(response, 1_000_000);
+      return parsePackageMeta(JSON.parse(text));
     } catch {
       // The id ranges from the product list still give a usable (if untitled) package.
       return undefined;
@@ -576,9 +625,17 @@ export class EvexLineProvider implements LineProvider {
       signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
       redirect: "error",
     });
-    if (response.status === 404 || response.status === 403 || response.status === 410) return undefined;
-    if (!response.ok) throw new Error("MEDIA_FETCH_FAILED");
-    if (Number(response.headers.get("content-length")) > this.downloadMaxBytes || !response.body) {
+    if (!response.ok) {
+      await discardResponse(response);
+      if (response.status === 404 || response.status === 403 || response.status === 410) return undefined;
+      throw new Error("MEDIA_FETCH_FAILED");
+    }
+    return this.readMediaBytes(response, this.downloadMaxBytes);
+  }
+
+  /** Stop oversized CDN and authenticated media bodies before buffering the rest. */
+  private async readMediaBytes(response: Response, maxBytes: number): Promise<Buffer | undefined> {
+    if (Number(response.headers.get("content-length")) > maxBytes || !response.body) {
       await response.body?.cancel();
       return undefined;
     }
@@ -587,13 +644,14 @@ export class EvexLineProvider implements LineProvider {
     let total = 0;
     for (let part = await reader.read(); !part.done; part = await reader.read()) {
       total += part.value.length;
-      if (total > this.downloadMaxBytes) {
+      if (total > maxBytes) {
         await reader.cancel();
         return undefined;
       }
       chunks.push(part.value);
     }
-    return Buffer.concat(chunks);
+    const single = chunks.length === 1 ? chunks[0] : undefined;
+    return single ? Buffer.from(single.buffer, single.byteOffset, single.byteLength) : Buffer.concat(chunks, total);
   }
 
   async fetchReadPositions(channel: ChannelRef): Promise<ReadPosition[]> {
@@ -618,51 +676,96 @@ export class EvexLineProvider implements LineProvider {
    * the generic member name until the retry delay passes.
    */
   private async resolveMembers(client: Client, source: "talk" | "square", mids: Iterable<string>): Promise<void> {
+    if (this.client !== client) return;
     const now = Date.now();
-    const pending = [...new Set(mids)]
-      .filter((mid) => (source === "square" ? mid.length > 0 : TALK_USER_MID.test(mid)))
-      .filter((mid) => !this.profiles.get(mid)?.settled && (this.lookupMisses.get(mid) ?? 0) <= now)
-      .slice(0, MAX_LOOKUPS_PER_CALL);
-    if (pending.length === 0) return;
-    const timeout = Promise.withResolvers<void>();
-    const timer = setTimeout(timeout.resolve, LOOKUP_TIMEOUT_MS);
-    try {
-      await Promise.race([source === "square" ? this.lookupSquareMembers(client, pending) : this.lookupContacts(client, pending), timeout.promise]);
-    } finally {
-      clearTimeout(timer);
-    }
-    const retryAt = Date.now() + LOOKUP_RETRY_MS;
-    for (const mid of pending) if (!this.profiles.get(mid)?.settled) this.lookupMisses.set(mid, retryAt);
-    if (this.lookupMisses.size > MAX_LOOKUP_MISSES) {
-      const now = Date.now();
-      for (const [mid, until] of this.lookupMisses) if (until <= now) this.lookupMisses.delete(mid);
-    }
-  }
-
-  private async lookupContacts(client: Client, mids: string[]): Promise<void> {
-    for (let offset = 0; offset < mids.length; offset += CONTACT_BATCH) {
-      try {
-        const { contacts } = await client.base.talk.getContactsV2({ mids: mids.slice(offset, offset + CONTACT_BATCH) });
-        if (this.client !== client) return;
-        for (const { contact } of Object.values(contacts ?? {})) {
-          if (contact?.mid) this.rememberProfile(contact.mid, contact.displayNameOverridden || contact.displayName, avatarMediaId("profile", contact.pictureStatus), true);
-        }
-      } catch {
-        // Unresolved mids get a retry delay in resolveMembers.
+    const pending: string[] = [];
+    const seen = new Set<string>();
+    for (const mid of mids) {
+      if (seen.has(mid)) continue;
+      seen.add(mid);
+      if (!(source === "square" ? mid.length > 0 : TALK_USER_MID.test(mid))) continue;
+      if (!this.profiles.get(mid)?.settled && (this.lookupMisses.get(`${source}:${mid}`) ?? 0) <= now) {
+        pending.push(mid);
+        if (pending.length === MAX_LOOKUPS_PER_CALL) break;
       }
     }
+    const waiting: Promise<void>[] = [];
+    const fresh: string[] = [];
+    for (const mid of pending) {
+      const flight = this.lookupFlights.get(`${source}:${mid}`);
+      if (flight) waiting.push(flight);
+      else fresh.push(mid);
+    }
+    const batchSize = source === "talk" ? CONTACT_BATCH : 1;
+    for (let offset = 0; offset < fresh.length; offset += batchSize) {
+      const batch = fresh.slice(offset, offset + batchSize);
+      const done = Promise.withResolvers<void>();
+      let expired = false;
+      const keys = batch.map((mid) => `${source}:${mid}`);
+      const finish = () => {
+        if (this.client === client) {
+          const retryAt = Date.now() + LOOKUP_RETRY_MS;
+          for (const mid of batch) if (!this.profiles.get(mid)?.settled) this.lookupMisses.set(`${source}:${mid}`, retryAt);
+          if (this.lookupMisses.size > MAX_LOOKUP_MISSES) {
+            for (const [key, until] of this.lookupMisses) if (until <= Date.now()) this.lookupMisses.delete(key);
+          }
+        }
+        done.resolve();
+      };
+      const forget = () => {
+        for (const key of keys) if (this.lookupFlights.get(key) === done.promise) this.lookupFlights.delete(key);
+      };
+      const job: { run: () => void; cancel: () => void } = {
+        cancel: () => {
+          expired = true;
+          clearTimeout(timer);
+          this.lookupJobs.delete(job);
+          if (this.lookupQueue.delete(job)) forget();
+          finish();
+        },
+        run: () => {
+          this.activeLookups += 1;
+          void (async () => {
+            try {
+              if (source === "talk") {
+                const { contacts } = await client.base.talk.getContactsV2({ mids: batch });
+                if (expired || this.client !== client) return;
+                for (const { contact } of Object.values(contacts ?? {})) {
+                  if (contact?.mid) this.rememberProfile(contact.mid, contact.displayNameOverridden || contact.displayName, avatarMediaId("profile", contact.pictureStatus), true);
+                }
+              } else {
+                const mid = batch[0]!;
+                const { squareMember } = await client.base.square.getSquareMember({ squareMemberMid: mid });
+                if (!expired && this.client === client) this.rememberProfile(mid, squareMember.displayName, avatarMediaId("obs", squareMember.profileImageObsHash), true, memberRole(squareMember.role));
+              }
+            } catch {
+              // Failed and timed-out lookups retain the existing retry delay.
+            } finally {
+              clearTimeout(timer);
+              this.lookupJobs.delete(job);
+              forget();
+              if (!expired) finish();
+              this.activeLookups -= 1;
+              this.drainLookups();
+            }
+          })();
+        },
+      };
+      const timer = setTimeout(job.cancel, LOOKUP_TIMEOUT_MS);
+      for (const key of keys) this.lookupFlights.set(key, done.promise);
+      this.lookupQueue.add(job);
+      this.lookupJobs.add(job);
+      waiting.push(done.promise);
+    }
+    this.drainLookups();
+    await Promise.all(waiting);
   }
 
-  private async lookupSquareMembers(client: Client, mids: string[]): Promise<void> {
-    for (let offset = 0; offset < mids.length; offset += SQUARE_LOOKUP_CONCURRENCY) {
-      await Promise.all(mids.slice(offset, offset + SQUARE_LOOKUP_CONCURRENCY).map(async (mid) => {
-        try {
-          const { squareMember } = await client.base.square.getSquareMember({ squareMemberMid: mid });
-          if (this.client === client) this.rememberProfile(mid, squareMember.displayName, avatarMediaId("obs", squareMember.profileImageObsHash), true, memberRole(squareMember.role));
-        } catch {
-          // Unresolved mids get a retry delay in resolveMembers.
-        }
-      }));
+  private drainLookups(): void {
+    while (this.activeLookups < SQUARE_LOOKUP_CONCURRENCY && this.lookupQueue.size > 0) {
+      const job = this.lookupQueue.values().next().value!;
+      this.lookupQueue.delete(job);
+      job.run();
     }
   }
 
@@ -674,12 +777,22 @@ export class EvexLineProvider implements LineProvider {
   async fetchChatAdmins(channel: ChannelRef): Promise<ChatAdmins> {
     if (channel.kind !== "square") throw new Error("CHAT_ADMINS_UNSUPPORTED");
     const client = this.requireClient();
+    const existing = this.adminFlights.get(channel.channelId);
+    if (existing?.client === client) return existing.promise;
+    const promise = this.loadChatAdmins(client, channel.channelId).finally(() => {
+      if (this.adminFlights.get(channel.channelId)?.promise === promise) this.adminFlights.delete(channel.channelId);
+    });
+    this.adminFlights.set(channel.channelId, { client, promise });
+    return promise;
+  }
+
+  private async loadChatAdmins(client: Client, chatId: string): Promise<ChatAdmins> {
     const admins = new Map<string, ChatAdmin>();
     const tokens = new Set<string>();
     let continuationToken: string | undefined;
     for (let page = 0; page < SQUARE_MEMBER_MAX_PAGES; page += 1) {
       const response = await client.base.square.getSquareChatMembers({
-        squareChatMid: channel.channelId,
+        squareChatMid: chatId,
         limit: SQUARE_PAGE_SIZE,
         continuationToken,
       });
@@ -711,10 +824,10 @@ export class EvexLineProvider implements LineProvider {
       continuationToken = response.continuationToken;
       if (!continuationToken) {
         // getSquareChat returns the authenticated account's membership, not its ordinary account mid.
-        const chat = await client.base.square.getSquareChat({ squareChatMid: channel.channelId });
+        const chat = await client.base.square.getSquareChat({ squareChatMid: chatId });
         if (this.client !== client || this.stopped) throw new Error("SESSION_CHANGED");
         const membership = chat?.squareChatMember;
-        if (membership?.squareChatMid !== channel.channelId
+        if (membership?.squareChatMid !== chatId
           || typeof membership.squareMemberMid !== "string" || !SQUARE_MEMBER_MID.test(membership.squareMemberMid)) {
           throw new Error("CHAT_ADMINS_INVALID_MEMBERSHIP");
         }
@@ -754,7 +867,7 @@ export class EvexLineProvider implements LineProvider {
     const raws = fetched.filter((raw) => raw.id !== anchorId);
     const readable: { raw: LineMessage; undecryptable: boolean }[] = [];
     for (const raw of raws) readable.push(await this.decryptTalk(client, raw));
-    await this.resolveMembers(client, "talk", readable.flatMap((entry) => [entry.raw.from, ...chatEventMids(entry.raw.contentMetadata)]));
+    await this.resolveMembers(client, "talk", talkMemberMids(readable));
     if (this.client !== client) throw new Error("HISTORY_INVALIDATED");
     const myMid = this.getProfile().userId;
     const messages = readable.map((entry) => this.talkToMessage(entry.raw, myMid, entry.undecryptable));
@@ -777,8 +890,7 @@ export class EvexLineProvider implements LineProvider {
     if (before !== undefined) {
       const match = /^(\d+):(\d{1,24})$/.exec(before);
       if (!match || !Number.isSafeInteger(Number(match[1]))) throw new Error("INVALID_CURSOR");
-      end = all.findIndex((message) => this.compareSquareMessages(message, { createdAt: Number(match[1]), messageId: match[2]! }) >= 0);
-      if (end < 0) end = all.length;
+      end = this.squareLowerBound(all, { createdAt: Number(match[1]), messageId: match[2]! });
     }
     const start = Math.max(0, end - limit);
     const messages = all.slice(start, end);
@@ -795,7 +907,7 @@ export class EvexLineProvider implements LineProvider {
     const cached = this.squareCache.get(squareChatMid);
     if (cached?.loading) return cached.loading;
     if (cached && Date.now() - cached.at < SQUARE_CACHE_MS) return cached.messages;
-    const entry: SquareHistory = { at: 0, messages: [], origins: new Map(), updates: new Map(), liveUpdates: new Set() };
+    const entry: SquareHistory = { at: 0, messages: [], byId: new Map(), origins: new Map(), updates: new Map(), liveUpdates: new Set() };
     // Take-backs are permanent; reaction snapshots are not. Only events arriving during this
     // walk override its history statuses, otherwise an expired live snapshot would win forever.
     if (cached) for (const [id, update] of cached.updates) {
@@ -842,7 +954,7 @@ export class EvexLineProvider implements LineProvider {
       token = { syncToken: response.syncToken, continuationToken: response.continuationToken };
     }
     for (const { raw, name } of found.values()) if (name) this.rememberName(raw.message.from, name);
-    await this.resolveMembers(client, "square", [...found.values()].map(({ raw }) => raw.message.from));
+    await this.resolveMembers(client, "square", squareMemberMids(found.values()));
     if (this.client !== client || this.squareCache.get(squareChatMid) !== entry) throw new Error("HISTORY_INVALIDATED");
     const merged = new Map<string, Message>();
     for (const { raw, reactions } of found.values()) {
@@ -858,6 +970,7 @@ export class EvexLineProvider implements LineProvider {
     for (const message of entry.messages) merged.set(message.messageId, message);
     entry.messages = [...merged.values()];
     entry.messages.sort((a, b) => this.compareSquareMessages(a, b));
+    entry.byId = merged;
     for (const [id, update] of entry.updates) this.applySquareUpdate(entry, id, update);
     this.boundSquareHistory(entry);
     entry.at = Date.now();
@@ -868,9 +981,21 @@ export class EvexLineProvider implements LineProvider {
     return a.createdAt - b.createdAt || a.messageId.length - b.messageId.length || a.messageId.localeCompare(b.messageId);
   }
 
+  private squareLowerBound(messages: Message[], target: Pick<Message, "createdAt" | "messageId">): number {
+    let low = 0;
+    let high = messages.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (this.compareSquareMessages(messages[middle]!, target) < 0) low = middle + 1;
+      else high = middle;
+    }
+    return low;
+  }
+
   private boundSquareHistory(entry: SquareHistory): void {
     if (entry.messages.length > SQUARE_MAX_MESSAGES) {
       for (const message of entry.messages.splice(0, entry.messages.length - SQUARE_MAX_MESSAGES)) {
+        entry.byId.delete(message.messageId);
         entry.origins.delete(message.messageId);
         entry.updates.delete(message.messageId);
         entry.liveUpdates.delete(message.messageId);
@@ -879,9 +1004,9 @@ export class EvexLineProvider implements LineProvider {
   }
 
   private applySquareUpdate(entry: SquareHistory, id: string, update: { unsent?: boolean; reactions?: Reactions }): void {
-    const index = entry.messages.findIndex((message) => message.messageId === id);
-    if (index < 0) return;
-    const message = entry.messages[index]!;
+    const message = entry.byId.get(id);
+    if (!message) return;
+    const index = this.squareLowerBound(entry.messages, message);
     if (update.unsent) {
       entry.messages[index] = { messageId: message.messageId, channelId: message.channelId, channelKind: message.channelKind, senderId: message.senderId, senderName: message.senderName, createdAt: message.createdAt, contentType: message.contentType, unsent: true };
       entry.origins.delete(id);
@@ -889,6 +1014,7 @@ export class EvexLineProvider implements LineProvider {
       const { reactions: _old, ...rest } = message;
       entry.messages[index] = { ...rest, ...(update.reactions ? { reactions: update.reactions } : {}) };
     }
+    entry.byId.set(id, entry.messages[index]!);
   }
 
   private updateSquareMessage(chatId: string, id: string, update: { unsent?: boolean; reactions?: Reactions }, live = true): void {
@@ -909,10 +1035,16 @@ export class EvexLineProvider implements LineProvider {
   private rememberSquareMessage(message: Message): void {
     const cached = this.squareCache.get(message.channelId);
     if (!cached) return;
-    const index = cached.messages.findIndex((entry) => entry.messageId === message.messageId);
-    if (index >= 0) cached.messages[index] = message;
-    else cached.messages.push(message);
-    if (cached.messages.length > 1 && this.compareSquareMessages(cached.messages.at(-2)!, cached.messages.at(-1)!) > 0) cached.messages.sort((a, b) => this.compareSquareMessages(a, b));
+    const previous = cached.byId.get(message.messageId);
+    const previousIndex = previous ? this.squareLowerBound(cached.messages, previous) : -1;
+    if (previous && previous.createdAt === message.createdAt) {
+      cached.messages[previousIndex] = message;
+    } else {
+      if (previous) cached.messages.splice(previousIndex, 1);
+      const index = this.squareLowerBound(cached.messages, message);
+      cached.messages.splice(index, 0, message);
+    }
+    cached.byId.set(message.messageId, message);
     const origin = this.mediaOrigins.get(message.messageId);
     if (origin?.square) cached.origins.set(message.messageId, origin.raw);
     const update = cached.updates.get(message.messageId);
@@ -954,7 +1086,9 @@ export class EvexLineProvider implements LineProvider {
     } catch (error) {
       if (!String((error as { data?: { code?: unknown } } | undefined)?.data?.code ?? "").includes("E2EE")) throw error;
     }
+    if (this.client !== client) throw new Error("NOT_AUTHENTICATED");
     const chunks = await client.base.e2ee.encryptE2EEMessage(to, { ...contentMetadata, text }, "NONE");
+    if (this.client !== client) throw new Error("NOT_AUTHENTICATED");
     return client.base.talk.sendMessage({
       to, contentType: "NONE", chunks, e2ee: true, ...reply,
       contentMetadata: { ...contentMetadata, e2eeVersion: "2", contentType: "0", e2eeMark: "2" },
@@ -985,7 +1119,12 @@ export class EvexLineProvider implements LineProvider {
     const client = this.requireClient();
     const me = this.getProfile();
     const isVideo = media.mime.startsWith("video/");
-    const blob = new Blob([new Uint8Array(media.bytes)], { type: media.mime });
+    const bytes = media.bytes;
+    // Blob snapshots ArrayBuffer views itself; shared backing stores still need an ordinary copy.
+    const part = bytes.buffer instanceof ArrayBuffer
+      ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+      : new Uint8Array(bytes);
+    const blob = new Blob([part], { type: media.mime });
     const filename = isVideo ? `video.${media.mime === "video/quicktime" ? "mov" : "mp4"}` : `image.${media.mime === "image/png" ? "png" : media.mime === "image/gif" ? "gif" : "jpg"}`;
     // LINE shows this number as the clip length and never works it out itself.
     const durationMs = isVideo ? mp4DurationMs(media.bytes) : undefined;
@@ -1024,7 +1163,7 @@ export class EvexLineProvider implements LineProvider {
       // OpenChat has no cancel call: MessageReactionType UNDO takes the reaction back.
       await client.base.square.reactToMessage({ request: { reqSeq, squareChatMid: channel.channelId, messageId, reactionType: kind ?? "UNDO" } });
       if (this.client !== client) throw new Error("NOT_AUTHENTICATED");
-      const message = this.squareCache.get(channel.channelId)?.messages.find((entry) => entry.messageId === messageId);
+      const message = this.squareCache.get(channel.channelId)?.byId.get(messageId);
       if (message && !message.unsent) {
         this.updateSquareMessage(channel.channelId, messageId, {
           reactions: withMyReaction(message.reactions, kind),
@@ -1051,13 +1190,19 @@ export class EvexLineProvider implements LineProvider {
   // LINE rejects above 100 mids ("max_size":100). Page it here instead.
   private async fetchFriends(client: Client): Promise<Channel[]> {
     const { userFriendMids } = await client.base.relation.getUserFriendIds({ request: { blockStatus: "ALL" } });
-    const batches: string[][] = [];
-    for (let offset = 0; offset < (userFriendMids?.length ?? 0); offset += FRIEND_BATCH) batches.push(userFriendMids.slice(offset, offset + FRIEND_BATCH));
+    if (this.client !== client || this.stopped) return [];
+    const count = userFriendMids?.length ?? 0;
     const friends: Channel[] = [];
     // A few batches at a time: a large friend list is not a long line of sequential round trips,
     // and LINE is not hit with every batch at once.
-    for (let wave = 0; wave < batches.length; wave += FRIEND_BATCH_CONCURRENCY) {
-      const answers = await Promise.all(batches.slice(wave, wave + FRIEND_BATCH_CONCURRENCY).map((mids) => client.base.relation.getContactsV3({ mids })));
+    for (let wave = 0; wave < count; wave += FRIEND_BATCH * FRIEND_BATCH_CONCURRENCY) {
+      const requests = [];
+      const end = Math.min(wave + FRIEND_BATCH * FRIEND_BATCH_CONCURRENCY, count);
+      for (let offset = wave; offset < end; offset += FRIEND_BATCH) {
+        requests.push(client.base.relation.getContactsV3({ mids: userFriendMids.slice(offset, offset + FRIEND_BATCH) }));
+      }
+      const answers = await Promise.all(requests);
+      if (this.client !== client || this.stopped) return [];
       for (const { responses } of answers) {
         for (const contact of responses) {
           const name = contact.friendDetail?.user?.overriddenName || contact.targetProfileDetail?.profileName || UNKNOWN_MEMBER;
@@ -1119,33 +1264,39 @@ export class EvexLineProvider implements LineProvider {
     const activeAt = new Map<string, number>();
     const talkLast = new Map<string, LineMessage>();
     const squareLast = new Map<string, { raw: LineSquareMessage; name?: string }>();
-    try {
-      const seen = new Set<string>();
-      let minChatId: string | undefined;
-      for (let page = 0; page < UNREAD_MAX_PAGES; page += 1) {
-        const { messageBoxes, hasNext } = await client.base.talk.getMessageBoxes({
-          messageBoxListRequest: { withUnreadCount: true, lastMessagesPerMessageBoxCount: 1, ...(minChatId ? { minChatId } : {}) },
-        });
-        const fresh = (messageBoxes ?? []).filter((box) => !seen.has(box.id));
-        for (const box of fresh) {
-          seen.add(box.id);
-          counts.set(box.id, Number(box.unreadCount));
-          const delivered = Number(box.lastDeliveredMessageId?.deliveredTime);
-          if (Number.isFinite(delivered) && delivered > 0) activeAt.set(box.id, delivered);
-          const last = box.lastMessages?.[0];
-          if (last && typeof last.id === "string") talkLast.set(box.id, last);
+    const talkLoading = (async () => {
+      try {
+        const seen = new Set<string>();
+        let minChatId: string | undefined;
+        for (let page = 0; page < UNREAD_MAX_PAGES && this.client === client && !this.stopped; page += 1) {
+          const { messageBoxes, hasNext } = await client.base.talk.getMessageBoxes({
+            messageBoxListRequest: { withUnreadCount: true, lastMessagesPerMessageBoxCount: 1, ...(minChatId ? { minChatId } : {}) },
+          });
+          if (this.client !== client || this.stopped) return;
+          const fresh = (messageBoxes ?? []).filter((box) => !seen.has(box.id));
+          for (const box of fresh) {
+            seen.add(box.id);
+            counts.set(box.id, Number(box.unreadCount));
+            const delivered = Number(box.lastDeliveredMessageId?.deliveredTime);
+            if (Number.isFinite(delivered) && delivered > 0) activeAt.set(box.id, delivered);
+            const last = box.lastMessages?.[0];
+            if (last && typeof last.id === "string") talkLast.set(box.id, last);
+          }
+          if (!hasNext || fresh.length === 0) break;
+          minChatId = fresh.at(-1)!.id;
         }
-        if (!hasNext || fresh.length === 0) break;
-        minChatId = fresh.at(-1)!.id;
+      } catch {
+        // Talk chats just show no badge or preview this time.
       }
-    } catch {
-      // Talk chats just show no badge or preview this time.
-    }
+    })();
     const squares = channels.filter((channel) => channel.kind === "square");
-    for (let offset = 0; offset < squares.length; offset += SQUARE_LOOKUP_CONCURRENCY) {
-      await Promise.all(squares.slice(offset, offset + SQUARE_LOOKUP_CONCURRENCY).map(async (channel) => {
+    let nextSquare = 0;
+    const squareWorker = async (): Promise<void> => {
+      while (nextSquare < squares.length && this.client === client && !this.stopped) {
+        const channel = squares[nextSquare++]!;
         try {
           const { chatStatus } = await client.base.square.getSquareChatStatus({ request: { squareChatMid: channel.channelId } });
+          if (this.client !== client || this.stopped) return;
           counts.set(channel.channelId, Number(chatStatus.otherStatus.unreadMessageCount));
           const members = Number(chatStatus.otherStatus.memberCount);
           if (Number.isInteger(members) && members > 0) channel.memberCount = members;
@@ -1154,9 +1305,12 @@ export class EvexLineProvider implements LineProvider {
         } catch {
           // This OpenChat shows no badge or preview this time.
         }
-      }));
-    }
+      }
+    };
+    await Promise.all([talkLoading, ...Array.from({ length: Math.min(SQUARE_LOOKUP_CONCURRENCY, squares.length) }, squareWorker)]);
+    if (this.client !== client || this.stopped) return;
     const previews = await this.previewMessages(client, talkLast, squareLast);
+    if (this.client !== client || this.stopped) return;
     for (const channel of channels) {
       const count = counts.get(channel.channelId);
       if (count && Number.isFinite(count) && count > 0) channel.unreadCount = Math.min(count, MAX_UNREAD_SHOWN);
@@ -1183,8 +1337,8 @@ export class EvexLineProvider implements LineProvider {
       decrypted.set(chatId, entry);
     }
     for (const { raw, name } of squareLast.values()) if (name) this.rememberName(raw.message.from, name);
-    await this.resolveMembers(client, "talk", [...decrypted.values()].flatMap((entry) => [entry.raw.from, ...chatEventMids(entry.raw.contentMetadata)]));
-    await this.resolveMembers(client, "square", [...squareLast.values()].map(({ raw }) => raw.message.from));
+    await this.resolveMembers(client, "talk", talkMemberMids(decrypted.values()));
+    await this.resolveMembers(client, "square", squareMemberMids(squareLast.values()));
     for (const [chatId, entry] of decrypted) {
       try {
         const message = this.talkToMessage(entry.raw, myMid, entry.undecryptable, true);
@@ -1243,6 +1397,12 @@ export class EvexLineProvider implements LineProvider {
     this.client = undefined;
     this.profiles.clear();
     this.lookupMisses.clear();
+    for (const job of this.lookupJobs) job.cancel();
+    this.lookupQueue.clear();
+    this.lookupJobs.clear();
+    this.lookupFlights.clear();
+    this.adminFlights.clear();
+    this.deliveries.clear();
     this.mediaOrigins.clear();
     this.previewDecrypts.clear();
     this.stickerPackages = undefined;

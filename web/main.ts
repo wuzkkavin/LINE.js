@@ -14,6 +14,8 @@ import { createUpdateNotice } from "./update.js";
 import { copyImage, downloadMedia } from "./save.js";
 import { createNotifier } from "./notify.js";
 import { CONTENT_LABEL, cardTitle, dayLabel, formatBytes, formatTime, listTime, previewOf, scamSummary } from "./format.js";
+import { SearchWindow } from "./searchWindow.js";
+import { CHAT_MESSAGE_LIMIT, TOTAL_MESSAGE_LIMIT, retainedRange } from "./retention.js";
 
 const $ = <T extends HTMLElement>(selector: string): T => document.querySelector<T>(selector)!;
 const login = $<HTMLElement>("#login");
@@ -74,7 +76,53 @@ let reconnectDelay = 1000;
 let authState: AuthState | undefined;
 let signedIn = false;
 let channels: Channel[] = [];
+const channelsById = new Map<string, Channel>();
+let channelOrderDirty = false;
+let orderedFriends: Channel[] | undefined;
+// Channel frames replace objects, so renamed channels receive a fresh search key.
+let channelSearchNames = new WeakMap<Channel, string>();
 let messages: Record<string, Message[]> = {};
+let messageIndices: Record<string, Map<string, number>> = {};
+const unorderedChats = new Set<string>();
+const retainedChats = new Set<string>();
+const trimmedNewer = new Set<string>();
+let retainedCount = 0;
+let evictedCount = 0;
+const retentionNote = document.createElement("p");
+retentionNote.id = "retention-note";
+retentionNote.role = "status";
+messageList.parentElement!.before(retentionNote);
+let shownRetentionCount = -1;
+let shownEvictionCount = -1;
+let shownHistoryWindow = false;
+
+function updateRetentionNote(): void {
+  const historyWindow = selected !== undefined && trimmedNewer.has(selected);
+  if (shownRetentionCount === retainedCount && shownEvictionCount === evictedCount && shownHistoryWindow === historyWindow) return;
+  const text = `只搜尋目前保留訊息：每聊天室最多 ${CHAT_MESSAGE_LIMIT} 則、全部最多 ${TOTAL_MESSAGE_LIMIT.toLocaleString()} 則；目前 ${retainedCount.toLocaleString()} 則。` +
+    (evictedCount ? `已移出 ${evictedCount.toLocaleString()} 則；較早訊息可向上載入，回到聊天室會重新載入最新訊息。` : "較早訊息可向上載入。") +
+    (historyWindow ? "目前閱讀歷史窗口；按「最新訊息」返回。" : "") +
+    "引用跳轉與提及候選僅涵蓋目前保留範圍。";
+  if (retentionNote.textContent !== text) retentionNote.textContent = text;
+  shownRetentionCount = retainedCount;
+  shownEvictionCount = evictedCount;
+  shownHistoryWindow = historyWindow;
+}
+
+function indexMessages(list: readonly Message[]): Map<string, number> {
+  const indices = new Map<string, number>();
+  for (let index = 0; index < list.length; index += 1) indices.set(list[index]!.messageId, index);
+  return indices;
+}
+
+function orderedMessages(channelId: string): Message[] {
+  const list = messages[channelId] ?? [];
+  if (unorderedChats.delete(channelId)) {
+    list.sort((a, b) => a.createdAt - b.createdAt);
+    messageIndices[channelId] = indexMessages(list);
+  }
+  return list;
+}
 let unread: Record<string, number> = {};
 // Chats opened (read) on this page, and chats whose unread count this page has changed itself:
 // for every other chat the badge follows LINE's own count from the channel list.
@@ -86,6 +134,8 @@ let selected: string | undefined;
 let myUserId: string | undefined;
 // Other members' read positions per chat (last message each has read), used for "已讀" labels.
 let readPositions: Record<string, Record<string, bigint>> = {};
+const sortedReadPositions = new WeakMap<Record<string, bigint>, bigint[]>();
+let messageReadIds = new WeakMap<Message, bigint | null>();
 // OpenChat chat → the member id this account's sends came back with there (it differs from myUserId).
 let mySquareSenders: Record<string, string> = {};
 // Where the "未讀" divider sits in the chat that was just opened; dropped when switching chats.
@@ -98,10 +148,11 @@ let readTimer: ReturnType<typeof setTimeout> | undefined;
 
 // Searching looks through what is already loaded (every chat's messages) and jumps to a hit on click.
 let searching = false;
+// Canonical matching/highlighting query; the input retains the user's original text.
 let searchQuery = "";
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 
-interface HistoryState { cursor?: string; hasMore: boolean; loading: boolean; loaded: boolean; failed: boolean }
+interface HistoryState { cursor?: string; hasMore: boolean; loading: boolean; loaded: boolean; failed: boolean; restart?: boolean }
 let historyOf: Record<string, HistoryState> = {};
 let pendingHistory: Record<string, string> = {};
 // The service has a Jev token (scam:state), and the scam checks this page is waiting on.
@@ -116,14 +167,16 @@ function send(frame: ClientFrame): boolean {
 
 // Who the "@" list offers: people who have spoken in the open chat (the server only accepts those), newest first.
 const composer = createComposer(send, {
-  candidates() {
-    const seen = new Map<string, MentionCandidate>();
-    for (const message of [...(messages[selected ?? ""] ?? [])].reverse()) {
+  *candidates(): Iterable<MentionCandidate> {
+    const seen = new Set<string>();
+    const messages = orderedMessages(selected ?? "");
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index]!;
       if (taggable(message) && !seen.has(message.senderId)) {
-        seen.set(message.senderId, { userId: message.senderId, name: message.senderName, ...(message.senderPictureId ? { pictureId: message.senderPictureId } : {}) });
+        seen.add(message.senderId);
+        yield { userId: message.senderId, name: message.senderName, ...(message.senderPictureId ? { pictureId: message.senderPictureId } : {}) };
       }
     }
-    return [...seen.values()];
   },
   avatar: (person) => createAvatar(person.pictureId, person.name),
 });
@@ -153,6 +206,14 @@ function applyAuthState(state: AuthState): void {
     // Session lost after login: fall back to the login view instead of a dead chat.
     clearTimeout(searchTimer);
     clearTimeout(readTimer);
+    cancelMessageRender();
+    messageDays = new WeakMap();
+    messageReadIds = new WeakMap();
+    searchText = new WeakMap();
+    channelSearchNames = new WeakMap();
+    searchWindow.clear();
+    renderedSearchQuery = undefined;
+    renderedSearchHits = [];
     searching = false;
     searchQuery = "";
     messageSearch.value = "";
@@ -179,11 +240,17 @@ function applyAuthState(state: AuthState): void {
     unseenBelow = 0;
     pinnedToBottom = true;
     channels = [];
+    orderedFriends = undefined;
+    channelsById.clear();
+    channelOrderDirty = false;
     messages = {};
+    messageIndices = {};
+    unorderedChats.clear();
     unread = {};
     opened = new Set();
     liveCounted = new Set();
     selected = undefined;
+    resetRetention();
     tab = "chats";
     filter.value = "";
     historyOf = {};
@@ -195,7 +262,7 @@ function applyAuthState(state: AuthState): void {
     unreadFrom = undefined;
     composer.reset();
     renderChannels();
-    renderMessages();
+    drawMessages();
   }
   clearSecrets();
   if (state === "restoring") showLogin("正在復用 session…", false);
@@ -214,7 +281,7 @@ function enterChat(profile: Profile): void {
   meAvatar.replaceChildren(createAvatar(profile.pictureId, profile.displayName, { zoomable: true }));
   logoutButton.disabled = false;
   renderChannels();
-  renderMessages();
+  drawMessages();
 }
 
 // A friend belongs to the 聊天 tab only once there is a conversation with them;
@@ -225,7 +292,7 @@ function hasConversation(channel: Channel): boolean {
 
 /** The newest message known for a chat: the server's list preview, unless this page has seen a newer one. */
 function latestOf(channel: Channel): Message | undefined {
-  const seen = messages[channel.channelId]?.at(-1);
+  const seen = messages[channel.channelId] ? orderedMessages(channel.channelId).at(-1) : undefined;
   const listed = channel.lastMessage;
   return seen && (!listed || seen.createdAt >= listed.createdAt) ? seen : listed;
 }
@@ -247,7 +314,11 @@ function renderTabs(): void {
     button.ariaSelected = String(tab === name);
     button.tabIndex = tab === name ? 0 : -1;
   }
-  const total = channels.filter(hasConversation).reduce((sum, channel) => sum + (unread[channel.channelId] ?? 0), 0);
+  let total = 0;
+  for (const id in unread) {
+    const channel = channelsById.get(id);
+    if (channel && hasConversation(channel)) total += unread[id]!;
+  }
   chatsUnread.hidden = total === 0;
   chatsUnread.textContent = total > 99 ? "99+" : String(total);
 }
@@ -297,11 +368,27 @@ function channelRow(channel: Channel, count: number | undefined, latest: Message
 const friendOrder = new Intl.Collator("zh-TW");
 
 function renderChannels(): void {
+  if (channelOrderDirty) {
+    sortChannels();
+    channelOrderDirty = false;
+  }
   const keyword = filter.value.trim().toLocaleLowerCase();
-  const inTab = channels.filter((channel) => (tab === "friends" ? channel.kind === "user" : hasConversation(channel)));
-  const visible = inTab.filter((channel) => channel.name.toLocaleLowerCase().includes(keyword));
-  // Conversations are ordered by activity (see sortChannels); the friend list reads alphabetically.
-  if (tab === "friends") visible.sort((a, b) => friendOrder.compare(a.name, b.name));
+  // Reuse full friend ordering, but keep a narrow search cheap after channel data changes.
+  const inTab = tab === "friends"
+    ? (orderedFriends ?? channels.filter((channel) => channel.kind === "user"))
+    : channels.filter(hasConversation);
+  const visible = keyword ? inTab.filter((channel) => {
+    let name = channelSearchNames.get(channel);
+    if (name === undefined) {
+      name = channel.name.toLocaleLowerCase();
+      channelSearchNames.set(channel, name);
+    }
+    return name.includes(keyword);
+  }) : inTab;
+  if (tab === "friends" && !orderedFriends) {
+    visible.sort((a, b) => friendOrder.compare(a.name, b.name));
+    if (!keyword) orderedFriends = visible;
+  }
   const day = new Date().toDateString();
   const nodes = visible.map((channel) => {
     const count = unread[channel.channelId];
@@ -311,13 +398,13 @@ function renderChannels(): void {
       row = { node: channelRow(channel, count, latest), channel, count, latest, tab, day };
       channelRows.set(channel.channelId, row);
     }
-    row.node.ariaSelected = String(channel.channelId === selected);
+    const ariaSelected = String(channel.channelId === selected);
+    if (row.node.ariaSelected !== ariaSelected) row.node.ariaSelected = ariaSelected;
     return row.node;
   });
   // Rows of channels that are gone (logout, another account) are not kept around.
   if (channelRows.size > channels.length) {
-    const current = new Set(channels.map((channel) => channel.channelId));
-    for (const id of channelRows.keys()) if (!current.has(id)) channelRows.delete(id);
+    for (const id of channelRows.keys()) if (!channelsById.has(id)) channelRows.delete(id);
   }
   reconcile(channelList, nodes);
   filter.placeholder = tab === "friends" ? "搜尋好友" : "搜尋聊天";
@@ -331,7 +418,7 @@ function renderChannels(): void {
 
 channelList.addEventListener("contextmenu", (event) => {
   const id = chatAt(event.target);
-  const channel = channels.find((entry) => entry.channelId === id);
+  const channel = id ? channelsById.get(id) : undefined;
   if (!channel) return;
   event.preventDefault();
   showMenu(event.clientX, event.clientY, [{
@@ -374,18 +461,24 @@ const CONTINUE_WITHIN_MS = 5 * 60_000;
 
 // True while the reader is at the newest message; media that finishes loading then keeps it in view.
 let pinnedToBottom = true;
+let mediaPinFrame: number | undefined;
 function keepPinned(): void {
-  if (pinnedToBottom) messageList.scrollTop = messageList.scrollHeight;
+  if (!signedIn || searching || !pinnedToBottom || mediaPinFrame !== undefined) return;
+  mediaPinFrame = requestAnimationFrame(() => {
+    mediaPinFrame = undefined;
+    if (signedIn && !searching && pinnedToBottom) messageList.scrollTop = messageList.scrollHeight;
+  });
 }
 
 // "↓ 最新訊息" while the reader is away from the newest line; counts what arrived below meanwhile.
 const jump = $<HTMLButtonElement>("#jump");
 let unseenBelow = 0;
 function updateJump(): void {
-  const away = selected !== undefined && messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight > 200;
+  const away = selected !== undefined && (trimmedNewer.has(selected) || messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight > 200);
   if (!away) unseenBelow = 0;
-  jump.hidden = !away;
-  jump.textContent = unseenBelow > 0 ? `↓ ${unseenBelow} 則新訊息` : "↓ 最新訊息";
+  jump.hidden = searching || !away;
+  const label = unseenBelow > 0 ? `↓ ${unseenBelow} 則新訊息` : "↓ 最新訊息";
+  if (jump.textContent !== label) jump.textContent = label;
 }
 jump.addEventListener("click", () => {
   scrollToLatest();
@@ -396,9 +489,15 @@ jump.addEventListener("click", () => {
 // to and whoever's id the echo carries (communities use another sender id): jump there and stay
 // pinned while pictures and stickers finish loading.
 function scrollToLatest(): void {
+  if (selected && trimmedNewer.has(selected)) {
+    dropRetainedChat(selected);
+    drawMessages();
+    requestHistory(selected);
+  }
   pinnedToBottom = true;
+  if (messageFrame !== undefined) pendingAnchor = "bottom";
   messageList.scrollTop = messageList.scrollHeight;
-  requestAnimationFrame(keepPinned);
+  keepPinned();
 }
 
 /**
@@ -407,6 +506,7 @@ function scrollToLatest(): void {
  * `hit` (a lower-cased query) only highlights when searching.
  */
 function decorate(text: string, mentions: readonly TextMention[], hit: string, emojis: readonly TextEmoji[] = []): Node[] {
+  if (mentions.length === 0 && emojis.length === 0 && !hit) return linkifiedNodes(text);
   const nodes: Node[] = [];
   const emit = (part: string, mention?: TextMention): void => {
     if (part === "") return;
@@ -432,14 +532,21 @@ function decorate(text: string, mentions: readonly TextMention[], hit: string, e
     }
     nodes.push(...linkifiedNodes(part));
   };
-  const ranges = [...mentions.map((mention) => ({ start: mention.start, end: mention.end, mention })), ...emojis.map((emoji) => ({ start: emoji.start, end: emoji.end, emoji }))]
-    .sort((a, b) => a.start - b.start);
+  // Both DTO lists are sorted; mentions retain precedence when ranges start together.
+  let mentionIndex = 0;
+  let emojiIndex = 0;
   let at = 0;
-  for (const range of ranges) {
+  while (mentionIndex < mentions.length || emojiIndex < emojis.length) {
+    const mention = mentions[mentionIndex];
+    const emoji = emojis[emojiIndex];
+    const useMention = mention !== undefined && (emoji === undefined || mention.start <= emoji.start);
+    const range = useMention ? mention! : emoji!;
+    if (useMention) mentionIndex++;
+    else emojiIndex++;
     if (range.start < at || range.end > text.length) continue;
     emit(text.slice(at, range.start));
-    if ("emoji" in range) nodes.push(emojiImage(range.emoji.emojiId, text.slice(range.start, range.end)));
-    else emit(text.slice(range.start, range.end), range.mention);
+    if (useMention) emit(text.slice(range.start, range.end), mention);
+    else nodes.push(emojiImage(emoji!.emojiId, text.slice(range.start, range.end)));
     at = range.end;
   }
   emit(text.slice(at));
@@ -544,10 +651,22 @@ function cardNode(card: MessageCard): HTMLElement {
  * receipts do not apply. Readers' positions are sorted once, then each message is a binary search.
  */
 function readLabels(channelId: string, list: readonly Message[]): (string | undefined)[] {
-  const positions = Object.values(readPositions[channelId] ?? {}).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const readers = readPositions[channelId];
+  if (!readers) return [];
+  let positions = sortedReadPositions.get(readers);
+  if (!positions) {
+    positions = Object.values(readers).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    sortedReadPositions.set(readers, positions);
+  }
+  if (positions.length === 0) return [];
   return list.map((message) => {
-    if (positions.length === 0 || message.senderId !== myUserId || message.channelKind === "square" || !/^\d{1,20}$/.test(message.messageId)) return undefined;
-    const id = BigInt(message.messageId);
+    if (message.senderId !== myUserId || message.channelKind === "square") return undefined;
+    let id = messageReadIds.get(message);
+    if (id === undefined) {
+      id = /^\d{1,20}$/.test(message.messageId) ? BigInt(message.messageId) : null;
+      messageReadIds.set(message, id);
+    }
+    if (id === null) return undefined;
     // First reader position at or past this message: everyone from there on has read it.
     let low = 0;
     let high = positions.length;
@@ -569,16 +688,27 @@ interface SearchHit {
   channel: Channel | undefined;
 }
 
+const searchWindow = new SearchWindow<SearchHit>(messageList, ({ message, channel }) => searchRow(message, channel), ({ message }) => JSON.stringify([message.channelId, message.messageId]));
+let renderedSearchQuery: string | undefined;
+let renderedSearchHits: readonly SearchHit[] = [];
+let searchText = new WeakMap<Message, { sender: string; body: string }>();
+
 function searchHits(): SearchHit[] {
-  const query = searchQuery.trim().toLocaleLowerCase();
+  const query = searchQuery;
   if (query === "") return [];
   const hits: SearchHit[] = [];
-  const byChannel = new Map(channels.map((channel) => [channel.channelId, channel]));
-  for (const [channelId, list] of Object.entries(messages)) {
-    const channel = byChannel.get(channelId);
-    for (const message of list) {
-      const sender = message.senderName.toLocaleLowerCase();
-      const body = (message.text ?? (message.card ? cardTitle(message.card) : "")).toLocaleLowerCase();
+  for (const channelId of Object.keys(messages)) {
+    const channel = channelsById.get(channelId);
+    for (const message of orderedMessages(channelId)) {
+      let text = searchText.get(message);
+      if (!text) {
+        text = {
+          sender: message.senderName.toLocaleLowerCase(),
+          body: (message.text ?? (message.card ? cardTitle(message.card) : "")).toLocaleLowerCase(),
+        };
+        searchText.set(message, text);
+      }
+      const { sender, body } = text;
       if (sender.includes(query) || body.includes(query)) hits.push({ message, channel });
     }
   }
@@ -588,9 +718,8 @@ function searchHits(): SearchHit[] {
 function jumpToMessage(message: Message): void {
   closeSearch();
   if (selected !== message.channelId) openChat(message.channelId);
-  const find = (): HTMLElement | undefined =>
-    [...messageList.querySelectorAll<HTMLElement>(".message, .system-event")].find((node) => node.dataset.messageId === message.messageId);
-  const node = find() ?? (renderMessages(), find());
+  const find = (): HTMLElement | undefined => rendered.get(message.messageId)?.node;
+  const node = find() ?? (drawMessages(), find());
   if (!node) return;
   node.scrollIntoView({ block: "center", behavior: "smooth" });
   node.classList.add("flash");
@@ -598,20 +727,23 @@ function jumpToMessage(message: Message): void {
 }
 
 function renderSearch(): void {
-  const query = searchQuery.trim();
+  const query = searchQuery;
   jump.hidden = true;
   const hits = searchHits();
+  if (renderedSearchQuery === query && hits.length === renderedSearchHits.length &&
+    hits.every((hit, index) => hit.message === renderedSearchHits[index]!.message && hit.channel === renderedSearchHits[index]!.channel)) return;
   searchCount.textContent = query === "" ? "" : hits.length + " 則";
-  const rows: Node[] = [];
-  const note = document.createElement("p");
-  note.className = "history-note";
-  note.textContent = query === "" ? "輸入文字以搜尋所有已載入的訊息。" : hits.length === 0 ? "沒有符合的已載入訊息。" : hits.length + " 則符合（只涵蓋已載入的訊息）";
-  rows.push(note);
-  const hit = query.toLocaleLowerCase();
-  for (const { message, channel } of hits) {
+  searchWindow.set(hits, query === "" ? "輸入文字；只搜尋目前保留訊息。" : hits.length === 0 ? "目前保留訊息沒有符合結果。" : `${hits.length} 則符合（只搜尋目前保留訊息）`, renderedSearchQuery !== query);
+  renderedSearchQuery = query;
+  renderedSearchHits = hits;
+}
+
+function searchRow(message: Message, channel: Channel | undefined): HTMLElement {
+    const hit = searchQuery;
     const row = document.createElement("article");
-    row.className = "message";
+    row.className = "message search-result";
     row.dataset.messageId = message.messageId;
+    row.dataset.channelId = message.channelId;
     row.role = "button";
     row.tabIndex = 0;
     row.addEventListener("click", () => jumpToMessage(message));
@@ -646,19 +778,20 @@ function renderSearch(): void {
     }
     main.append(body);
     row.append(main);
-    rows.push(row);
-  }
-  reconcile(messageList, rows);
+    return row;
 }
 
 function closeSearch(): void {
   clearTimeout(searchTimer);
   searching = false;
+  searchWindow.clear();
+  renderedSearchQuery = undefined;
+  renderedSearchHits = [];
   searchQuery = "";
   messageSearch.value = "";
   searchBar.hidden = true;
   searchToggle.ariaPressed = "false";
-  renderMessages();
+  drawMessages();
 }
 
 searchToggle.addEventListener("click", () => {
@@ -666,6 +799,9 @@ searchToggle.addEventListener("click", () => {
   searching = true;
   searchBar.hidden = false;
   searchToggle.ariaPressed = "true";
+  cancelMessageRender();
+  rendered.clear();
+  dayDividers.clear();
   renderSearch();
   messageSearch.focus();
 });
@@ -673,8 +809,8 @@ searchClose.addEventListener("click", closeSearch);
 messageSearch.addEventListener("input", () => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
-    searchQuery = messageSearch.value;
-    renderSearch();
+    searchQuery = messageSearch.value.trim().toLocaleLowerCase();
+    renderMessages("keep");
   }, 120);
 });
 messageSearch.addEventListener("keydown", (event) => {
@@ -794,7 +930,7 @@ function quoteNode(message: Message, original: Message | undefined): HTMLElement
   const quote = document.createElement("button");
   quote.type = "button";
   quote.className = "reply-quote";
-  quote.textContent = original ? `${original.senderName}：${previewOf(original)}` : "回覆一則較早的訊息";
+  quote.textContent = original ? `${original.senderName}：${previewOf(original)}` : "原訊息不在目前保留範圍（可向上載入）";
   quote.disabled = !original;
   quote.dataset.replyTo = message.replyTo;
   return quote;
@@ -868,6 +1004,26 @@ function messageNode(message: Message, continued: boolean, quoted: Message | und
  * attached, so a playing video or voice message keeps playing and loaded pictures are not reloaded.
  */
 function reconcile(parent: HTMLElement, nodes: readonly Node[]): void {
+  let current = parent.firstChild;
+  let matched = 0;
+  while (current !== null && matched < nodes.length && nodes[matched] === current) {
+    current = current.nextSibling;
+    matched++;
+  }
+  // Appends and trailing removals do not need a full membership set or child-node snapshot.
+  if (current === null) {
+    while (matched < nodes.length) parent.appendChild(nodes[matched++]!);
+    return;
+  }
+  if (matched === nodes.length) {
+    while (current !== null) {
+      const next: ChildNode | null = current.nextSibling;
+      current.remove();
+      current = next;
+    }
+    return;
+  }
+
   const keep = new Set(nodes);
   for (const child of [...parent.childNodes]) if (!keep.has(child)) child.remove();
   let cursor = parent.firstChild;
@@ -878,10 +1034,12 @@ function reconcile(parent: HTMLElement, nodes: readonly Node[]): void {
 }
 
 // What is on screen for the open chat, keyed by message id; dropped when another chat is opened.
-let rendered = new Map<string, RenderedMessage>();
+const rendered = new Map<string, RenderedMessage>();
 let renderedChannel: string | undefined;
 const historyMarker = document.createElement("div");
 historyMarker.className = "history-note";
+const emptyMessages = document.createElement("p");
+emptyMessages.className = "empty";
 const historyRetry = document.createElement("button");
 historyRetry.type = "button";
 historyRetry.className = "ghost";
@@ -932,64 +1090,98 @@ messageList.addEventListener("keydown", (event) => {
   composer.insertMention({ userId: message.senderId, name: message.senderName });
 });
 
-function renderMessages(anchor: "bottom" | "keep" | "prepend" = "bottom"): void {
-  const channel = channels.find((entry) => entry.channelId === selected);
-  channelTitle.textContent = channel?.name ?? "選擇一個聊天室";
+type MessageAnchor = "bottom" | "keep" | "prepend";
+let messageFrame: number | undefined;
+let pendingAnchor: MessageAnchor | undefined;
+let burstNearBottom: boolean | undefined;
+const historyFill = new Set<string>();
+let messageDays = new WeakMap<Message, string>();
+
+function cancelMessageRender(): void {
+  if (messageFrame !== undefined) cancelAnimationFrame(messageFrame);
+  messageFrame = undefined;
+  pendingAnchor = undefined;
+  burstNearBottom = undefined;
+  historyFill.clear();
+}
+
+function renderMessages(anchor: MessageAnchor = "bottom"): void {
+  // An own send wins over history anchoring; prepends otherwise retain the old viewport.
+  if (pendingAnchor !== "bottom" && (anchor !== "keep" || pendingAnchor === undefined)) pendingAnchor = anchor;
+  if (messageFrame !== undefined) return;
+  messageFrame = requestAnimationFrame(() => {
+    const nextAnchor = pendingAnchor ?? "keep";
+    const fill = [...historyFill];
+    drawMessages(nextAnchor);
+    for (const channelId of fill) {
+      const state = historyOf[channelId];
+      if (!searching && channelId === selected && state?.hasMore && (messageList.scrollHeight <= messageList.clientHeight + 40 || messageList.scrollTop < 80)) requestHistory(channelId);
+    }
+  });
+}
+
+function drawMessages(anchor: MessageAnchor = "bottom"): void {
+  cancelMessageRender();
+  updateRetentionNote();
+  const channel = selected ? channelsById.get(selected) : undefined;
+  const title = channel?.name ?? "選擇一個聊天室";
+  if (channelTitle.textContent !== title) channelTitle.textContent = title;
   // The header avatar is redrawn only when it would look different.
   const avatarKey = channel ? `${channel.channelId}\n${channel.pictureId ?? ""}\n${channel.name}` : "";
   if (channelAvatar.dataset.key !== avatarKey) {
     channelAvatar.dataset.key = avatarKey;
     channelAvatar.replaceChildren(...(channel ? [createAvatar(channel.pictureId, channel.name, { zoomable: true })] : []));
   }
-  channelMeta.textContent = channel ? KIND_LABEL[channel.kind] + (channel.kind !== "user" && channel.memberCount ? ` · ${channel.memberCount} 人` : "") : "";
+  const meta = channel ? KIND_LABEL[channel.kind] + (channel.kind !== "user" && channel.memberCount ? ` · ${channel.memberCount} 人` : "") : "";
+  if (channelMeta.textContent !== meta) channelMeta.textContent = meta;
   if (searching) {
     renderSearch();
     return;
   }
-  const list = selected ? (messages[selected] ?? []) : [];
+  const list = selected ? orderedMessages(selected) : [];
   const state = selected ? historyOf[selected] : undefined;
   if (renderedChannel !== selected) {
-    rendered = new Map();
+    rendered.clear();
     renderedChannel = selected;
   }
   const previousHeight = messageList.scrollHeight;
   const previousTop = messageList.scrollTop;
   // Re-renders that add a line (a read label, a divider) must not push the newest message out of view.
   const atBottom = previousHeight - previousTop - messageList.clientHeight < 8;
+  const retainedAnchor = anchor !== "bottom" && !atBottom ? visibleMessageAnchor() : undefined;
   if (!channel || list.length === 0) {
-    const empty = document.createElement("p");
-    empty.className = "empty";
-    if (!channel) empty.textContent = "從左側選擇聊天室；新的訊息會即時出現在這裡。";
-    else if (state?.loading || !state?.loaded) empty.textContent = state?.failed ? "無法載入歷史訊息。" : "載入訊息中…";
-    else empty.textContent = "這個聊天室還沒有訊息。";
-    if (channel && state?.failed) {
-      messageList.replaceChildren(empty, historyRetry);
-      rendered.clear();
-      updateJump();
-      return;
-    }
-    messageList.replaceChildren(empty);
-    rendered = new Map();
+    let label: string;
+    if (!channel) label = "從左側選擇聊天室；新的訊息會即時出現在這裡。";
+    else if (state?.loading || !state?.loaded) label = state?.failed ? "無法載入歷史訊息。" : "載入訊息中…";
+    else label = "這個聊天室還沒有訊息。";
+    if (emptyMessages.textContent !== label) emptyMessages.textContent = label;
+    reconcile(messageList, channel && state?.failed ? [emptyMessages, historyRetry] : [emptyMessages]);
+    rendered.clear();
     updateJump();
     return;
   }
   const nodes: Node[] = [];
   if (state) {
-    if (state.loading) historyMarker.textContent = "載入更早的訊息…";
-    else if (state.failed) historyMarker.replaceChildren(historyRetry);
-    else if (state.hasMore) historyMarker.textContent = "向上捲動以載入更早的訊息";
-    else historyMarker.textContent = "— 已經是最早的訊息 —";
+    if (!state.loading && state.failed) {
+      if (historyRetry.parentNode !== historyMarker) historyMarker.replaceChildren(historyRetry);
+    } else {
+      const label = state.loading ? "載入更早的訊息…" : state.hasMore ? "向上捲動以載入更早的訊息" : "— 已經是最早的訊息 —";
+      if (historyMarker.textContent !== label) historyMarker.textContent = label;
+    }
     nodes.push(historyMarker);
   }
-  const byId = new Map(list.map((message) => [message.messageId, message]));
+  const indices = messageIndices[channel.channelId];
   const labels = readLabels(channel.channelId, list);
   const divider = unreadFrom?.channelId === selected ? unreadFrom : undefined;
-  const next = new Map<string, RenderedMessage>();
   const nextDays = new Map<string, HTMLElement>();
   list.forEach((message, index) => {
     const previous = list[index - 1];
-    const day = new Date(message.createdAt).toDateString();
-    const newDay = previous === undefined || new Date(previous.createdAt).toDateString() !== day;
+    let day = messageDays.get(message);
+    if (day === undefined) {
+      day = new Date(message.createdAt).toDateString();
+      messageDays.set(message, day);
+    }
+    const newDay = previous === undefined || messageDays.get(previous) !== day;
     if (newDay) {
       const line = dayDividers.get(day) ?? Object.assign(document.createElement("div"), { className: "day-divider" });
       // "今天"/"昨天" move on at midnight, so the text is refreshed on every render.
@@ -1003,44 +1195,136 @@ function renderMessages(anchor: "bottom" | "keep" | "prepend" = "bottom"): void 
       nodes.push(unreadDivider);
     }
     const continued = previous !== undefined && !newDay && previous.contentType !== "CHATEVENT" && previous.senderId === message.senderId && message.createdAt - previous.createdAt < CONTINUE_WITHIN_MS;
-    const quoted = message.replyTo ? byId.get(message.replyTo) : undefined;
+    const quoteIndex = message.replyTo ? indices?.get(message.replyTo) : undefined;
+    const quoted = quoteIndex === undefined ? undefined : list[quoteIndex];
     const known = rendered.get(message.messageId);
     const entry = known && known.message === message && known.continued === continued && known.quoted === quoted ? known : messageNode(message, continued, quoted);
     if (entry.read) {
       const label = labels[index];
-      entry.read.hidden = label === undefined;
+      const hidden = label === undefined;
+      if (entry.read.hidden !== hidden) entry.read.hidden = hidden;
       if (entry.read.textContent !== (label ?? "")) entry.read.textContent = label ?? "";
     }
-    next.set(message.messageId, entry);
+    if (entry !== known) rendered.set(message.messageId, entry);
     nodes.push(entry.node);
   });
-  rendered = next;
+  if (rendered.size !== list.length) {
+    for (const messageId of rendered.keys()) if (!indices?.has(messageId)) rendered.delete(messageId);
+  }
   dayDividers = nextDays;
   reconcile(messageList, nodes);
   if (anchor === "bottom" || (anchor === "keep" && atBottom)) messageList.scrollTop = messageList.scrollHeight;
   // Older messages were inserted above: keep what the reader was looking at in place.
-  else if (anchor === "prepend") messageList.scrollTop = previousTop + (messageList.scrollHeight - previousHeight);
+  else if (retainedAnchor || anchor === "prepend") {
+    // Prepending can change sender grouping and replace the anchor's node.
+    const anchorNode = retainedAnchor ? rendered.get(retainedAnchor.messageId)?.node : undefined;
+    messageList.scrollTop = anchorNode && retainedAnchor
+      ? previousTop + anchorNode.getBoundingClientRect().top - retainedAnchor.top
+      : previousTop + (messageList.scrollHeight - previousHeight);
+  }
   else messageList.scrollTop = previousTop;
   updateJump();
 }
 
 /** Adds or replaces messages of one chat, sorting once per batch rather than once per message. */
-function mergeMessages(channelId: string, incoming: readonly Message[]): void {
+function mergeMessages(channelId: string, incoming: readonly Message[], older = false): void {
   const list = messages[channelId] ?? [];
-  const at = new Map(list.map((entry, index) => [entry.messageId, index]));
-  // Live messages almost always arrive newest-last: sort only when one landed out of order.
-  let unordered = false;
+  const previousLength = list.length;
+  const at = (messageIndices[channelId] ??= new Map());
   for (const message of incoming) {
     const index = at.get(message.messageId);
-    if (index !== undefined) list[index] = message;
+    if (index !== undefined) {
+      if (list[index]!.createdAt !== message.createdAt) unorderedChats.add(channelId);
+      list[index] = message;
+    }
     else {
-      unordered ||= list.length > 0 && message.createdAt < list[list.length - 1]!.createdAt;
+      if (list.length > 0 && message.createdAt < list[list.length - 1]!.createdAt) unorderedChats.add(channelId);
       at.set(message.messageId, list.length);
       list.push(message);
     }
   }
-  if (unordered) list.sort((a, b) => a.createdAt - b.createdAt);
+  const anchorId = list.length > CHAT_MESSAGE_LIMIT && channelId === selected && !searching ? retentionAnchor() : undefined;
   messages[channelId] = list;
+  retainedCount += list.length - previousLength;
+  retainedChats.delete(channelId);
+  retainedChats.add(channelId);
+  enforceRetention(channelId, anchorId, older);
+}
+
+function visibleMessageAnchor(): { messageId: string; top: number } | undefined {
+  const top = messageList.getBoundingClientRect().top;
+  // The index is updated in place; its insertion order need not match the timeline.
+  for (let node = messageList.firstElementChild; node; node = node.nextElementSibling) {
+    const messageId = node.getAttribute("data-message-id");
+    if (messageId === null || rendered.get(messageId)?.node !== node) continue;
+    const rect = node.getBoundingClientRect();
+    if (rect.bottom > top) return { messageId, top: rect.top };
+  }
+  return undefined;
+}
+
+function retentionAnchor(): string | undefined {
+  const selection = window.getSelection();
+  const element = selection?.anchorNode?.parentElement?.closest<HTMLElement>("[data-message-id]");
+  if (selection && !selection.isCollapsed && element && messageList.contains(element)) return element.dataset.messageId;
+  if (pinnedToBottom) return undefined;
+  return visibleMessageAnchor()?.messageId;
+}
+
+function resetRetention(): void {
+  retainedChats.clear();
+  trimmedNewer.clear();
+  retainedCount = 0;
+  evictedCount = 0;
+  updateRetentionNote();
+}
+
+function dropRetainedChat(channelId: string): void {
+  const count = messages[channelId]?.length ?? 0;
+  retainedCount -= count;
+  evictedCount += count;
+  delete messages[channelId];
+  delete messageIndices[channelId];
+  unorderedChats.delete(channelId);
+  retainedChats.delete(channelId);
+  trimmedNewer.delete(channelId);
+  delete historyOf[channelId];
+  for (const requestId of Object.keys(pendingHistory)) if (pendingHistory[requestId] === channelId) delete pendingHistory[requestId];
+  if (renderedChannel === channelId) {
+    rendered.clear();
+    dayDividers.clear();
+  }
+  updateRetentionNote();
+}
+
+function enforceRetention(channelId: string, anchorId: string | undefined, older: boolean): void {
+  const list = orderedMessages(channelId);
+  if (list.length > CHAT_MESSAGE_LIMIT) {
+    const index = anchorId ? messageIndices[channelId]?.get(anchorId) : undefined;
+    const { start, end } = retainedRange(list.length, index, older);
+    const kept = list.slice(start, end);
+    messages[channelId] = kept;
+    messageIndices[channelId] = indexMessages(kept);
+    retainedCount -= list.length - kept.length;
+    evictedCount += list.length - kept.length;
+    if (end < list.length) trimmedNewer.add(channelId);
+    if (start > 0) {
+      // Provider cursors are opaque: restart at the latest page, never skip a removed prefix.
+      const state = historyOf[channelId];
+      if (state) {
+        delete state.cursor;
+        state.hasMore = true;
+        state.restart = true;
+        state.loading = false;
+        for (const requestId of Object.keys(pendingHistory)) if (pendingHistory[requestId] === channelId) delete pendingHistory[requestId];
+      }
+    }
+  }
+  for (const id of retainedChats) {
+    if (retainedCount <= TOTAL_MESSAGE_LIMIT) break;
+    if (id !== selected && id !== channelId) dropRetainedChat(id);
+  }
+  updateRetentionNote();
 }
 
 function requestHistory(channelId: string): void {
@@ -1049,6 +1333,7 @@ function requestHistory(channelId: string): void {
   const requestId = crypto.randomUUID();
   if (!send({ type: "history:fetch", requestId, chatId: channelId, ...(state.cursor ? { before: state.cursor } : {}) })) return;
   state.loading = true;
+  state.restart = false;
   state.failed = false;
   pendingHistory[requestId] = channelId;
   if (channelId === selected) renderMessages("keep");
@@ -1059,35 +1344,46 @@ function applyHistory(frame: Extract<ServerFrame, { type: "history" }>): void {
   const state = channelId ? historyOf[channelId] : undefined;
   if (!channelId || !state) return;
   delete pendingHistory[frame.requestId];
-  const firstPage = !state.loaded;
-  mergeMessages(channelId, frame.messages);
+  const firstPage = (messages[channelId]?.length ?? 0) === 0;
+  mergeMessages(channelId, frame.messages, !firstPage);
   state.loading = false;
   state.loaded = true;
-  state.cursor = frame.cursor;
-  state.hasMore = frame.hasMore && frame.cursor !== undefined;
-  renderChannels();
+  if (!state.restart) {
+    state.cursor = frame.cursor;
+    state.hasMore = frame.hasMore && frame.cursor !== undefined;
+  }
+  scheduleChannels();
   if (channelId !== selected) {
-    if (searching) renderSearch();
+    if (searching) renderMessages("keep");
     return;
   }
   renderMessages(firstPage ? "bottom" : "prepend");
   // A short conversation never scrolls, so the scroll trigger would never fire: keep filling the view.
-  if (!searching && state.hasMore && frame.messages.length > 0 && messageList.scrollHeight <= messageList.clientHeight + 40) requestHistory(channelId);
+  if (state.hasMore && frame.messages.length > 0) historyFill.add(channelId);
   reportRead();
 }
 
 function upsertMessage(message: Message, fresh: boolean): void {
-  const nearBottom = messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < 80;
-  mergeMessages(message.channelId, [message]);
-  if (message.channelId !== selected || searching) {
-    if (searching) renderSearch();
+  const mine = isMine(message);
+  if (mine && message.channelId === selected && !searching) scrollToLatest();
+  if (trimmedNewer.has(message.channelId) && !messageIndices[message.channelId]?.has(message.messageId)) {
+    // Keep a contiguous historical window. Unseen live traffic is fetched when returning
+    // to latest, rather than splicing a distant new tail onto an old history page.
+    if (fresh && message.channelId === selected) unseenBelow += 1;
+    evictedCount += 1;
+    updateRetentionNote();
+    updateJump();
     return;
   }
+  mergeMessages(message.channelId, [message]);
+  if (message.channelId !== selected || searching) {
+    if (searching) renderMessages("keep");
+    return;
+  }
+  const nearBottom = pendingAnchor === "bottom" || (burstNearBottom ??= messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < 80);
   // Your own message always jumps into view, even when you were reading older history.
-  const mine = isMine(message);
   renderMessages(nearBottom || mine ? "bottom" : "keep");
   if (fresh && !mine && !nearBottom) unseenBelow += 1;
-  updateJump();
   reportRead();
 }
 
@@ -1097,19 +1393,33 @@ function upsertMessage(message: Message, fresh: boolean): void {
  */
 function reportRead(): void {
   clearTimeout(readTimer);
+  const chatId = selected;
   readTimer = setTimeout(() => {
-    if (!signedIn || searching || !selected || document.visibilityState !== "visible") return;
-    const newest = [...(messages[selected] ?? [])].reverse().find((message) => /^\d{1,24}$/.test(message.messageId));
+    if (!signedIn || searching || !chatId || selected !== chatId || document.visibilityState !== "visible" || trimmedNewer.has(chatId) || !pinnedToBottom) return;
+    // A background tab may not have drawn its queued frame yet: never acknowledge unseen DOM.
+    if (messageFrame !== undefined) {
+      reportRead();
+      return;
+    }
+    const list = orderedMessages(chatId);
+    let index = list.length - 1;
+    while (index >= 0 && !/^\d{1,24}$/.test(list[index]!.messageId)) index--;
+    const newest = list[index];
     if (!newest) return;
+    const node = rendered.get(newest.messageId)?.node;
+    if (!node) return;
     const id = BigInt(newest.messageId);
-    const known = reportedRead[selected];
+    const known = reportedRead[chatId];
     if (known !== undefined && id <= known) return;
-    if (send({ type: "chat:read", chatId: selected, messageId: newest.messageId })) {
-      reportedRead[selected] = id;
-      notifier.clear(selected);
+    const viewport = messageList.getBoundingClientRect();
+    const rect = node.getBoundingClientRect();
+    if (rect.top >= viewport.bottom || rect.bottom <= viewport.top) return;
+    if (send({ type: "chat:read", chatId, messageId: newest.messageId })) {
+      reportedRead[chatId] = id;
+      notifier.clear(chatId);
       // What was just reported as read is no longer unread, whether it arrived while hidden or not.
-      if (unread[selected]) {
-        delete unread[selected];
+      if (unread[chatId]) {
+        delete unread[chatId];
         renderChannels();
       }
     }
@@ -1125,9 +1435,23 @@ async function handle(frame: ServerFrame): Promise<void> {
       if (halted) return;
       // The server replays the full snapshot after every (re)connect.
       channels = [];
+      orderedFriends = undefined;
+      channelsById.clear();
+      channelOrderDirty = false;
       readPositions = {};
       unreadFrom = undefined;
       messages = {};
+      cancelMessageRender();
+      clearTimeout(readTimer);
+      searchWindow.clear();
+      renderedSearchQuery = undefined;
+      renderedSearchHits = [];
+      messageDays = new WeakMap();
+      messageReadIds = new WeakMap();
+      searchText = new WeakMap();
+      channelSearchNames = new WeakMap();
+      messageIndices = {};
+      unorderedChats.clear();
       unread = {};
       opened = new Set();
       liveCounted = new Set();
@@ -1135,6 +1459,13 @@ async function handle(frame: ServerFrame): Promise<void> {
       pendingHistory = {};
       pendingScam = new Set();
       reportedRead = {};
+      resetRetention();
+      rendered.clear();
+      dayDividers.clear();
+      messageList.replaceChildren();
+      searchCount.textContent = "";
+      unseenBelow = 0;
+      pinnedToBottom = true;
       return;
     case "update:available":
       notice.available(frame);
@@ -1157,9 +1488,14 @@ async function handle(frame: ServerFrame): Promise<void> {
       return;
     case "channels":
       channels = frame.channels;
-      sortChannels();
-      for (const channel of channels) applyUnread(channel);
-      if (selected && !channels.some((channel) => channel.channelId === selected)) {
+      orderedFriends = undefined;
+      channelOrderDirty = true;
+      channelsById.clear();
+      for (const channel of channels) {
+        channelsById.set(channel.channelId, channel);
+        applyUnread(channel);
+      }
+      if (selected && !channelsById.has(selected)) {
         selected = undefined;
         composer.setChannel(undefined);
       }
@@ -1169,11 +1505,16 @@ async function handle(frame: ServerFrame): Promise<void> {
       if (selected && !historyOf[selected]?.loaded) requestHistory(selected);
       return;
     case "channel": {
-      // One chat changed: it moves to where its activity puts it; its preview and badge follow.
-      const index = channels.findIndex((channel) => channel.channelId === frame.channel.channelId);
+      // Update data and unread state now; activity ordering joins the next channel render.
+      const previous = channelsById.get(frame.channel.channelId);
+      // Group activity does not change the alphabetical friend list.
+      if (previous?.kind === "user" || frame.channel.kind === "user") orderedFriends = undefined;
+      const index = previous ? channels.indexOf(previous) : -1;
       if (index < 0) channels.push(frame.channel);
       else channels[index] = frame.channel;
-      sortChannels();
+      channelsById.set(frame.channel.channelId, frame.channel);
+      channelOrderDirty ||= !previous || previous.name !== frame.channel.name
+        || (previous.lastMessageAt ?? 0) !== (frame.channel.lastMessageAt ?? 0);
       applyUnread(frame.channel);
       scheduleChannels();
       return;
@@ -1193,15 +1534,15 @@ async function handle(frame: ServerFrame): Promise<void> {
       if (frame.type === "message" && !isMine(message) && (message.channelId !== selected || document.visibilityState !== "visible")) {
         unread[message.channelId] = (unread[message.channelId] ?? 0) + 1;
         liveCounted.add(message.channelId);
-        notifier.notify(message, channels.find((channel) => channel.channelId === message.channelId)?.name ?? "", previewOf(message));
+        notifier.notify(message, channelsById.get(message.channelId)?.name ?? "", previewOf);
       }
       scheduleChannels();
       return;
     }
     case "message:unsend": {
       const list = messages[frame.chatId] ?? [];
-      const index = list.findIndex((entry) => entry.messageId === frame.messageId);
-      if (index < 0) return;
+      const index = messageIndices[frame.chatId]?.get(frame.messageId);
+      if (index === undefined) return;
       // Keep who sent it and when; the content is gone.
       const { text: _text, mediaId: _media, replyTo: _reply, mentions: _mentions, card: _card, editedAt: _edited, decryptFailed: _unreadable, reactions: _reactions, ...kept } = list[index]!;
       list[index] = { ...kept, unsent: true };
@@ -1210,18 +1551,20 @@ async function handle(frame: ServerFrame): Promise<void> {
     }
     case "message:reactions": {
       const list = messages[frame.chatId] ?? [];
-      const index = list.findIndex((entry) => entry.messageId === frame.messageId);
-      if (index < 0 || list[index]!.unsent) return;
+      const index = messageIndices[frame.chatId]?.get(frame.messageId);
+      if (index === undefined || list[index]!.unsent) return;
+      const previousMessage = list[index]!;
       const { reactions: _old, ...rest } = list[index]!;
       // Reaction changes only touch the chips: do not interrupt a playing media body.
       list[index] = frame.reactions ? { ...rest, reactions: frame.reactions } : rest;
       const entry = frame.chatId === selected ? rendered.get(frame.messageId) : undefined;
-      if (entry && !searching) {
+      if (entry && !searching && entry.message === previousMessage) {
         entry.node.querySelector(".reactions")?.remove();
         entry.message = list[index]!;
         if (frame.reactions) entry.node.querySelector(".message-main")?.append(reactionsNode(entry.message, frame.reactions));
       }
-      if (frame.chatId === selected || searching) renderMessages("keep");
+      // Search omits reaction/read chips; retain their state without rescanning cached messages.
+      if (!searching && frame.chatId === selected) renderMessages("keep");
       return;
     }
     case "messages":
@@ -1235,15 +1578,21 @@ async function handle(frame: ServerFrame): Promise<void> {
       return;
     case "read": {
       const known = (readPositions[frame.chatId] ??= {});
+      let changed = false;
       for (const position of frame.positions) {
         const id = BigInt(position.messageId);
-        if (!(position.readerId in known) || id > known[position.readerId]!) known[position.readerId] = id;
+        if (!(position.readerId in known) || id > known[position.readerId]!) {
+          known[position.readerId] = id;
+          sortedReadPositions.delete(known);
+          changed = true;
+        }
       }
-      if (frame.chatId === selected) renderMessages("keep");
+      if (changed && !searching && frame.chatId === selected) renderMessages("keep");
       return;
     }
     case "sent": {
-      const echo = selected ? messages[selected]?.find((message) => message.messageId === frame.messageId) : undefined;
+      const index = selected ? messageIndices[selected]?.get(frame.messageId) : undefined;
+      const echo = selected && index !== undefined ? messages[selected]?.[index] : undefined;
       if (echo?.channelKind === "square") mySquareSenders[echo.channelId] = echo.senderId;
       if (composer.handleSent(frame.requestId)) scrollToLatest();
       return;
@@ -1434,17 +1783,26 @@ function openChat(id: string): void {
   if (!signedIn) return;
   if (searching) closeSearch();
   if (id !== selected) {
-    const list = messages[id] ?? [];
+    if (selected) {
+      for (const requestId of Object.keys(pendingHistory)) if (pendingHistory[requestId] === selected) delete pendingHistory[requestId];
+      const previous = historyOf[selected];
+      if (previous) previous.loading = false;
+    }
+    if (selected && trimmedNewer.has(selected)) dropRetainedChat(selected);
+    const list = orderedMessages(id);
     const count = unread[id] ?? 0;
     unreadFrom = count > 0 && count <= list.length ? { channelId: id, messageId: list[list.length - count]!.messageId, count } : undefined;
   }
   selected = id;
+  retainedChats.delete(id);
+  if (messages[id]) retainedChats.add(id);
+  updateRetentionNote();
   setDrawer(false);
   delete unread[id];
   opened.add(id);
   composer.setChannel(id);
   renderChannels();
-  renderMessages();
+  drawMessages();
   if (!historyOf[id]?.loaded) requestHistory(id);
   reportRead();
 }
@@ -1458,21 +1816,23 @@ channelList.addEventListener("click", (event) => {
   if (id) openChat(id);
 });
 channelList.addEventListener("keydown", (event) => {
-  const id = chatAt(event.target);
-  if (!id) return;
+  const current = (event.target as Element).closest<HTMLLIElement>("li");
+  const id = current?.dataset.channelId;
+  if (!current || !id) return;
   if (event.key === "Enter" || event.key === " ") {
     event.preventDefault();
     openChat(id);
     return;
   }
   // Listbox keys: move between rows without opening them; Enter opens.
-  const rows = [...channelList.querySelectorAll<HTMLLIElement>("li")];
-  const index = rows.findIndex((row) => row.dataset.channelId === id);
-  const target = event.key === "ArrowDown" ? rows[index + 1] : event.key === "ArrowUp" ? rows[index - 1] : event.key === "Home" ? rows[0] : event.key === "End" ? rows.at(-1) : undefined;
-  if (event.key === "ArrowUp" && index === 0) {
+  const target = event.key === "ArrowDown" ? current.nextElementSibling
+    : event.key === "ArrowUp" ? current.previousElementSibling
+    : event.key === "Home" ? channelList.firstElementChild
+    : event.key === "End" ? channelList.lastElementChild : undefined;
+  if (event.key === "ArrowUp" && !current.previousElementSibling) {
     event.preventDefault();
     filter.focus();
-  } else if (target) {
+  } else if (target instanceof HTMLLIElement) {
     event.preventDefault();
     target.focus();
   }
@@ -1489,6 +1849,7 @@ filter.addEventListener("keydown", (event) => {
 messageList.addEventListener("scroll", () => {
   pinnedToBottom = messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < 80;
   updateJump();
+  if (!searching && pinnedToBottom) reportRead();
   const state = selected ? historyOf[selected] : undefined;
   // Near the top: load the next older page, unless the last attempt failed (then the user retries explicitly).
   if (!searching && selected && state?.loaded && state.hasMore && !state.loading && !state.failed && messageList.scrollTop < 80) requestHistory(selected);

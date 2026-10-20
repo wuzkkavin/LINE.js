@@ -131,6 +131,7 @@ approval, and a regression against any of them is treated as a vulnerability.
 | Sending is limited per connection (`limits.sendsPerSecond`, at most 5/s) and across all bots (`api.sendsPerMinute`, at most 120/min). | `src/ws/hub.ts`, `src/limit.ts` |
 | `hello.capabilities` advertises `chat:admins` only on the bot endpoint. `chat:admins:get` is restricted to known, allowed OpenChat rooms while signed in; other chat kinds are unsupported. The adapter enumerates all chat members and returns administrators/co-administrators plus the authenticated account's `ownMemberId` from `getSquareChat.squareChatMember`, only to the requester. Both own and administrator IDs must match `/^p[A-Za-z0-9]{10,64}$/`; invalid data or incomplete pagination fails closed, never returning partial results. Old-session results and failures are discarded. Queries share the per-connection 10/s budget with history/profile; browser `/ws` rejects them. The old `chat:admins` request is not accepted. | `src/ws/hub.ts`, `src/line/provider.ts` |
 | A successful administrator query permits that bot connection to mention returned administrators who have not spoken, only in that same chat. This grant never populates the shared message cache or authorizes other sockets/pages. A new query immediately revokes the previous grant, even if rate-limited or later failing; superseded queries cannot reauthorize old members. Disconnect, logout and account changes invalidate grants and pending results. Ordinary mention permissions for senders of displayed messages are unchanged. | `src/ws/hub.ts` |
+| Within one account session, administrator queries for the same chat share only in-flight retrieval. Completion or failure removes the entry; completed role lists are not cached. Every request still passes its own chat authorization and rate limit, and grants remain connection-local and latest-query-only. Account changes and teardown invalidate old work; late cleanup cannot remove a replacement query. | `src/line/provider.ts`, `src/ws/hub.ts` |
 
 ### Scam check (TypeSafe Jev, off by default)
 
@@ -150,7 +151,7 @@ approval, and a regression against any of them is treated as a vulnerability.
 | `session.json` is created with mode `0600` using `O_EXCL \| O_NOFOLLOW`, re-tightened to `0600` if it exists, must be a regular file owned by the current user, and is rejected if it is a symlink or corrupt (it is never overwritten in that case). | `src/line/session.ts` |
 | Session writes are serialized and atomic (temporary file `0600`, fsync, rename). A write failure is surfaced and is not silently swallowed. | `src/line/session.ts` |
 | `session.json` and `config.yaml` are git-ignored. The process runs with `umask 077`. | `.gitignore`, `src/main.ts` |
-| Logs never contain credentials, tokens, QR URLs, PINs, key material, or package error objects. Internal errors are logged as short codes locally; clients only ever receive a generic message. | `src/ws/hub.ts`, project rule |
+| Logs never contain credentials, tokens, QR URLs, PINs, key material, or package error objects. Operation failures and process-level exceptions are logged only as fixed codes locally, never upstream error names or messages; clients only ever receive a generic message. | `src/ws/hub.ts`, `src/main.ts`, project rule |
 | On logout or auth failure, the message cache, media cache and read state are cleared from memory. | `src/ws/hub.ts` |
 | Decrypt or parse failures **fail closed**: a placeholder is shown; content is never guessed. | project rule |
 
@@ -159,11 +160,13 @@ approval, and a regression against any of them is treated as a vulnerability.
 | Rule | Enforcement |
 |---|---|
 | WebSocket frames are capped (`maxPayload`, at most 256 KiB). Every socket has an `error` handler, so an oversized frame cannot crash the process. | `src/ws/hub.ts`, `src/config.ts` |
+| Browser snapshot replay is paced by completed sends. Deferred increments and socket buffering share the 8 MiB backpressure budget; a stalled replay send is terminated after 30 seconds. Logout, account changes, disconnect and shutdown invalidate queued work; bots still receive no replay. | `src/ws/hub.ts` |
 | Per connection: `message:send` is limited (at most 5 per second); history and sticker requests are limited; uploads are limited per minute and by size. | `src/ws/hub.ts`, `src/http/server.ts`, `src/limit.ts` |
 | Inputs are validated: `chatId` format, text length (at most 8000), history `limit` (at most 100), positive-integer sticker ids, reply and mention targets that this server has already shown. | `src/ws/requests.ts`, `src/ws/hub.ts` |
 | Taking a message back (`message:unsend`) is page-only and shares the send rate limit. The server sends it to LINE only for a message it has shown that this account sent (its own mid, or in OpenChat the member id its own sends came back with); bots cannot. | `src/ws/hub.ts`, `src/ws/requests.ts` |
 | Reacting (`message:react`) is page-only and shares the send rate limit. Only LINE's six predefined reactions are accepted, and only for a message the server has shown that was not taken back; bots cannot. | `src/ws/hub.ts`, `src/ws/requests.ts` |
 | Uploaded media types are decided from the bytes, never from the client-supplied type or file name. | `src/media/service.ts` |
+| Outbound JSON response limits are enforced during UTF-8 decoding, before parsing: Jev 65,536 UTF-16 code units, release metadata 1,048,576, sticker package metadata 1,000,000. Oversized streams are cancelled; existing declared-length checks remain in place. | `src/response.ts`, `src/jev/client.ts`, `src/update/checker.ts`, `src/line/provider.ts` |
 | Binary data never travels over the WebSocket; it is served over HTTP. | design rule |
 
 ### Media and content
@@ -174,10 +177,12 @@ approval, and a regression against any of them is treated as a vulnerability.
 | Media types are determined from content bytes; SVG and HTML are never served as received media. | `src/media/service.ts` |
 | Received files (`file-<id>`, same seen-message rule and size limit) are never sniffed or shown inline: always `application/octet-stream` with `Content-Disposition: attachment`, `no-store`, and no longer served once taken back. | `src/line/provider.ts`, `src/http/server.ts` |
 | Download size is capped (`limits.downloadMaxBytes`, default 50 MiB, at most 100 MiB) and the media cache is a bounded LRU. | `src/line/provider.ts`, `src/media/service.ts` |
+| Media fetching allows at most 4 actual upstream jobs and 64 FIFO waiters globally, coalescing identical IDs. Overflow returns the existing not-found response. Forgotten/cleared work resolves without bytes; stale results cannot repopulate cache or reach waiters. Running work retains its concurrency slot until the upstream settles. | `src/media/service.ts` |
 | Message media is served `private, no-store`; it must not linger in the browser cache. | `src/http/server.ts` |
-| A message its sender took back keeps only sender and time in the cache (history pages and list previews included); its media is dropped from the media cache, a download already in progress is handed only to requests already waiting and never cached, and it is no longer fetched from LINE. | `src/model/store.ts`, `src/ws/hub.ts`, `src/line/provider.ts`, `src/media/service.ts` |
-| Avatar, sticker and LINE emoji fetches use fixed LINE CDN origins with a timeout and `redirect: "error"`; emoji ids must be a 24-hex product id and a short number before they reach a URL. | `src/line/provider.ts`, `src/line/emoji.ts`, `src/media/service.ts` |
+| A message its sender took back keeps only sender and time in the cache (history pages and list previews included); its media is dropped from the media cache, queued work is cancelled, and results of an in-progress download are discarded rather than delivered to waiting requests or cached. It is no longer fetched from LINE. | `src/model/store.ts`, `src/ws/hub.ts`, `src/line/provider.ts`, `src/media/service.ts` |
+| Avatar, sticker, sticker-pack icon and LINE emoji fetches use fixed LINE CDN origins with a timeout and `redirect: "error"`; emoji ids must be a 24-hex product id and a short number before they reach a URL. CDN bodies are limited to 2 MiB during streaming: declared oversized responses and streams that exceed the limit are cancelled rather than fully buffered. | `src/line/provider.ts`, `src/line/emoji.ts`, `src/media/service.ts` |
 | Messages are never written to disk. At most 500 are kept per channel in memory, de-duplicated by message id. | `src/model/store.ts` |
+| The frontend retains at most 500 messages per chat and 10,000 overall, with visible retention/search-scope notices. Historical windows remain navigable; reading an older window does not acknowledge unseen newer messages. Logout clears retained messages and virtual search rows. | `web/main.ts`, `web/retention.ts`, `web/searchWindow.ts` |
 
 ### PWA
 
@@ -187,11 +192,13 @@ Cache Storage after logout (`web/public/sw.js`).
 
 ### Supply chain
 
-- `@evex/linejs` and `@evex/linejs-types` are pinned to **3.4.2** and are not upgraded without explicit
-  maintainer approval. All direct dependencies are pinned to exact versions, and `package-lock.json` is
-  committed.
-- `thrift` is forced to a patched version through `overrides` (see [CVE-2026-41636](https://github.com/advisories/GHSA-r67j-r569-jrwp)).
+- `@evex/linejs` and `@evex/linejs-types` are pinned to **3.5.0**. The upgrade from 3.4.2 was explicitly
+  authorized by the user; future upgrades still require explicit maintainer approval. All direct
+  dependencies are pinned to exact versions, and `package-lock.json` is committed.
+- `thrift` remains forced to **0.23.0** through `overrides` after this upgrade (see [CVE-2026-41636](https://github.com/advisories/GHSA-r67j-r569-jrwp)).
   The override must not be removed while the upstream dependency is affected.
+- This upgrade has not been verified with a real LINE account or passed a real LINE Gate. Earlier
+  real-account observations for 3.4.2 do not establish compatibility of 3.5.0.
 - `npm audit` must report no high or critical advisories before a release.
 - New dependencies require justification; trivial functionality is written locally.
 

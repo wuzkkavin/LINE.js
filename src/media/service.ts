@@ -44,13 +44,26 @@ export function isMediaId(id: string): boolean {
   return STICKER_ID.test(id) || STICKER_PACK_ID.test(id) || EMOJI_ID.test(id) || AVATAR_ID.test(id) || MESSAGE_ID.test(id) || FILE_ID.test(id);
 }
 
+const MAX_ACTIVE_DOWNLOADS = 4;
+const MAX_QUEUED_DOWNLOADS = 64;
+
+interface Download {
+  id: string;
+  promise: Promise<MediaBytes | undefined>;
+  resolve: (media: MediaBytes | undefined) => void;
+  reject: (error: unknown) => void;
+}
+
 /**
- * Byte-budgeted LRU in front of the LINE adapter. Concurrent requests for the same
- * id share one upstream fetch; failures are never cached.
+ * Byte-budgeted LRU in front of the LINE adapter. Four downloads run at once, with
+ * a FIFO queue of at most 64 distinct ids; overflow returns undefined (HTTP 404).
+ * Concurrent requests for the same id share work; failures are never cached.
  */
 export class MediaService {
   private cache = new Map<string, MediaBytes>();
-  private inflight = new Map<string, Promise<MediaBytes | undefined>>();
+  private inflight = new Map<string, Download>();
+  private queue: Download[] = [];
+  private active = 0;
   private uploads = new Map<string, { media: MediaBytes; expires: number }>();
   private size = 0;
 
@@ -65,18 +78,42 @@ export class MediaService {
       this.cache.set(id, hit);
       return hit;
     }
-    let pending = this.inflight.get(id);
-    if (!pending) {
-      const load = this.load(id).then((media) => {
-        // Forgotten (the message was taken back) while downloading: hand the bytes to whoever was
-        // already waiting, but never keep them. A later request starts from the adapter, which refuses.
-        if (media && this.inflight.get(id) === load) this.remember(id, media);
-        return media;
-      }).finally(() => { if (this.inflight.get(id) === load) this.inflight.delete(id); });
-      pending = load;
-      this.inflight.set(id, load);
+    const pending = this.inflight.get(id);
+    if (pending) return pending.promise;
+    if (this.active >= MAX_ACTIVE_DOWNLOADS && this.queue.length >= MAX_QUEUED_DOWNLOADS) return undefined;
+    let resolve!: Download["resolve"];
+    let reject!: Download["reject"];
+    const promise = new Promise<MediaBytes | undefined>((yes, no) => { resolve = yes; reject = no; });
+    const download = { id, promise, resolve, reject };
+    this.inflight.set(id, download);
+    this.queue.push(download);
+    this.drain();
+    return promise;
+  }
+
+  private drain(): void {
+    while (this.active < MAX_ACTIVE_DOWNLOADS && this.queue.length > 0) {
+      const download = this.queue.shift()!;
+      this.active += 1;
+      void this.run(download);
     }
-    return pending;
+  }
+
+  private async run(download: Download): Promise<void> {
+    try {
+      const media = await this.load(download.id);
+      if (this.inflight.get(download.id) !== download) return;
+      if (media) this.remember(download.id, media);
+      download.resolve(media);
+    } catch (error) {
+      if (this.inflight.get(download.id) === download) download.reject(error);
+    } finally {
+      if (this.inflight.get(download.id) === download) this.inflight.delete(download.id);
+      // Invalidating a running request settles its consumers, not its upstream work:
+      // keep its slot until the real download finishes, even across logout.
+      this.active -= 1;
+      this.drain();
+    }
   }
 
   private load(id: string): Promise<MediaBytes | undefined> {
@@ -136,7 +173,13 @@ export class MediaService {
 
   /** Drops one cached item, finished or still downloading (a message taken back must not stay downloadable). */
   forget(id: string): void {
-    this.inflight.delete(id);
+    const download = this.inflight.get(id);
+    if (download) {
+      this.inflight.delete(id);
+      const queued = this.queue.indexOf(download);
+      if (queued !== -1) this.queue.splice(queued, 1);
+      download.resolve(undefined);
+    }
     const entry = this.cache.get(id);
     if (!entry) return;
     this.cache.delete(id);
@@ -145,7 +188,9 @@ export class MediaService {
 
   clear(): void {
     this.cache.clear();
+    for (const download of this.inflight.values()) download.resolve(undefined);
     this.inflight.clear();
+    this.queue.length = 0;
     this.uploads.clear();
     this.size = 0;
   }
@@ -162,9 +207,10 @@ export function isUploadId(id: string): boolean {
 
 /** Trusts file contents, not the client's Content-Type: only formats LINE displays are accepted. */
 export function sniffImage(bytes: Buffer): "image/png" | "image/jpeg" | "image/gif" | undefined {
-  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  // Read fixed signatures in place, without temporary Buffer views or decoded strings.
+  if (bytes.length >= 8 && bytes.readUInt32BE(0) === 0x89504e47 && bytes.readUInt32BE(4) === 0x0d0a1a0a) return "image/png";
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
-  if (bytes.length >= 6 && (bytes.subarray(0, 6).toString("latin1") === "GIF87a" || bytes.subarray(0, 6).toString("latin1") === "GIF89a")) return "image/gif";
+  if (bytes.length >= 6 && bytes.readUInt32BE(0) === 0x47494638 && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) return "image/gif";
   return undefined;
 }
 
@@ -189,7 +235,7 @@ export function sniffUpload(bytes: Buffer): "image/png" | "image/jpeg" | "image/
  * the clip length and does not work it out itself. Undefined when the file does not say.
  */
 export function mp4DurationMs(bytes: Buffer): number | undefined {
-  const find = (start: number, end: number, wanted: string): { body: number; end: number } | undefined => {
+  const find = (start: number, end: number, wanted: number): { body: number; end: number } | undefined => {
     let at = start;
     while (at + 8 <= end) {
       let size = bytes.readUInt32BE(at);
@@ -202,13 +248,13 @@ export function mp4DurationMs(bytes: Buffer): number | undefined {
         header = 16;
       } else if (size === 0) size = end - at;
       if (size < header || at + size > end) return undefined;
-      if (bytes.toString("latin1", at + 4, at + 8) === wanted) return { body: at + header, end: at + size };
+      if (bytes.readUInt32BE(at + 4) === wanted) return { body: at + header, end: at + size };
       at += size;
     }
     return undefined;
   };
-  const moov = find(0, bytes.length, "moov");
-  const mvhd = moov && find(moov.body, moov.end, "mvhd");
+  const moov = find(0, bytes.length, 0x6d6f6f76 /* moov */);
+  const mvhd = moov && find(moov.body, moov.end, 0x6d766864 /* mvhd */);
   if (!mvhd) return undefined;
   const version = bytes[mvhd.body];
   let timescale: number;
@@ -232,12 +278,12 @@ export function mp4DurationMs(bytes: Buffer): number | undefined {
 export function sniffMedia(bytes: Buffer): string | undefined {
   const image = sniffImage(bytes);
   if (image) return image;
-  if (bytes.length >= 12 && bytes.toString("latin1", 0, 4) === "RIFF" && bytes.toString("latin1", 8, 12) === "WEBP") return "image/webp";
-  if (bytes.length >= 12 && bytes.toString("latin1", 4, 8) === "ftyp") {
-    const brand = bytes.toString("latin1", 8, 12);
-    return brand === "M4A " || brand === "M4B " ? "audio/mp4" : "video/mp4";
+  if (bytes.length >= 12 && bytes.readUInt32BE(0) === 0x52494646 /* RIFF */ && bytes.readUInt32BE(8) === 0x57454250 /* WEBP */) return "image/webp";
+  if (bytes.length >= 12 && bytes.readUInt32BE(4) === 0x66747970 /* ftyp */) {
+    const brand = bytes.readUInt32BE(8);
+    return brand === 0x4d344120 /* M4A */ || brand === 0x4d344220 /* M4B */ ? "audio/mp4" : "video/mp4";
   }
-  if (bytes.length >= 3 && bytes.toString("latin1", 0, 3) === "ID3") return "audio/mpeg";
+  if (bytes.length >= 3 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33 /* ID3 */) return "audio/mpeg";
   if (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1]! & 0xf6) === 0xf0) return "audio/aac";
   if (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1]! & 0xe0) === 0xe0) return "audio/mpeg";
   return undefined;

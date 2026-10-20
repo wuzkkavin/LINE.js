@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { readFile, realpath } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import type { Config } from "../config.js";
 import { SlidingWindowLimiter } from "../limit.js";
@@ -16,7 +16,8 @@ export interface WebServer {
 }
 
 export function createWebServer(config: Config, webRoot: string, media: MediaService, apiTokens: ApiTokenStore): WebServer {
-  const browserToken = randomBytes(32).toString("hex");
+  const browserTokenBytes = randomBytes(32);
+  const browserToken = browserTokenBytes.toString("hex");
   // The Host header is deliberately not pinned, on loopback binds too (owner's decision): the service is reached
   // under whatever name or IP the user uses (reverse proxy, LAN name, tunnel). Origin must still equal the Host
   // it came in under, the cookie is required and cross-site requests are refused, but a DNS-rebinding page
@@ -33,7 +34,7 @@ export function createWebServer(config: Config, webRoot: string, media: MediaSer
 
   function hasBrowserCookie(request: IncomingMessage): boolean {
     const cookie = request.headers.cookie?.split(";").map((entry) => entry.trim()).find((entry) => entry.startsWith("linejs_browser="))?.slice("linejs_browser=".length) ?? "";
-    return /^[a-f0-9]{64}$/.test(cookie) && timingSafeEqual(Buffer.from(cookie), Buffer.from(browserToken));
+    return /^[a-f0-9]{64}$/.test(cookie) && timingSafeEqual(Buffer.from(cookie, "hex"), browserTokenBytes);
   }
 
   // Behind a TLS-terminating reverse proxy or tunnel the page (and so Origin) is https while this server only sees
@@ -107,7 +108,7 @@ export function createWebServer(config: Config, webRoot: string, media: MediaSer
       }
       chunks.push(chunk);
     }
-    const bytes = Buffer.concat(chunks);
+    const bytes = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
     const detected = sniffUpload(bytes);
     if (!detected) {
       json(response, 400, { code: "INVALID_MEDIA" });
@@ -188,7 +189,15 @@ export function createWebServer(config: Config, webRoot: string, media: MediaSer
         json(response, 404, { code: "NOT_FOUND" });
         return;
       }
-      const body = await readFile(path);
+      let body: Buffer | undefined;
+      if (request.method === "HEAD") {
+        if (!(await stat(path)).isFile()) {
+          json(response, 404, { code: "NOT_FOUND" });
+          return;
+        }
+      } else {
+        body = await readFile(path);
+      }
       response.setHeader("Content-Type", mime[extname(path)]!);
       // Vite names every built asset after its content hash, so a given URL never changes: the
       // browser may keep it for good. Everything else (the page itself sets the cookie) stays no-store.
@@ -197,7 +206,7 @@ export function createWebServer(config: Config, webRoot: string, media: MediaSer
         response.setHeader("Set-Cookie", `linejs_browser=${browserToken}; HttpOnly; SameSite=Strict; Path=/`);
       }
       response.writeHead(200);
-      response.end(request.method === "HEAD" ? undefined : body);
+      response.end(body);
     } catch {
       json(response, 404, { code: "NOT_FOUND" });
     }

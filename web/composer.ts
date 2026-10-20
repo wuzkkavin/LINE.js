@@ -55,7 +55,7 @@ export interface Composer {
 
 /** Who can be tagged in the open chat (newest speaker first) and how to draw their avatar in the "@" list. */
 export interface MentionSource {
-  candidates(): MentionCandidate[];
+  candidates(): Iterable<MentionCandidate>;
   avatar(person: MentionCandidate): HTMLElement;
 }
 
@@ -185,6 +185,7 @@ export function createComposer(send: (frame: ClientFrame) => boolean, mentions: 
   }
 
   function closeSuggestions(): void {
+    if (!suggesting) return;
     suggesting = undefined;
     mentionList.hidden = true;
     mentionList.replaceChildren();
@@ -220,11 +221,23 @@ export function createComposer(send: (frame: ClientFrame) => boolean, mentions: 
     const match = draft.selectionEnd === caret ? MENTION_QUERY.exec(draft.value.slice(0, caret)) : null;
     if (!match) return closeSuggestions();
     const typed = match[1]!.toLocaleLowerCase();
-    const options = mentions.candidates().filter((person) => person.name.toLocaleLowerCase().includes(typed)).slice(0, MAX_SUGGESTIONS);
+    const options: MentionCandidate[] = [];
+    for (const person of mentions.candidates()) {
+      if (typed && !person.name.toLocaleLowerCase().includes(typed)) continue;
+      options.push(person);
+      if (options.length === MAX_SUGGESTIONS) break;
+    }
     if (options.length === 0) return closeSuggestions();
     const start = caret - match[1]!.length - 1;
-    const keep = suggesting?.start === start ? options.findIndex((person) => person.userId === suggesting!.options[suggesting!.active]?.userId) : -1;
+    const previous = suggesting;
+    const keep = previous?.start === start ? options.findIndex((person) => person.userId === previous.options[previous.active]?.userId) : -1;
     suggesting = { start, options, active: Math.max(keep, 0) };
+    // The insertion start may move even when the displayed options do not.
+    if (previous && previous.active === suggesting.active && previous.options.length === options.length &&
+      options.every((person, index) => {
+        const before = previous.options[index]!;
+        return person.userId === before.userId && person.name === before.name && person.pictureId === before.pictureId;
+      })) return;
     renderSuggestions();
   }
 
@@ -409,8 +422,13 @@ export function createComposer(send: (frame: ClientFrame) => boolean, mentions: 
       const count = suggesting.options.length;
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
+        if (count === 1) return;
+        // Keep the existing avatars and mouse handlers when only selection changes.
+        mentionList.children[suggesting.active]!.ariaSelected = "false";
         suggesting.active = (suggesting.active + (event.key === "ArrowDown" ? 1 : count - 1)) % count;
-        return renderSuggestions();
+        mentionList.children[suggesting.active]!.ariaSelected = "true";
+        draft.setAttribute("aria-activedescendant", `mention-option-${suggesting.active}`);
+        return;
       }
       if ((event.key === "Enter" && !event.shiftKey) || event.key === "Tab") {
         event.preventDefault();
@@ -488,10 +506,10 @@ export function createComposer(send: (frame: ClientFrame) => boolean, mentions: 
 
   function renderStickers(): void {
     tabs.replaceChildren();
-    grid.replaceChildren();
+    if (packages && !packages.some((entry) => entry.packageId === activePackage)) activePackage = packages[0]?.packageId;
+    renderStickerGrid();
     if (!packages) return;
     stickerState.textContent = packages.length === 0 ? "此帳號沒有可用的貼圖包；可用下方「用 ID 手動送出」。" : "";
-    if (!packages.some((entry) => entry.packageId === activePackage)) activePackage = packages[0]?.packageId;
     for (const entry of packages) {
       const tab = document.createElement("button");
       tab.type = "button";
@@ -506,12 +524,19 @@ export function createComposer(send: (frame: ClientFrame) => boolean, mentions: 
       icon.src = `/media/stickerpack-${entry.packageId}`;
       tab.append(icon);
       tab.addEventListener("click", () => {
+        if (activePackage === entry.packageId) return;
+        tabs.querySelector('[aria-selected="true"]')?.setAttribute("aria-selected", "false");
+        tab.ariaSelected = "true";
         activePackage = entry.packageId;
-        renderStickers();
+        renderStickerGrid();
       });
       tabs.append(tab);
     }
-    const active = packages.find((entry) => entry.packageId === activePackage);
+  }
+
+  function renderStickerGrid(): void {
+    grid.replaceChildren();
+    const active = packages?.find((entry) => entry.packageId === activePackage);
     if (!active) return;
     for (const stickerId of active.stickerIds) {
       const cell = document.createElement("button");
