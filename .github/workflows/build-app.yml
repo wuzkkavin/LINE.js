@@ -239,6 +239,61 @@ jobs:
             if ($stubProc -and -not $stubProc.HasExited) { Stop-Process -Id $stubProc.Id -Force }
           }
 
+      - name: 主題截圖 (五套主題各一張總覽頁)
+        shell: pwsh
+        run: |
+          # 以預置 shell-settings.json 的 theme 逐套重啟 App: 證明已存主題在啟動
+          # 第一幀即套用 (autostart 走同一條啟動路徑), 且五套色票實際渲染正確。
+          # 每套用獨立資料目錄互不污染; 全螢幕截圖, 工作列一併入鏡。
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class U32T {
+            [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+          }
+          '@
+          New-Item -ItemType Directory -Force -Path themes | Out-Null
+          foreach ($t in @('forest','ocean','sakura','violet','mono')) {
+            $home2 = Join-Path $env:RUNNER_TEMP "aibao-theme-$t"
+            New-Item -ItemType Directory -Force -Path $home2 | Out-Null
+            @{ show_window_on_start = $true; tray_hint_shown = $true; theme = $t } |
+              ConvertTo-Json | Set-Content (Join-Path $home2 'shell-settings.json') -Encoding UTF8
+            $env:HWLINEHELPER_HOME = $home2
+            $proc = Start-Process 'out\AI寶.exe' -PassThru
+            $up = $false
+            for ($i = 0; $i -lt 45; $i++) {
+              Start-Sleep -Seconds 2
+              try {
+                $r = Invoke-WebRequest -Uri 'http://127.0.0.1:3790/api/status' -UseBasicParsing -TimeoutSec 3
+                if ($r.StatusCode -eq 200) { $up = $true; break }
+              } catch {}
+            }
+            if (-not $up) { throw "theme ${t}: helper 3790 did not come up" }
+            Start-Sleep -Seconds 5
+            $proc.Refresh()
+            if ($proc.MainWindowHandle -ne 0) {
+              [U32T]::SetWindowPos($proc.MainWindowHandle, [IntPtr]::Zero, 40, 30, 1000, 700, 0) | Out-Null
+              [U32T]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
+            }
+            Start-Sleep -Seconds 3
+            Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save((Join-Path $PWD "themes\theme-$t.png"))
+            $g.Dispose(); $bmp.Dispose()
+            & 'out\AI寶.exe' --quit | Out-Null
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) { break }
+            }
+            if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) { throw "theme ${t}: app did not exit after --quit" }
+            Write-Host "theme ${t}: screenshot saved"
+          }
+          Get-ChildItem themes | ForEach-Object { "shot: $($_.Name) $($_.Length) bytes" }
+
       - name: 上傳成品、探針結果、截圖與 log
         if: always()
         uses: actions/upload-artifact@v4
@@ -252,6 +307,7 @@ jobs:
             app-main.png
             gui-after-quit.txt
             foreign-shell.log
+            themes/theme-*.png
           if-no-files-found: warn
 
   # 舊世代建置 (結束殘留情境的前置): 歷史定版各自建出當代產物 —
