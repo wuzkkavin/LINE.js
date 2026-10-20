@@ -66,6 +66,23 @@ pub fn run_probe() -> i32 {
     if let Some(text) = engine::http_get_text(engine::HELPER_PORT, "/api/status") {
         let has_bot = text.contains("\"bot\"");
         rec(format!("helper_status_has_bot={has_bot}"));
+        // 身分標記也要在 (新版 helper 才有; App 靠它分辨新舊服務)
+        let has_identity = text.contains("\"service\":\"aibao-helper\"") || text.contains("\"service\": \"aibao-helper\"");
+        rec(format!("helper_status_identity={has_identity}"));
+    }
+    // 4b) payload 端點實測: 實際 POST /api/list-models 與 /api/test-ai, 用回應內容證明路由存在。
+    // list-models 不給 Key → 正確行為是 HTTP 200 + {ok:false, code:"AI_NO_KEY"}; 若回 404 就是路由不在 (實機踩過)。
+    match engine::http_post_text(engine::HELPER_PORT, "/api/list-models", "{\"provider\":\"groq\",\"baseUrl\":\"https://api.groq.com/openai/v1\"}") {
+        Some((200, body)) if body.contains("AI_NO_KEY") => rec("helper_list_models_route=ok".to_string()),
+        Some((code, body)) => rec(format!("helper_list_models_route=fail:http{code}:{}", sanitize(&body.chars().take(120).collect::<String>()))),
+        None => rec("helper_list_models_route=fail:no-response".to_string()),
+    }
+    // test-ai 把 baseUrl 指向必定連不上的本機埠 → 正確行為是 HTTP 200 + {ok:false, code:"AI_NETWORK"};
+    // 回 404 代表 test-ai 路由不在; 回 ok:true 或其他 code 都不對。
+    match engine::http_post_text(engine::HELPER_PORT, "/api/test-ai", "{\"provider\":\"groq\",\"baseUrl\":\"http://127.0.0.1:9/v1\",\"model\":\"probe-stub\",\"apiKey\":\"probe\"}") {
+        Some((200, body)) if body.contains("AI_NETWORK") => rec("helper_test_ai_route=ok".to_string()),
+        Some((code, body)) => rec(format!("helper_test_ai_route=fail:http{code}:{}", sanitize(&body.chars().take(120).collect::<String>()))),
+        None => rec("helper_test_ai_route=fail:no-response".to_string()),
     }
     // 5) WS 登入往返
     let events = core_ws::probe_login_roundtrip(true, Duration::from_secs(90));

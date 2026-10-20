@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use core_ws::{AuthState, LoginUi, SharedLogin, WsCommand};
-use engine::{EngineManager, EngineState};
+use engine::{EngineManager, EngineState, StopOutcome};
 use serde_json::Value;
 
 const COPYRIGHT: &str = "©Copyright 2026 By 吳治綱 繁體中文化";
@@ -128,7 +128,9 @@ struct App {
     hidden: bool,
     confirm_quit: bool,
     quitting: bool,
-    quit_done: Arc<Mutex<bool>>,
+    quit_outcome: Arc<Mutex<Option<StopOutcome>>>,
+    quit_blocked_msg: Option<String>,
+    show_tray_hint: bool,
     confirm_logout: bool,
     autostart_arg: bool,
     shell_settings: shell::ShellSettings,
@@ -414,7 +416,9 @@ impl App {
             hidden: start_hidden,
             confirm_quit: false,
             quitting: false,
-            quit_done: Arc::new(Mutex::new(false)),
+            quit_outcome: Arc::new(Mutex::new(None)),
+            quit_blocked_msg: None,
+            show_tray_hint: false,
             confirm_logout: false,
             autostart_arg,
             shell_settings,
@@ -440,7 +444,8 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
-    /// 開始結束序列: 背景執行緒執行 engine.stop() (CTRL_BREAK→Job 兜底), 完成後主執行緒關視窗。
+    /// 開始結束序列: 背景執行緒執行 engine.stop() (停止訊號檔→Job 兜底), 完成後主執行緒依結果關視窗;
+    /// 若服務不是本視窗啟的、又停不下來 (StopOutcome::External), 不關窗, 改顯示白話說明 (不假裝已結束)。
     fn begin_quit(&mut self, ctx: &egui::Context) {
         if self.quitting {
             return;
@@ -449,14 +454,14 @@ impl App {
         self.confirm_quit = false;
         self.show_window(ctx);
         let engine = self.engine.clone();
-        let done = self.quit_done.clone();
+        let slot = self.quit_outcome.clone();
         std::thread::spawn(move || {
             let outcome = {
                 let mut mgr = engine.lock().unwrap();
                 mgr.stop()
             };
             shell::log_line(&format!("結束序列完成: {outcome:?}"));
-            *done.lock().unwrap() = true;
+            *slot.lock().unwrap() = Some(outcome);
         });
     }
 
@@ -538,12 +543,24 @@ impl eframe::App for App {
             }
         }
 
-        // 結束序列完成 → 真正關閉視窗 (close_requested 不再攔截)
-        if self.quitting && *self.quit_done.lock().unwrap() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        // 結束序列完成 → 依結果處理: 真的停了才關視窗; 停不下來 (外部引擎) 就取消結束並明說。
+        if self.quitting {
+            let outcome = self.quit_outcome.lock().unwrap().take();
+            if let Some(outcome) = outcome {
+                if matches!(outcome, StopOutcome::External) {
+                    self.quitting = false;
+                    self.quit_blocked_msg = Some(
+                        "沒有把服務停下來: 目前在跑的 LINE 服務不是由這個視窗啟動的 (是另一個 AI寶 程式啟動的), 剛才已請它結束但它沒有停。這個視窗先不關, 服務還在執行中。要真正全部結束, 請到啟動它的那個 AI寶 程式按「結束服務並關閉程式」, 或到 Windows 工作管理員結束 AI寶 的行程。".to_string(),
+                    );
+                    shell::log_line("結束序列中止: 外部引擎未停止, 已顯示說明給使用者");
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
         }
 
-        // 視窗行為: 最小化與 X 都改成縮到系統匣 (規格書 v3 第 7 節)
+        // 視窗行為: 最小化與 X 都改成縮到系統匣 (規格書 v3 第 7 節);
+        // 第一次縮小時先跳白話提示, 避免使用者以為「關掉視窗 = 結束程式」(2026-10-20 老吳實機誤會)。
         let (close_requested, minimized) = ctx.input(|i| {
             let v = i.viewport();
             (v.close_requested(), v.minimized)
@@ -551,12 +568,22 @@ impl eframe::App for App {
         if !self.quitting {
             if close_requested {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.hide_window(ctx);
-                shell::log_line("主視窗關閉鍵 → 縮到系統匣 (服務繼續執行)");
+                if self.shell_settings.tray_hint_shown {
+                    self.hide_window(ctx);
+                    shell::log_line("主視窗關閉鍵 → 縮到系統匣 (服務繼續執行)");
+                } else {
+                    self.show_tray_hint = true;
+                    shell::log_line("主視窗關閉鍵 → 先顯示系統匣提示 (第一次)");
+                }
             } else if minimized == Some(true) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                self.hide_window(ctx);
-                shell::log_line("主視窗最小化 → 縮到系統匣 (服務繼續執行)");
+                if self.shell_settings.tray_hint_shown {
+                    self.hide_window(ctx);
+                    shell::log_line("主視窗最小化 → 縮到系統匣 (服務繼續執行)");
+                } else {
+                    self.show_tray_hint = true;
+                    shell::log_line("主視窗最小化 → 先顯示系統匣提示 (第一次)");
+                }
             }
         }
 
@@ -651,7 +678,11 @@ impl eframe::App for App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label("結束後 AI寶 將停止回覆群組訊息, 確定要結束服務並關閉程式嗎?");
+                    if matches!(self.engine_snap.state, EngineState::ExternalRunning) {
+                        ui.label("目前在跑的服務不是由這個視窗啟動的 (是另一個 AI寶 程式)。結束時會請它一起停止; 如果停不下來, 會再告訴你, 不會假裝已經關好。確定要結束嗎?");
+                    } else {
+                        ui.label("結束後 AI寶 將停止回覆群組訊息, 確定要結束服務並關閉程式嗎?");
+                    }
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("取消").clicked() {
@@ -685,6 +716,46 @@ impl eframe::App for App {
                             let _ = self.login_tx.send(WsCommand::Logout);
                         }
                     });
+                });
+        }
+
+        // 系統匣提示 (第一次按 X 或最小化時): 講清楚「關視窗 ≠ 結束程式」
+        if self.show_tray_hint {
+            egui::Window::new("AI寶還在執行")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("提醒: 把視窗關起來, 程式不會結束。AI寶 會縮到 Windows 右下角的「系統匣」繼續執行, LINE 服務照常運作。");
+                    ui.label("要真正停止服務並關閉程式, 請用系統匣圖示右鍵選單, 或視窗左下角的「結束服務並關閉程式」。");
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("先不要").clicked() {
+                            self.show_tray_hint = false;
+                        }
+                        if ui.button(egui::RichText::new("知道了, 縮到系統匣").strong()).clicked() {
+                            self.shell_settings.tray_hint_shown = true;
+                            self.shell_settings.save();
+                            self.show_tray_hint = false;
+                            self.hide_window(ctx);
+                            shell::log_line("系統匣提示已確認, 之後縮小不再提示");
+                        }
+                    });
+                });
+        }
+
+        // 結束未成說明框 (服務不是本視窗啟的、又停不下來時, 明說不假裝)
+        if let Some(msg) = self.quit_blocked_msg.clone() {
+            egui::Window::new("服務還在執行")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(msg);
+                    ui.add_space(10.0);
+                    if ui.button("知道了").clicked() {
+                        self.quit_blocked_msg = None;
+                    }
                 });
         }
 

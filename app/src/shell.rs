@@ -71,6 +71,10 @@ pub struct ShellSettings {
     /// 雙擊啟動時是否直接顯示主視窗 (自啟動 --autostart 時永遠先縮系統匣, 不受此值影響)
     #[serde(default = "default_true")]
     pub show_window_on_start: bool,
+    /// 是否已看過「縮到系統匣 ≠ 結束程式」的提示 (只提示第一次, 避免每次縮小都打擾;
+    /// 2026-10-20 老吳實機: 按 X 以為關掉程式, 其實只是縮到系統匣、服務繼續跑, 誤以為結束功能壞掉)
+    #[serde(default)]
+    pub tray_hint_shown: bool,
 }
 
 fn default_true() -> bool {
@@ -79,7 +83,7 @@ fn default_true() -> bool {
 
 impl Default for ShellSettings {
     fn default() -> Self {
-        Self { show_window_on_start: true }
+        Self { show_window_on_start: true, tray_hint_shown: false }
     }
 }
 

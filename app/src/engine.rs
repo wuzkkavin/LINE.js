@@ -268,7 +268,25 @@ impl EngineManager {
     /// (2026-10-20 雲端探針實測 GenerateConsoleCtrlEvent 失敗) — 規格書 v3 風險 2 的定案退路。
     pub fn stop(&mut self) -> StopOutcome {
         match self.state {
-            EngineState::ExternalRunning => return StopOutcome::External,
+            EngineState::ExternalRunning => {
+                // 不是本殼啟動的引擎 (例如另一個 AI寶 視窗或新版網頁版啟的): 不能假裝關得掉。
+                // 但新版監督者都看同一個資料目錄的 stop-request 訊號檔, 放訊號請它優雅結束,
+                // 並以「埠真的釋放」為成功判準; 15 秒內沒停就誠實回 External, 由 UI 明說沒停成。
+                let stop_file = shell::data_dir().join("stop-request");
+                let _ = std::fs::write(&stop_file, b"stop");
+                shell::log_line("結束外部引擎: 已放出停止訊號檔, 等待埠釋放確認");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while Instant::now() < deadline {
+                    if !Self::ports_alive() {
+                        self.state = EngineState::Stopped;
+                        shell::log_line("外部引擎已結束 (埠已釋放)");
+                        return StopOutcome::GracefulSignal;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                shell::log_line("外部引擎 15 秒內未結束 (埠仍有回應), 回報未停止");
+                return StopOutcome::External;
+            }
             EngineState::NotStarted | EngineState::Stopped => return StopOutcome::AlreadyStopped,
             _ => {}
         }
@@ -339,6 +357,30 @@ pub fn http_status(port: u16, path: &str) -> Option<u16> {
     match agent.get(&format!("http://127.0.0.1:{port}{path}")).call() {
         Ok(resp) => Some(resp.status()),
         Err(ureq::Error::Status(code, _)) => Some(code),
+        Err(_) => None,
+    }
+}
+
+/// POST 一段 JSON 並回傳 (狀態碼, body); 連不上回傳 None (探針端點實測用)。
+/// 為什麼需要: /api/status 回 200 不代表其他端點存在 — 2026-10-20 老吳實機遇到 /api/list-models 404,
+/// 探針必須實際打端點、用回應內容證明路由存在且邏輯有跑, 不能只看狀態端點。
+pub fn http_post_text(port: u16, path: &str, json_body: &str) -> Option<(u16, String)> {
+    use std::io::Read as _;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout_read(Duration::from_secs(10))
+        .build();
+    let read_body = |mut resp: ureq::Response| -> String {
+        let mut text = String::new();
+        let _ = resp.into_reader().read_to_string(&mut text);
+        text
+    };
+    match agent.post(&format!("http://127.0.0.1:{port}{path}")).set("Content-Type", "application/json").send_string(json_body) {
+        Ok(resp) => {
+            let code = resp.status();
+            Some((code, read_body(resp)))
+        }
+        Err(ureq::Error::Status(code, resp)) => Some((code, read_body(resp))),
         Err(_) => None,
     }
 }
