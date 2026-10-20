@@ -227,3 +227,37 @@ fn make_zip_stored(files: &[(String, Vec<u8>)]) -> Vec<u8> {
     out.extend_from_slice(&0u16.to_le_bytes());
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_zip_structure_is_valid() {
+        let files = vec![
+            ("version.txt".to_string(), b"AI-Bao test\n".to_vec()),
+            ("logs/helper-2026-10-20.log".to_string(), vec![b'x'; 5000]),
+        ];
+        let zip = make_zip_stored(&files);
+        // EOCD 在結尾 22 bytes: 簽名、筆數、central 大小與位移要對得起來
+        let eocd = &zip[zip.len() - 22..];
+        assert_eq!(&eocd[0..4], &0x06054b50u32.to_le_bytes());
+        let count = u16::from_le_bytes([eocd[10], eocd[11]]);
+        assert_eq!(count, 2);
+        let central_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as usize;
+        let central_off = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as usize;
+        assert_eq!(central_off + central_size, zip.len() - 22);
+        assert_eq!(&zip[central_off..central_off + 4], &0x02014b50u32.to_le_bytes());
+        // 第一筆 local header: 簽名 + CRC 與內容相符 + 資料原樣
+        assert_eq!(&zip[0..4], &0x04034b50u32.to_le_bytes());
+        let crc = u32::from_le_bytes([zip[14], zip[15], zip[16], zip[17]]);
+        assert_eq!(crc, crc32(b"AI-Bao test\n"));
+        let name_len = u16::from_le_bytes([zip[26], zip[27]]) as usize;
+        assert_eq!(&zip[30..30 + name_len], b"version.txt");
+        let data_start = 30 + name_len;
+        assert_eq!(&zip[data_start..data_start + 12], b"AI-Bao test\n");
+        // 第二筆 local header 緊接在第一筆資料之後, central 每筆固定 46+name
+        let second = data_start + 12;
+        assert_eq!(&zip[second..second + 4], &0x04034b50u32.to_le_bytes());
+    }
+}
