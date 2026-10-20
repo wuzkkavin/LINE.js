@@ -15,7 +15,7 @@ tungstenite = "0.24"
 # 殼只呼叫本機 http://127.0.0.1 的 helper API, 不需要 TLS: 關掉預設的 rustls 避免多餘相依
 ureq = { version = "2", default-features = false, features = ["json"] }
 qrcode = "0.14"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.15"
 
 # 本機 (Linux) cargo check 用: winit 需要 x11 後端才編得過; Windows 建置不套用本節

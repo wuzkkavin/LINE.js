@@ -176,12 +176,17 @@ struct App {
     repair_lines: Vec<String>,
     avatar_tex: Option<egui::TextureHandle>,
     /// 登入帳號的實際 LINE 頭像 (以核心 profile 的 pictureId 向 /media 取圖)。
-    /// account_avatar_id 記錄目前這張圖 (或這次失敗嘗試) 對應的 pictureId,
-    /// id 沒變就不重抓; 抓不到時顯示退回品牌頭像 avatar_tex。
+    /// account_avatar_id 記錄目前這張圖對應的 pictureId, id 沒變就不重抓;
+    /// 抓取/解碼失敗不把 id 記死 (舊版記死後永遠不再試, 一次偶發失敗就一輩子顯示
+    /// 品牌圖), 改記失敗次數與下次可重試時間: 間隔 20 秒、最多 6 次, 且每次
+    /// 「連線成功 (含 session 還原)」都重置額度重新嘗試。抓不到時顯示退回品牌頭像。
     account_avatar_tex: Option<egui::TextureHandle>,
     account_avatar_id: Option<String>,
     account_avatar_fetching: Option<String>,
     account_avatar_slot: Slot<(String, Result<Vec<u8>, String>)>,
+    account_avatar_attempts: u32,
+    account_avatar_retry_at: Option<std::time::Instant>,
+    account_avatar_ready_seen: bool,
     hidden: bool,
     confirm_quit: bool,
     quitting: bool,
@@ -213,8 +218,13 @@ struct Tray {
     gray_icon: tray_icon::Icon,
 }
 
-fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?;
+/// 解碼圖片位元組為 RGBA: 依內容自動辨識格式 (不再強制 PNG)。
+/// 為什麼改 (2026-10-20 驗收修復): 登入帳號的實際頭像是向核心 /media 取的 LINE 頭像圖,
+/// LINE 的頭像原圖是 JPEG; 舊版強制以 PNG 格式解碼, JPEG 位元組必然失敗, 總覽與側欄
+/// 永遠退回品牌定版圖 (實機回報「頭像沒換成帳號實際頭像」的程式層根因)。品牌圖示等
+/// PNG 素材走同一條路徑照常解碼。
+fn decode_image_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let img = image::load_from_memory(bytes).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     Some((rgba.into_raw(), w, h))
@@ -228,7 +238,7 @@ fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
 /// 在這裡先算出帶正確抗鋸齒邊的小圖, 呼叫端幾乎不必再縮放, 邊緣才乾淨。
 /// 只處理縮小 (目標邊長小於來源); 否則原樣回傳 (仍會補正方形)。
 fn icon_rgba(size: u32) -> Option<(Vec<u8>, u32, u32)> {
-    let (rgba, w, h) = decode_png_rgba(ICON_BYTES)?;
+    let (rgba, w, h) = decode_image_rgba(ICON_BYTES)?;
     // 置中貼到正方形透明畫布 (來源 233x232 非正方形, 直接給非正方形尺寸會被拉伸變形)
     let side = w.max(h);
     let mut canvas = vec![0u8; (side * side * 4) as usize];
@@ -353,7 +363,9 @@ fn main() {
 
     // 視窗尺寸鎖定(2026-10-20 老吳指示):不給使用者任意放大縮小,避免版面被
     // 拉到走樣。沿用現行設計尺寸 1024x720:resizable(false) 之外再把 min/max
-    // 釘在同一尺寸雙重保險;最大化按鈕由 Windows 隨不可調整大小一併停用。
+    // 釘在同一尺寸雙重保險;最大化按鈕也明確關掉 (with_maximize_button(false)
+    // + with_maximized(false)) — 不靠「Windows 會隨 resizable 一併停用」的慣例,
+    // 老吳驗收時明示連最大化都不行, 設定寫死在 builder 上可直接查證。
     // 縮到系統匣、最小化、關閉行為不受影響;--autostart 走同一條路徑同樣固定。
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("AI寶")
@@ -361,6 +373,8 @@ fn main() {
         .with_min_inner_size([1024.0, 720.0])
         .with_max_inner_size([1024.0, 720.0])
         .with_resizable(false)
+        .with_maximize_button(false)
+        .with_maximized(false)
         .with_visible(!start_hidden);
     // 視窗/工作列圖示: 給預先縮好的 64px 圖 (理由見 icon_rgba), 不再直交 233x232 原圖
     if let Some((rgba, w, h)) = icon_rgba(64) {
@@ -533,7 +547,7 @@ impl App {
             }
         }
 
-        let avatar_tex = decode_png_rgba(AVATAR_BYTES).map(|(rgba, w, h)| {
+        let avatar_tex = decode_image_rgba(AVATAR_BYTES).map(|(rgba, w, h)| {
             let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
             cc.egui_ctx.load_texture("avatar", img, egui::TextureOptions::LINEAR)
         });
@@ -541,7 +555,7 @@ impl App {
         // 側欄圖示: 任一顆解碼失敗只退回該顆純文字按鈕並記 log, 不 panic、不擋啟動。
         let mut nav_icons: [Option<egui::TextureHandle>; 9] = Default::default();
         for (idx, (page, _)) in NAV_PAGES.iter().enumerate() {
-            nav_icons[idx] = decode_png_rgba(nav_icon_bytes(*page)).map(|(rgba, w, h)| {
+            nav_icons[idx] = decode_image_rgba(nav_icon_bytes(*page)).map(|(rgba, w, h)| {
                 let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
                 cc.egui_ctx.load_texture(format!("nav-{idx}"), img, egui::TextureOptions::LINEAR)
             });
@@ -587,6 +601,9 @@ impl App {
             account_avatar_id: None,
             account_avatar_fetching: None,
             account_avatar_slot: Arc::new(Mutex::new(None)),
+            account_avatar_attempts: 0,
+            account_avatar_retry_at: None,
+            account_avatar_ready_seen: false,
             hidden: start_hidden,
             confirm_quit: false,
             quitting: false,
@@ -762,33 +779,52 @@ impl App {
         self.login.lock().unwrap().clone()
     }
 
-    /// 每幀同步帳號實際頭像: pictureId 出現或變化時在背景抓一次圖, 成功就
-    /// 換上 texture; 失敗只記 log 並退回品牌頭像 (不打擾使用者、不重試轟炸)。
-    /// 登出 (pictureId 消失) 時清掉帳號頭像, 下次登入會重新抓。
+    /// 每幀同步帳號實際頭像: pictureId 出現或變化時在背景抓圖, 成功就換上 texture;
+    /// 失敗記 log (白話原因) 並退回品牌頭像, 但不記死: 20 秒後可再試 (最多 6 次),
+    /// 且每次連線成功 (含 session 還原的 Ready) 都重置次數重新嘗試 — 舊版把失敗
+    /// 記成「已處理」永不再試, 一次偶發失敗 (核心媒體未就緒、cookie 流程競態)
+    /// 就永遠顯示品牌圖。登出 (pictureId 消失) 時清掉帳號頭像, 下次登入會重新抓。
     fn sync_account_avatar(&mut self, ctx: &egui::Context) {
-        let want = self.login_snapshot().profile_picture_id;
+        let snap = self.login_snapshot();
+        let want = snap.profile_picture_id.clone();
+        // 連線成功 (Ready) 的上升緣: 重置重試額度 — 每次連上都重新嘗試取得頭像
+        let ready_now = snap.connected && snap.auth == AuthState::Ready;
+        if ready_now && !self.account_avatar_ready_seen {
+            self.account_avatar_attempts = 0;
+            self.account_avatar_retry_at = None;
+        }
+        self.account_avatar_ready_seen = ready_now;
         if let Some((id, res)) = self.account_avatar_slot.lock().unwrap().take() {
             if self.account_avatar_fetching.as_deref() == Some(id.as_str()) {
                 self.account_avatar_fetching = None;
             }
             if want.as_deref() == Some(id.as_str()) {
-                self.account_avatar_id = Some(id);
                 match res {
                     Ok(bytes) => {
-                        self.account_avatar_tex = decode_png_rgba(&bytes).map(|(rgba, w, h)| {
+                        self.account_avatar_tex = decode_image_rgba(&bytes).map(|(rgba, w, h)| {
                             let img = egui::ColorImage::from_rgba_unmultiplied(
                                 [w as usize, h as usize],
                                 &rgba,
                             );
                             ctx.load_texture("account-avatar", img, egui::TextureOptions::LINEAR)
                         });
-                        if self.account_avatar_tex.is_none() {
-                            shell::log_line("帳號頭像解碼失敗, 退回品牌頭像顯示");
+                        if self.account_avatar_tex.is_some() {
+                            self.account_avatar_id = Some(id);
+                            self.account_avatar_attempts = 0;
+                            self.account_avatar_retry_at = None;
+                        } else {
+                            self.account_avatar_attempts += 1;
+                            self.account_avatar_retry_at =
+                                Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+                            shell::log_line("帳號頭像解碼失敗, 退回品牌頭像顯示 (稍後會自動再試)");
                         }
                     }
                     Err(e) => {
                         self.account_avatar_tex = None;
-                        shell::log_line(&format!("帳號頭像抓取失敗, 退回品牌頭像顯示: {e}"));
+                        self.account_avatar_attempts += 1;
+                        self.account_avatar_retry_at =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+                        shell::log_line(&format!("帳號頭像抓取失敗, 退回品牌頭像顯示 (稍後會自動再試): {e}"));
                     }
                 }
             }
@@ -799,10 +835,17 @@ impl App {
                     self.account_avatar_id = None;
                     self.account_avatar_tex = None;
                 }
+                self.account_avatar_attempts = 0;
+                self.account_avatar_retry_at = None;
             }
             Some(id) => {
+                let retry_due = self
+                    .account_avatar_retry_at
+                    .map_or(true, |t| std::time::Instant::now() >= t);
                 if self.account_avatar_id.as_deref() != Some(id.as_str())
                     && self.account_avatar_fetching.as_deref() != Some(id.as_str())
+                    && self.account_avatar_attempts < 6
+                    && retry_due
                 {
                     let id = id.clone();
                     let slot = self.account_avatar_slot.clone();
@@ -2495,6 +2538,35 @@ impl App {
             ui.label("機密保存方式: API Key 存放在 Windows 認證管理員; LINE 登入狀態以 DPAPI 加密後存放在本機資料目錄, 只綁這台電腦的這個使用者帳號。");
             ui.label("提醒: 本程式以次要帳號登入 LINE (非官方介面), 請勿使用主帳號。");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_image_rgba;
+    use std::io::Cursor;
+
+    fn encode(img: &image::DynamicImage, format: image::ImageFormat) -> Vec<u8> {
+        let mut buf = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), format).unwrap();
+        buf
+    }
+
+    #[test]
+    fn decode_accepts_png_and_jpeg() {
+        // 品牌素材是 PNG、LINE 帳號頭像是 JPEG: 兩種都要解得開。
+        // (舊版強制 PNG 解碼, JPEG 頭像必然失敗 — 2026-10-20 驗收第 4 項根因。)
+        let src = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(4, 3, image::Rgba([10, 20, 30, 255])));
+        let png = encode(&src, image::ImageFormat::Png);
+        let (rgba, w, h) = decode_image_rgba(&png).expect("PNG 應可解碼");
+        assert_eq!((w, h), (4, 3));
+        assert_eq!(&rgba[0..4], &[10, 20, 30, 255]);
+        let jpg = encode(&src, image::ImageFormat::Jpeg);
+        let (rgba2, w2, h2) = decode_image_rgba(&jpg).expect("JPEG 頭像應可解碼");
+        assert_eq!((w2, h2), (4, 3));
+        // JPEG 是有損壓縮, 只驗大致顏色與不透明
+        assert!((rgba2[0] as i32 - 10).abs() <= 4 && rgba2[3] == 255);
+        assert!(decode_image_rgba(b"not an image").is_none());
     }
 }
 
