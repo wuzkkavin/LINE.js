@@ -80,6 +80,16 @@ pub fn line_config_status() -> Result<serde_json::Value, String> {
     get_json("/api/line/config-status")
 }
 
+/// 讀取已登入帳號的群組清單 (helper 經核心網頁通道取得, 含白名單標記)。
+/// helper 端要等核心快照 + 重新整理, 可能十幾秒, 用較長逾時 (一般 get_json 只有 10 秒)。
+pub fn line_chats() -> Result<serde_json::Value, String> {
+    match agent(40).get(&url("/api/line/chats")).call() {
+        Ok(resp) => resp.into_json::<serde_json::Value>().map_err(|e| format!("回應解析失敗: {e}")),
+        Err(ureq::Error::Status(_, resp)) => Err(format!("服務回應錯誤: {}", resp.status())),
+        Err(e) => Err(format!("連不上設定服務: {e}")),
+    }
+}
+
 pub fn line_config_apply(chat_id: &str) -> Result<serde_json::Value, String> {
     post_json("/api/line/config-apply", serde_json::json!({ "chatId": chat_id }), 20)
 }

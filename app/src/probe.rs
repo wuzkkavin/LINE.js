@@ -84,6 +84,15 @@ pub fn run_probe() -> i32 {
         Some((code, body)) => rec(format!("helper_test_ai_route=fail:http{code}:{}", sanitize(&body.chars().take(120).collect::<String>()))),
         None => rec("helper_test_ai_route=fail:no-response".to_string()),
     }
+    // 4c) 群組清單端點實測: GET /api/line/chats。此時核心未登入, 正確行為是 200 + {ok:false, code:"NOT_LOGGED_IN"};
+    // 回 404 或非 JSON 代表路由不在 (同 4b 教訓)。helper 端要等核心把登入狀態定案, 給 40 秒逾時。
+    match engine::http_get_text_long(engine::HELPER_PORT, "/api/line/chats", 40) {
+        Some(body) if body.contains("NOT_LOGGED_IN") || body.contains("\"ok\":true") || body.contains("\"ok\": true") => {
+            rec("helper_line_chats_route=ok".to_string())
+        }
+        Some(body) => rec(format!("helper_line_chats_route=fail:{}", sanitize(&body.chars().take(120).collect::<String>()))),
+        None => rec("helper_line_chats_route=fail:no-response".to_string()),
+    }
     // 5) WS 登入往返
     let events = core_ws::probe_login_roundtrip(true, Duration::from_secs(90));
     for e in &events {

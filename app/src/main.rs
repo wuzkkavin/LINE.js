@@ -118,6 +118,9 @@ struct App {
     busy: HashMap<String, bool>,
     token_slot: Slot<Value>,
     apply_slot: Slot<Value>,
+    chats_slot: Slot<Value>,
+    group_chats: Vec<Value>,
+    chats_loaded: bool,
     line_cfg_status: Slot<Value>,
     reindex_slot: Slot<Value>,
     save_slot: Slot<Value>,
@@ -406,6 +409,9 @@ impl App {
             busy: HashMap::new(),
             token_slot: Arc::new(Mutex::new(None)),
             apply_slot: Arc::new(Mutex::new(None)),
+            chats_slot: Arc::new(Mutex::new(None)),
+            group_chats: Vec::new(),
+            chats_loaded: false,
             line_cfg_status: Arc::new(Mutex::new(None)),
             reindex_slot: Arc::new(Mutex::new(None)),
             save_slot: Arc::new(Mutex::new(None)),
@@ -1029,6 +1035,21 @@ impl App {
             let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("完成").to_string();
             self.page_msg.insert("apply".into(), msg);
             refresh_line_cfg_status(self);
+            // 套用成功後自動重讀群組清單, 讓「已在白名單」標示立刻更新
+            if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) && self.chats_loaded {
+                self.spawn_chats_load(ctx);
+            }
+        }
+        // 群組清單讀取
+        if let Some(v) = self.chats_slot.lock().unwrap().take() {
+            self.busy.insert("chats".into(), false);
+            if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+                self.group_chats = v.get("chats").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+                self.chats_loaded = true;
+            }
+            if let Some(m) = v.get("message").and_then(|m| m.as_str()) {
+                self.page_msg.insert("chats".into(), m.to_string());
+            }
         }
         // 知識庫重建
         if let Some(v) = self.reindex_slot.lock().unwrap().take() {
@@ -1053,6 +1074,42 @@ impl App {
 impl App {
     fn engine_unavailable(&self) -> bool {
         !matches!(self.engine_snap.state, EngineState::Running | EngineState::ExternalRunning)
+    }
+
+    /// 背景讀取群組清單 (helper /api/line/chats), 結果進 chats_slot 由 poll 收。
+    fn spawn_chats_load(&mut self, ctx: &egui::Context) {
+        if self.busy.get("chats").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("chats".into(), true);
+        let slot = self.chats_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = helper_api::line_chats();
+            *slot.lock().unwrap() = Some(match r {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// 背景把某個聊天室加入白名單 (helper /api/line/config-apply), 結果進 apply_slot 由 poll 收。
+    fn start_apply(&mut self, ctx: &egui::Context, chat_id: String) {
+        if self.busy.get("apply").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("apply".into(), true);
+        let slot = self.apply_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = helper_api::line_config_apply(&chat_id);
+            *slot.lock().unwrap() = Some(match r {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
     }
 
     fn page_overview(&mut self, ui: &mut egui::Ui) {
@@ -1398,7 +1455,7 @@ impl App {
         });
         ui.add_space(10.0);
         card(ui, "LINE 開通 (讓機器人能在群組說話)", |ui| {
-            // 步驟一: 白名單
+            // 步驟一: 白名單 (用選的: 先讀群組清單, 再點選加入; 貼 ID 降為進階)
             let cfg = self.line_cfg_status.lock().unwrap().clone();
             ui.label(egui::RichText::new("步驟一: 把目標群組加入白名單").strong());
             if let Some(c) = &cfg {
@@ -1412,33 +1469,58 @@ impl App {
             } else {
                 ui.label("正在讀取核心設定狀態…");
             }
-            ui.horizontal(|ui| {
-                ui.label("群組 ID:");
-                let mut chat_id = self.page_msg.get("chatid").cloned().unwrap_or_default();
-                if ui.add(egui::TextEdit::singleline(&mut chat_id).desired_width(320.0).hint_text("c 開頭共 33 碼")).changed() {
-                    self.page_msg.insert("chatid".into(), chat_id);
-                }
-            });
-            ui.label(egui::RichText::new("群組 ID 的找法: 在總覽的對話裡, 對聊天室按右鍵選「複製聊天室 ID」(核心功能); 或在群組資訊頁查看。").weak());
-            let busy_apply = self.busy.get("apply").copied().unwrap_or(false);
-            if ui.button(if busy_apply { "處理中…" } else { "加入白名單" }).clicked() && !busy_apply {
-                let chat_id = self.page_msg.get("chatid").cloned().unwrap_or_default();
-                if chat_id.trim().is_empty() {
-                    self.page_msg.insert("apply".into(), "請先貼上群組 ID 再按加入白名單".to_string());
-                } else {
-                    self.busy.insert("apply".into(), true);
-                    let slot = self.apply_slot.clone();
-                    let ctx2 = ctx.clone();
-                    std::thread::spawn(move || {
-                        let r = helper_api::line_config_apply(&chat_id);
-                        *slot.lock().unwrap() = Some(match r {
-                            Ok(v) => v,
-                            Err(e) => serde_json::json!({ "ok": false, "message": e }),
-                        });
-                        ctx2.request_repaint();
+            ui.label(egui::RichText::new("不用自己找代號: 先在手機 LINE 把這個次要帳號邀請進要用的群組, 回來按「讀取我的群組清單」, 群組會列出來, 用點的加入白名單。").weak());
+            let busy_chats = self.busy.get("chats").copied().unwrap_or(false);
+            if ui.button(if busy_chats { "讀取中…" } else { "讀取我的群組清單" }).clicked() && !busy_chats {
+                self.spawn_chats_load(&ctx);
+            }
+            if let Some(m) = self.page_msg.get("chats") {
+                ui.label(m.clone());
+            }
+            if self.chats_loaded {
+                let chats = self.group_chats.clone();
+                let busy_apply_now = self.busy.get("apply").copied().unwrap_or(false);
+                for c in &chats {
+                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("(未命名)").to_string();
+                    let kind = c.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    let kind_label = match kind { "group" => "群組", "room" => "聊天室", "square" => "社群", _ => kind };
+                    let members = c.get("memberCount").and_then(|v| v.as_i64());
+                    let whitelisted = c.get("whitelisted").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    ui.horizontal(|ui| {
+                        let mut text = format!("{name} ({kind_label}");
+                        if let Some(n) = members {
+                            text += &format!("・{n} 人");
+                        }
+                        text += ")";
+                        ui.label(text);
+                        if whitelisted {
+                            ui.label(egui::RichText::new("已在白名單").color(COLOR_OK));
+                        } else if ui.add_enabled(!busy_apply_now, egui::Button::new("加入白名單")).clicked() {
+                            self.start_apply(&ctx, id.clone());
+                        }
                     });
                 }
             }
+            ui.collapsing("進階: 手動貼上群組 ID (清單讀不到時才需要)", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("群組 ID:");
+                    let mut chat_id = self.page_msg.get("chatid").cloned().unwrap_or_default();
+                    if ui.add(egui::TextEdit::singleline(&mut chat_id).desired_width(320.0).hint_text("c 開頭共 33 碼")).changed() {
+                        self.page_msg.insert("chatid".into(), chat_id);
+                    }
+                });
+                ui.label(egui::RichText::new("備用方法: 在核心網頁 (http://127.0.0.1:3789) 點進群組聊天室, 用右鍵「複製聊天室 ID」取得 ID, 再貼到上面欄位。").weak());
+                let busy_apply = self.busy.get("apply").copied().unwrap_or(false);
+                if ui.button(if busy_apply { "處理中…" } else { "加入白名單" }).clicked() && !busy_apply {
+                    let chat_id = self.page_msg.get("chatid").cloned().unwrap_or_default();
+                    if chat_id.trim().is_empty() {
+                        self.page_msg.insert("apply".into(), "請先貼上群組 ID 再按加入白名單".to_string());
+                    } else {
+                        self.start_apply(&ctx, chat_id);
+                    }
+                }
+            });
             if let Some(m) = self.page_msg.get("apply") {
                 ui.label(m.clone());
             }

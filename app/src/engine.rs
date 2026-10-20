@@ -386,6 +386,19 @@ pub fn http_post_text(port: u16, path: &str, json_body: &str) -> Option<(u16, St
 }
 
 /// 讀取一個本機 HTTP 回應的 body (探針與狀態檢查用)
+/// GET 並讀完整 body 的較長逾時版 (給需要等核心定案的端點探測用, 如 /api/line/chats)。
+pub fn http_get_text_long(port: u16, path: &str, read_secs: u64) -> Option<String> {
+    use std::io::Read as _;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout_read(Duration::from_secs(read_secs))
+        .build();
+    let resp = agent.get(&format!("http://127.0.0.1:{port}{path}")).call().ok()?;
+    let mut text = String::new();
+    resp.into_reader().read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
 pub fn http_get_text(port: u16, path: &str) -> Option<String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(2))
