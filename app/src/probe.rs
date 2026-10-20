@@ -75,14 +75,16 @@ pub fn run_probe() -> i32 {
     }
     // 4b) payload 端點實測: 實際 POST /api/list-models 與 /api/test-ai, 用回應內容證明路由存在。
     // list-models 不給 Key → 正確行為是 HTTP 200 + {ok:false, code:"AI_NO_KEY"}; 若回 404 就是路由不在 (實機踩過)。
-    match engine::http_post_text(engine::HELPER_PORT, "/api/list-models", "{\"provider\":\"groq\",\"baseUrl\":\"https://api.groq.com/openai/v1\"}") {
+    // 兩支都用 40 秒長逾時: list-models 沒帶 Key 時 helper 要先讀 Windows 認證管理員
+    // (冷啟動 PowerShell + Add-Type 編譯), 10 秒在忙碌 CI 機器上會假失敗 (run 39413133498 實證)。
+    match engine::http_post_text_long(engine::HELPER_PORT, "/api/list-models", "{\"provider\":\"groq\",\"baseUrl\":\"https://api.groq.com/openai/v1\"}", 40) {
         Some((200, body)) if body.contains("AI_NO_KEY") => rec("helper_list_models_route=ok".to_string()),
         Some((code, body)) => rec(format!("helper_list_models_route=fail:http{code}:{}", sanitize(&body.chars().take(120).collect::<String>()))),
         None => rec("helper_list_models_route=fail:no-response".to_string()),
     }
     // test-ai 把 baseUrl 指向必定連不上的本機埠 → 正確行為是 HTTP 200 + {ok:false, code:"AI_NETWORK"};
     // 回 404 代表 test-ai 路由不在; 回 ok:true 或其他 code 都不對。
-    match engine::http_post_text(engine::HELPER_PORT, "/api/test-ai", "{\"provider\":\"groq\",\"baseUrl\":\"http://127.0.0.1:9/v1\",\"model\":\"probe-stub\",\"apiKey\":\"probe\"}") {
+    match engine::http_post_text_long(engine::HELPER_PORT, "/api/test-ai", "{\"provider\":\"groq\",\"baseUrl\":\"http://127.0.0.1:9/v1\",\"model\":\"probe-stub\",\"apiKey\":\"probe\"}", 40) {
         Some((200, body)) if body.contains("AI_NETWORK") => rec("helper_test_ai_route=ok".to_string()),
         Some((code, body)) => rec(format!("helper_test_ai_route=fail:http{code}:{}", sanitize(&body.chars().take(120).collect::<String>()))),
         None => rec("helper_test_ai_route=fail:no-response".to_string()),

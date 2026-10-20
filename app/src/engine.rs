@@ -864,10 +864,17 @@ pub fn http_status(port: u16, path: &str) -> Option<u16> {
 /// 為什麼需要: /api/status 回 200 不代表其他端點存在 — 2026-10-20 老吳實機遇到 /api/list-models 404,
 /// 探針必須實際打端點、用回應內容證明路由存在且邏輯有跑, 不能只看狀態端點。
 pub fn http_post_text(port: u16, path: &str, json_body: &str) -> Option<(u16, String)> {
+    http_post_text_long(port, path, json_body, 10)
+}
+
+/// POST 的較長逾時版: 給「首次呼叫要等平台冷啟動」的端點探測用 — 例如 /api/list-models
+/// 在沒帶 Key 時須先讀 Windows 認證管理員 (helper 要冷啟動 PowerShell + Add-Type 編譯,
+/// 忙碌的 CI 機器上實測可超過 10 秒, run 39413133498 探針因此假失敗)。
+pub fn http_post_text_long(port: u16, path: &str, json_body: &str, read_secs: u64) -> Option<(u16, String)> {
     use std::io::Read as _;
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(2))
-        .timeout_read(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(read_secs))
         .build();
     let read_body = |mut resp: ureq::Response| -> String {
         let mut text = String::new();
