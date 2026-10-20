@@ -8,13 +8,13 @@ import { Logger } from "../src/logger.mjs";
 import { FileSecretStore, MemorySecretStore, WindowsSecretStore, createSecretStore, maskSecret } from "../src/secrets.mjs";
 import { SettingsStore, SECRET_NAMES, DEFAULT_CREATOR_REPLY } from "../src/config.mjs";
 import { createAiClient, DEFAULT_LIST_MODELS_TIMEOUT_MS } from "../src/ai.mjs";
-import { createTriggerState, evaluateTrigger, markAnswered, markTriggered } from "../src/trigger.mjs";
+import { createTriggerState, evaluateTrigger, markAnswered, markTriggered, localDateKey } from "../src/trigger.mjs";
 import { KnowledgeBase } from "../src/kb.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, ruleFallbackJudge, PerMinuteLimiter } from "../src/scam.mjs";
 import { createConsoleServer } from "../src/server.mjs";
 import { parseApiSection, applyApiConfig, applyCoreApiConfig, readCoreApiStatus, isValidChatId } from "../src/linecfg.mjs";
 import { MessageSenderRegistry } from "../src/msgregistry.mjs";
-import { HelperBot, isCreatorIntent, calculateAge, buildPersonaSection, QUOTE_HISTORY_PAGES, answerFilename, splitLongText, TEXT_SEND_LIMIT } from "../src/bot.mjs";
+import { HelperBot, isCreatorIntent, calculateAge, buildPersonaSection, QUOTE_HISTORY_PAGES, answerFilename, splitLongText, TEXT_SEND_LIMIT, LINE_FORMAT_RULE } from "../src/bot.mjs";
 import { coreEndpoints, fetchCoreChannels, shapeChatList } from "../src/corechats.mjs";
 import { WebSocketServer } from "ws";
 import { createAiClient as aiFactory } from "../src/ai.mjs";
@@ -980,13 +980,14 @@ async function waitUntilUnit(pred, timeout = 6000, label = "condition") {
     await new Promise((r) => setTimeout(r, 30));
   }
 }
-async function startBotHarness(t, { settingsOver = {}, kbFolder = "" } = {}) {
+async function startBotHarness(t, { settingsOver = {}, kbFolder = "", aiHandler = null, aiOptions = {} } = {}) {
   const dir = await tmp();
   const logger = new Logger({ dir: join(dir, "logs") });
   const settings = new SettingsStore({ path: join(dir, "settings.json"), logger });
   const aiBodies = [];
   const { server: aiServer, url: aiUrl } = await aiStubServer((body) => {
     aiBodies.push(body);
+    if (aiHandler) return aiHandler(body);
     const all = (body.messages ?? []).map((m) => m.content).join("\n");
     const content = all.includes("以下是公司知識庫片段") ? "依知識庫內容回答: 彩色列印請到四樓影印室。" : "這是一般回答。";
     return { body: { model: body.model, choices: [{ message: { role: "assistant", content } }] } };
@@ -1020,7 +1021,7 @@ async function startBotHarness(t, { settingsOver = {}, kbFolder = "" } = {}) {
   const kb = new KnowledgeBase({ folder: kbFolder, indexPath: join(dir, "kb-index.json"), logger });
   if (kbFolder) await kb.scan({ force: true });
   const registry = new MessageSenderRegistry({ path: join(dir, "message-senders.json"), logger });
-  const bot = new HelperBot({ settings, secrets, ai: createAiClient({}), kb, logger, registry });
+  const bot = new HelperBot({ settings, secrets, ai: createAiClient(aiOptions), kb, logger, registry });
   await bot.connect();
   t.after(() => bot.disconnect());
   await waitUntilUnit(() => bot.selfId === "u-me", 4000, "bot auth ready");
@@ -1123,4 +1124,123 @@ test("console: reindex 掃描進行中立即回 JSON (already-scanning, 3 秒內
   assert.equal(done.ok, true);
   assert.equal(done.scanState, "completed");
   assert.equal(done.status.files, 1);
+});
+
+// --- 2026-10-20 晚間驗收批次二: 429 退避 / 冷卻與每日上限實證 / 活動端點 / LINE 格式規則 ---
+
+test("ai: 429 依上游建議等待退避重試, 第三次降額度後成功; 錯誤不含上游原文", async (t) => {
+  const bodies = [];
+  const waits = [];
+  const groq429 = { error: { message: "Rate limit reached for model `qwen/qwen3.8-27b` in organization `org_01knez0r83ffxtk4crx6dnhyhw` service tier `on_demand` on output tokens per minute (OTPM): Limit 1000, Used 155, Requested 922. Please try again in 0.01s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing" } };
+  const { server, url } = await aiStubServer((body) => {
+    bodies.push(body);
+    if (bodies.length < 3) return { status: 429, body: groq429 };
+    return { body: { model: body.model, choices: [{ message: { role: "assistant", content: "退避後回答" } }] } };
+  });
+  t.after(() => server.close());
+  const ai = createAiClient({ sleepImpl: async (ms) => { waits.push(ms); } });
+  const r = await ai.chat({ baseUrl: url, apiKey: "k", model: "stub-model", messages: [{ role: "user", content: "hi" }], maxTokens: 2048 });
+  assert.equal(r.content, "退避後回答");
+  assert.equal(bodies.length, 3, "429 應重試到第三次");
+  assert.equal(bodies[0].max_tokens, 2048);
+  assert.equal(bodies[1].max_tokens, 2048);
+  assert.equal(bodies[2].max_tokens, 768, "第三次嘗試應降額度提高過關率");
+  assert.equal(waits.length, 2);
+  assert.ok(waits[0] >= 250 && waits[0] <= 1000, `等待應依上游建議 (0.01s+250ms), 實際 ${waits[0]}`);
+});
+
+test("ai: 429 三次都擋下時拋 AI_BUSY 白話錯誤 (不含原文/連結/組織 id)", async (t) => {
+  const groq429 = { error: { message: "Rate limit reached ... Please try again in 0.01s. https://console.groq.com/settings/billing org_01knez" } };
+  const { server, url } = await aiStubServer(() => ({ status: 429, body: groq429 }));
+  t.after(() => server.close());
+  const ai = createAiClient({ sleepImpl: async () => {} });
+  const err = await ai.chat({ baseUrl: url, apiKey: "k", model: "stub-model", messages: [{ role: "user", content: "hi" }] }).then(() => null, (e) => e);
+  assert.equal(err?.code, "AI_BUSY");
+  assert.ok(!/groq|org_|Rate limit/i.test(err.message), `AI_BUSY 訊息不得含上游原文: ${err.message}`);
+});
+
+test("bot: 寬鬆模式同人同群連發 3 則只回 1 次, 其餘被冷卻擋下且活動面板有紀錄 (第 9 項)", async (t) => {
+  const h = await startBotHarness(t, { settingsOver: { triggerMode: "relaxed", cooldownSec: 20, dailyLimit: 100 } });
+  h.inject("b1", "u-fast", "AI寶 什麼是機器學習?");
+  const first = await h.waitSent((f) => f.replyTo === "b1", "first answer");
+  assert.ok(first);
+  h.inject("b2", "u-fast", "AI寶 那什麼是深度學習?");
+  h.inject("b3", "u-fast", "AI寶 再說說神經網路?");
+  // 等判決都跑完 (活動紀錄裡出現 2 筆 cooldown)
+  await waitUntilUnit(() => h.bot.activitySnapshot().filter((a) => a.kind === "cooldown").length === 2, 6000, "cooldown activities");
+  const sends = h.bot.activitySnapshot();
+  assert.equal(sends.filter((a) => a.kind === "answered").length, 1, "連發 3 則只應回答 1 次");
+  assert.equal(h.aiBodies.length, 1, "被冷卻擋下的不應呼叫 AI");
+});
+
+test("bot: 每日上限 3 時第 4 次被擋 (白話提示), 且計數跨重啟持久 (第 9 項)", async (t) => {
+  const h = await startBotHarness(t, { settingsOver: { triggerMode: "relaxed", cooldownSec: 0, dailyLimit: 3 } });
+  for (const [i, u] of ["u-1", "u-2", "u-3"].entries()) {
+    h.inject(`d${i + 1}`, u, "AI寶，你是誰創造的？");
+    await h.waitSent((f) => f.replyTo === `d${i + 1}`, `creator ${i + 1}`);
+  }
+  h.inject("d4", "u-4", "AI寶，你是誰創造的？");
+  const limitSend = await h.waitSent((f) => f.replyTo === "d4", "daily limit notice");
+  assert.match(limitSend.text, /回答次數已達上限/);
+  assert.equal(h.bot.triggerState.daily.count, 3);
+  await waitUntilUnit(() => h.bot.activitySnapshot().some((a) => a.kind === "daily_limit"), 4000, "daily_limit activity");
+  // 持久化: 新 bot 從同一 state 檔載入, 當日計數不歸零
+  const dir2 = await tmp();
+  const path2 = join(dir2, "daily-state.json");
+  const settings2 = new SettingsStore({ path: join(dir2, "settings.json") });
+  const botA = new HelperBot({ settings: settings2, dailyStatePath: path2 });
+  botA.triggerState.daily.date = localDateKey();
+  markAnswered(botA.triggerState); markAnswered(botA.triggerState); markAnswered(botA.triggerState);
+  botA.stats.answered = 3;
+  botA.persistDaily();
+  const botB = new HelperBot({ settings: settings2, dailyStatePath: path2 });
+  assert.equal(botB.triggerState.daily.count, 3, "重啟後每日計數應從磁碟載入, 不得歸零");
+  assert.equal(botB.stats.answered, 3);
+});
+
+test("bot: AI 被 429 擋下時群組只收到白話忙線句 (第 8 項, 不含上游原文/連結)", async (t) => {
+  const groq429 = { error: { message: "Rate limit reached for model `qwen/qwen3.8-27b` in organization `org_01knez0r83ffxtk4crx6dnhyhw`. Please try again in 4.62s. https://console.groq.com/settings/billing" } };
+  const h = await startBotHarness(t, {
+    settingsOver: { triggerMode: "relaxed", cooldownSec: 0 },
+    aiHandler: () => ({ status: 429, body: groq429 }),
+    aiOptions: { sleepImpl: async () => {} },
+  });
+  h.inject("g1", "u-g", "AI寶 請問VPN是什麼?");
+  const sent = await h.waitSent((f) => f.replyTo === "g1", "busy fallback");
+  assert.equal(sent.text, "我這邊有點忙,稍等幾秒再問我一次。".replace(",", "，").replace(",", "，"));
+  assert.ok(!/groq|org_|Rate limit/i.test(sent.text), "群組訊息不得含上游原文");
+  await waitUntilUnit(() => h.bot.activitySnapshot().some((a) => a.kind === "ai_busy"), 4000, "ai_busy activity");
+});
+
+test("bot: 問答的 system prompt 附 LINE 友善格式規則 (第 13 項)", async (t) => {
+  const h = await startBotHarness(t, { settingsOver: { cooldownSec: 0 } });
+  h.inject("f1", "u-f", "AI寶，什麼是雲端硬碟？");
+  await h.waitSent((f) => f.replyTo === "f1", "answer");
+  assert.equal(h.aiBodies.length, 1);
+  const system = h.aiBodies[0].messages.find((x) => x.role === "system")?.content ?? "";
+  assert.ok(system.includes(LINE_FORMAT_RULE), "system prompt 應含程式附加的格式規則");
+  assert.match(system, /不要使用 Markdown 表格/);
+  assert.match(system, /不要使用 \*\* 粗體符號/);
+});
+
+test("activity: /api/bot/activity 回傳新到舊、上限 50、欄位完整 (第 12 項)", async (t) => {
+  const dir = await tmp();
+  const logger = new Logger({ dir: join(dir, "logs") });
+  const settings = new SettingsStore({ path: join(dir, "settings.json"), logger });
+  const secrets = new MemorySecretStore();
+  const bot = new HelperBot({ settings, secrets, ai: createAiClient({}), logger });
+  const server = createConsoleServer({ settings, secrets, ai: createAiClient({}), kb: null, bot, logger });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  for (let i = 1; i <= 55; i += 1) {
+    bot.recordActivity({ kind: i % 2 ? "answered" : "cooldown", m: { channelId: "c-act", senderName: `同事${i}`, text: `問題${i}一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十` }, answerChars: 10, ms: 100 });
+  }
+  const r = await fetch(`http://127.0.0.1:${server.address().port}/api/bot/activity`).then((x) => x.json());
+  assert.equal(r.ok, true);
+  assert.equal(r.events.length, 50, "環形緩衝上限 50 筆");
+  assert.equal(r.events[0].question.startsWith("問題55"), true, "最新在最前");
+  assert.ok(r.events[0].question.length <= 30, "問題片段只留前 30 字");
+  assert.equal(r.events[0].senderName, "同事55");
+  assert.equal(r.status.answeredToday, 0);
+  assert.equal(typeof r.status.dailyLimit, "number");
 });

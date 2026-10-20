@@ -89,7 +89,7 @@ a.btn { text-decoration: none; }
   <div class="grid" id="statusGrid">
     <div class="card"><div class="stat-label">LINE 登入 / 機器人連線</div><div class="stat-value" id="stLine">讀取中…</div><div class="stat-sub" id="stSelf"></div></div>
     <div class="card"><img class="bot-avatar" id="botAvatar" src="/assets/avatar.png" alt="AI寶 頭像" onerror="this.style.display='none';"><div class="stat-label">機器人名字 (觸發)</div><div class="stat-value" id="stName">—</div><div class="stat-sub" id="stMode"></div></div>
-    <div class="card"><div class="stat-label">使用中的 AI</div><div class="stat-value" id="stAi">—</div><div class="stat-sub" id="stAiModel"></div></div>
+    <div class="card"><div class="stat-label">使用中的 AI</div><div class="stat-value" id="stAi">—</div><div class="stat-sub" id="stAiModel"></div><div class="stat-sub" id="stCoreVer"></div></div>
     <div class="card"><div class="stat-label">知識庫</div><div class="stat-value" id="stKb">—</div><div class="stat-sub" id="stKbSub"></div></div>
     <div class="card"><div class="stat-label">今日數據</div><div class="stat-value" id="stToday">—</div><div class="stat-sub" id="stScam"></div></div>
   </div>
@@ -165,9 +165,9 @@ a.btn { text-decoration: none; }
     <label for="lineApiUrl">LINE 核心連線位置 (進階, 通常不用改)</label>
     <input type="text" id="lineApiUrl">
     <h3>創造者問題的固定回覆</h3>
-    <div class="hint">同事問「你是誰創造的」「作者是誰」「版權是誰的」這類問題時, 我會直接回下面這句, 不會去問 AI。每個人問的次數一樣會計入每日上限與冷卻。</div>
-    <label for="creatorReply">創造者問題的固定回覆</label>
-    <input type="text" id="creatorReply">
+    <div class="hint">同事問「你是誰創造的」「作者是誰」「版權是誰的」這類問題時, 我會直接回下面這句, 不會去問 AI。每個人問的次數一樣會計入每日上限與冷卻。這句是固定答覆, 只供檢視, 不能修改。</div>
+    <label for="creatorReply">創造者問題的固定回覆 (唯讀)</label>
+    <input type="text" id="creatorReply" readonly aria-readonly="true">
     <h3>機器人人設</h3>
     <div class="hint">填了才算數: 同事問我的年紀、生日、星座、性別、三圍、興趣、婚姻狀態或自我介紹時, 我只會照這裡填的回答; 沒填的欄位我會老實說「這部分我還沒有設定」, 不會自己編。年紀不用填, 我會用出生日自己算。</div>
     <div class="row">
@@ -275,17 +275,17 @@ a.btn { text-decoration: none; }
   <section class="card">
     <h2>關於</h2>
     <div style="font-size:15px; line-height:1.8">
-      ©Copyright 2026 By 吳治綱 繁體中文化
+      ©Copyright 2026 By 吳治綱
     </div>
     <div class="hint" style="font-size:13.5px; line-height:1.8">
-      本頁的版權宣告是針對本繁體中文化／客製版本 (helper 伴隨模組)。<br>
+      本頁的版權宣告是針對本客製版本 (helper 伴隨模組)。<br>
       上游出處: 原始專案 <strong>JS-PACKAGE/LINE.js</strong> (授權: Apache License 2.0), 核心函式庫 <strong>@evex/linejs</strong> (evex-dev)。上游著作權與授權標示完整保留, 詳見 Repo 根目錄 LICENSE 與 helper/README.md。<br>
       本頁圖示 (AI寶 icon) 由吳治綱提供; 字體 jf open 粉圓依 SIL Open Font License 1.1 使用。
     </div>
   </section>
 
   <footer class="pagefoot">
-    <div>©Copyright 2026 By 吳治綱 繁體中文化</div>
+    <div>©Copyright 2026 By 吳治綱</div>
     <div>上游: JS-PACKAGE/LINE.js (Apache License 2.0) · @evex/linejs</div>
   </footer>
 </main>
@@ -379,6 +379,7 @@ async function loadAll() {
   const ap = s.ai.providers[s.ai.active];
   $("stAi").textContent = ap ? ap.label : s.ai.active;
   $("stAiModel").textContent = ap ? ap.model : "";
+  $("stCoreVer").textContent = b.coreVersion ? `核心 LINE.js：v${b.coreVersion}` : "核心 LINE.js：—";
   if (b.kb) { $("stKb").textContent = b.kb.ready ? `${b.kb.files} 個檔案 / ${b.kb.chunks} 段` : "尚無資料"; $("stKbSub").textContent = b.kb.folder || "尚未設定資料夾"; }
   $("stToday").textContent = `已回答 ${b.answeredToday ?? 0} 則`;
   $("stScam").innerHTML = s.scam.enabled ? `防詐騙:開啟 · 今日判讀 ${b.scam?.checkedToday ?? 0} 則 · 警告 ${b.scam?.warnedToday ?? 0} 則` : "防詐騙:關閉";

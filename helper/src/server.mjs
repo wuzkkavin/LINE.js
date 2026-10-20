@@ -102,6 +102,12 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         // 避免把還在跑的舊版 AI寶.exe (無 list-models、舊測試邏輯) 誤認成自己的服務 (2026-10-20 老吳實機踩到)。
         return json(res, 200, { service: "aibao-helper", version, capabilities: ["list-models", "line-config", "token-gen"], bot: bot ? bot.status() : null, serverTime: new Date().toISOString() });
       }
+      if (req.method === "GET" && path === "/api/bot/activity") {
+        // 機器人聊天情況 (第 12 項): 狀態列摘要 + 最近動態 (記憶體環形緩衝, 新到舊)。
+        // 唯讀、本機限定 (整個 server 只綁 127.0.0.1, 與既有端點同一認證面)。
+        // events 的 question 只是前 30 字片段且從不落盤 (見 bot.recordActivity)。
+        return json(res, 200, { ok: true, status: bot ? bot.status() : null, events: bot ? bot.activitySnapshot() : [] });
+      }
       if (req.method === "GET" && path === "/api/settings") {
         return json(res, 200, await settings.publicView(secrets));
       }
@@ -181,6 +187,9 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         const r = line.fetchChats
           ? await line.fetchChats()
           : await fetchCoreChannels({ lineApiUrl: settings.get().lineApiUrl });
+        // 每種結果都入 log (第 5 項觀測性修復): 舊版只有成功才記, 失敗時 log 全無痕跡,
+        // 實機出問題時無法分辨「請求沒到 helper」還是「helper 處理失敗」。
+        logger?.info("設定", "LINE 群組清單讀取結果", { status: r.status });
         if (r.status === "not-logged-in") {
           return json(res, 200, { ok: false, code: "NOT_LOGGED_IN", message: "LINE 還沒有登入完成。請先完成 LINE 登入 (用次要帳號掃 QR), 再回來讀取群組清單。" });
         }
@@ -306,8 +315,10 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
       if (req.method === "GET" && path === "/api/log-dir") {
         return json(res, 200, { dir: logger?.dir ?? "", message: "Log 資料夾位置如上; 在 Windows 上可用檔案總管貼上這個路徑開啟" });
       }
-      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-      return res.end("找不到這個路徑");
+      // 未知路徑回 JSON (帶白話 message): 舊版回 text/plain 無訊息, App 端只能顯示
+      // 「回應狀態異常」且 log 查不到狀態碼以外的線索 (2026-10-20 群組清單事故的觀測性缺口)。
+      logger?.warn("控制台", "未知路徑", { method: req.method, path });
+      return json(res, 404, { ok: false, code: "NOT_FOUND", message: "找不到這個路徑" });
     } catch (e) {
       // 原始錯誤只進 log; 回給畫面的只有白話說明與下一步, 不外露例外字串或狀態碼 (修復批次一, 第 7 項)
       logger?.error("控制台", "API 處理失敗", { path, error: String(e?.message ?? e) });

@@ -4,13 +4,24 @@
 // listModels 15 秒; 測試注入短逾時驗證)。錯誤訊息白話化 (第 7 項): 回給 UI/使用者的訊息只留白話原因,
 // 不含 URL、原始例外字串 (如 fetch failed) 或 HTTP 狀態碼; 原始細節放在 AiError.detail, 只寫進 log。
 export class AiError extends Error {
-  constructor(message, { status, code, detail } = {}) {
+  constructor(message, { status, code, detail, retryAfterMs } = {}) {
     super(message);
     this.name = "AiError";
     this.status = status;
     this.code = code;
     this.detail = detail; // 原始細節 (URL/狀態碼/上游原文), 只供 log, 不回給使用者
+    this.retryAfterMs = retryAfterMs; // 429 時上游建議的等待毫秒 (Retry-After 標頭或回應文字), 供退避重試
   }
+}
+
+// 從 429 回應取出建議等待時間: 先看 Retry-After 標頭 (秒), 再看上游文字的 "try again in X s"。
+// 上限 30 秒 — 免費層的 OTPM 是每分鐘窗口, 等超過 30 秒不如讓使用者稍後再問。
+export function parseRetryAfterMs(res, bodyText) {
+  const header = Number(res?.headers?.get?.("retry-after"));
+  if (Number.isFinite(header) && header > 0) return Math.min(header * 1000, 30000);
+  const m = /try again in\s+([\d.]+)\s*s/i.exec(bodyText ?? "");
+  if (m) return Math.min(Math.ceil(Number(m[1]) * 1000) + 250, 30000);
+  return null;
 }
 
 const DEFAULT_MAX_TOKENS = 1024;
@@ -31,7 +42,8 @@ function isTimeoutError(e) {
   return e?.name === "TimeoutError" || e?.name === "AbortError";
 }
 
-export function createAiClient({ fetchImpl = fetch, timeoutMs = DEFAULT_CHAT_TIMEOUT_MS, listModelsTimeoutMs = DEFAULT_LIST_MODELS_TIMEOUT_MS, logger } = {}) {
+export function createAiClient({ fetchImpl = fetch, timeoutMs = DEFAULT_CHAT_TIMEOUT_MS, listModelsTimeoutMs = DEFAULT_LIST_MODELS_TIMEOUT_MS, logger, sleepImpl } = {}) {
+  const sleep = sleepImpl ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   function endpoint(baseUrl, path) {
     return `${String(baseUrl).replace(/\/$/, "")}${path}`;
   }
@@ -68,6 +80,7 @@ export function createAiClient({ fetchImpl = fetch, timeoutMs = DEFAULT_CHAT_TIM
         status: res.status,
         code: "AI_HTTP",
         detail: `${url} HTTP ${res.status} ${body?.error?.message ?? ""}`,
+        retryAfterMs: res.status === 429 ? parseRetryAfterMs(res, body?.error?.message ?? "") : undefined,
       });
     }
     const choice = body?.choices?.[0];
@@ -99,9 +112,30 @@ export function createAiClient({ fetchImpl = fetch, timeoutMs = DEFAULT_CHAT_TIM
     // gpt-oss 系列是推理模型: 帶 reasoning_effort=low, 降低「silent empty generation」
     // (finish_reason=stop 卻吐空內容) 的機率 (Groq 實測解法); 只對 gpt-oss 送, 避免其他供應商拒收未知參數
     const reasoningEffort = /gpt-oss/i.test(model) ? "low" : undefined;
+    // 429 退避重試 (第 8 項): 免費層 OTPM 是每分鐘窗口, 一次 429 就回錯誤會讓同事頻頻碰壁。
+    // 依上游建議等待 (Retry-After/回應文字) 後重試, 共最多 3 次嘗試, 最後一次把額度降到 768
+    // 提高過關率; 仍被擋才拋 AI_BUSY 白話錯誤 (訊息不含上游原文/連結/組織 id)。
+    const attemptWithBusyRetry = async (tokens) => {
+      let currentTokens = tokens;
+      let lastErr = null;
+      for (let attemptNo = 1; attemptNo <= 3; attemptNo += 1) {
+        try {
+          return await chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens: currentTokens, reasoningEffort, timeoutMs: callTimeoutMs });
+        } catch (e) {
+          lastErr = e;
+          if (e?.status !== 429) throw e;
+          if (attemptNo === 3) break;
+          const waitMs = Math.max(250, Math.min(e.retryAfterMs ?? (attemptNo === 1 ? 4000 : 8000), 30000));
+          logger?.info("AI", "AI 限流 (429), 退避後重試", { attempt: attemptNo, waitMs, nextTokens: attemptNo === 2 ? Math.min(currentTokens, 768) : currentTokens });
+          await sleep(waitMs);
+          if (attemptNo === 2) currentTokens = Math.min(currentTokens, 768);
+        }
+      }
+      throw new AiError("AI 目前太忙碌, 請稍等幾秒再試一次", { status: 429, code: "AI_BUSY", detail: lastErr?.detail });
+    };
     let first;
     try {
-      first = await chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens: firstTokens, reasoningEffort, timeoutMs: callTimeoutMs });
+      first = await attemptWithBusyRetry(firstTokens);
     } catch (e) { logDetail("AI 呼叫失敗 (原始細節)", e); throw e; }
     if (first.content) return { content: first.content, latencyMs: first.latencyMs, model: first.model, usage: first.usage, finishReason: first.finishReason };
     if (!first.hasChoices) throw new AiError("AI 服務回應格式不正確 (沒有回答內容)", { code: "AI_BAD_RESPONSE" });
@@ -115,7 +149,7 @@ export function createAiClient({ fetchImpl = fetch, timeoutMs = DEFAULT_CHAT_TIM
     // 推理模型把額度都用在思考上: 自動把額度加倍重試一次, 讓回答有機會產生
     const bigger = Math.min(firstTokens * 2, MAX_MAX_TOKENS);
     if (bigger > firstTokens) {
-      const second = await chatOnce({ baseUrl, apiKey, model, messages, temperature, maxTokens: bigger, reasoningEffort, timeoutMs: callTimeoutMs }).catch((e) => { logDetail("AI 呼叫失敗 (原始細節)", e); throw e; });
+      const second = await attemptWithBusyRetry(bigger).catch((e) => { logDetail("AI 呼叫失敗 (原始細節)", e); throw e; });
       if (second.content) return { content: second.content, latencyMs: first.latencyMs + second.latencyMs, model: second.model, usage: second.usage, finishReason: second.finishReason };
     }
     throw new AiError("AI 把回覆額度都用在思考上, 沒有產生回答內容; 可以換一個模型, 或稍後再試一次", { code: "AI_REASONING_ONLY" });

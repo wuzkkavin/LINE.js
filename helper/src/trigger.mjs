@@ -5,7 +5,13 @@ const LEADING_PUNCT = /^[\s:：,，、。!！?？~～\-—「『（(]+/;
 export function createTriggerState() {
   return { lastByUser: new Map(), daily: { date: "", count: 0 }, limitNoticeByUser: new Map() };
 }
-function todayKey(now = new Date()) { return now.toISOString().slice(0, 10); }
+// 「每日」以使用者當地日期為界 (舊版用 UTC 日期, 台灣時間每天早上 8 點才換日,
+// 每日上限與今日統計的歸零時間都錯位)。用本地年月日組字串, 不經 toISOString。
+export function localDateKey(now = new Date()) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}`;
+}
+function todayKey(now = new Date()) { return localDateKey(now); }
 function rollDaily(state, now) {
   const d = todayKey(now);
   if (state.daily.date !== d) state.daily = { date: d, count: 0 };

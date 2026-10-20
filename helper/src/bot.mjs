@@ -1,7 +1,9 @@
 // 機器人主程式: 連 LINE.js 核心的 /api/ws, 串起 觸發 -> 知識庫優先 -> AI 回答, 以及防詐騙自動掃描。
 // 名字一律取自設定 (botName / aliases), 本檔不寫死任何名字。
 import WebSocket from "ws";
-import { evaluateTrigger, markAnswered, markTriggered, createTriggerState } from "./trigger.mjs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { evaluateTrigger, markAnswered, markTriggered, createTriggerState, localDateKey } from "./trigger.mjs";
 import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, scamVerdictText, scamWarningText, PerMinuteLimiter } from "./scam.mjs";
 import { SECRET_NAMES, DEFAULT_CREATOR_REPLY } from "./config.mjs";
@@ -22,8 +24,14 @@ export function kbMissText() {
 // --- 長回答交付 (2026-10-20 驗收修復, 老吳新規格) ---
 // 群組回答的 AI 回覆額度: ai.mjs 的通用預設只有 1024 tokens, 中文一字約一 token,
 // 稍長的條列回答就會被 finish_reason=length 切在半句 (實機長篇自我介紹即此症)。
-// 群組問答改用 4096 (ai.mjs 的額度上限同為 4096), 一般長答覆足夠完整。
-export const ANSWER_MAX_TOKENS = 4096;
+// 2026-10-20 晚間再修訂: 4096 在 Groq 免費層的 OTPM (每分鐘輸出 token) 上限只有 1000,
+// 單次 requested 就會破表被 429 (實機 Requested 922 已逼近)。改用 2048 兼顧長答覆,
+// 且 ai.mjs 對 429 有退避重試並在重試時降額度 (見 ai.mjs), 長答覆仍可走文字檔交付。
+export const ANSWER_MAX_TOKENS = 2048;
+// LINE 友善格式規則 (第 13 項): LINE 不渲染 Markdown, 表格的 | 與 ** 粗體符號會原樣露出。
+// 這段由程式附加在每次問答的 system prompt 尾端 (不是使用者可編輯欄位, 保證一定生效);
+// 知識庫片段的回答走同一個 system prompt, 一併受此規則約束。
+export const LINE_FORMAT_RULE = "回答格式規則 (LINE 訊息, 務必遵守): 不要使用 Markdown 表格, 不要使用 ### 之類的標題符號, 不要使用 ** 粗體符號; 需要條列時用「・」開頭或數字編號, 一項一行; 適度分段, 每段不要太長, 讓同事在手機上好讀。";
 // 一則文字訊息可送的字數上限: 核心 message:send 的 textMaxLength 預設 8000 字
 // (核心 src/config.ts 與 config.example.yaml), 超過會被核心直接拒收 (INVALID_REQUEST),
 // 以前就是整則回答默默消失。超過這個字數改走文字檔交付 (老吳 2026-10-20 新規格)。
@@ -126,7 +134,7 @@ export const QUOTE_HISTORY_PAGES = 5;
 export const HISTORY_PREFETCH_PAGES = 3;
 
 export class HelperBot {
-  constructor({ settings, secrets, ai, kb, logger, registry, reconnectDelaysMs } = {}) {
+  constructor({ settings, secrets, ai, kb, logger, registry, reconnectDelaysMs, dailyStatePath = "" } = {}) {
     this.settings = settings; // SettingsStore
     this.secrets = secrets;
     this.ai = ai;
@@ -158,13 +166,70 @@ export class HelperBot {
     // 補登目的: 離線/重啟期間機器人自己發過的訊息不在登記簿裡, 重連後先主動把近期歷史補登,
     // 同事引用那些回答追問時第一時間就認得出來, 不必等引用當下才向核心補查。
     this.botChats = []; // 白名單聊天室 ID (由核心 channels 影格提供)
+    this.chatNames = new Map(); // chatId -> 顯示名稱 (活動面板用; 同樣來自 channels 影格)
     this.historyPrefetchedChats = new Set(); // 本次連線已補登過的聊天室 (重連時清空重補)
     this.historyPrefetchInFlight = new Set();
     this.stats = { date: "", answered: 0, triggered: 0, scamChecked: 0, scamWarned: 0 };
+    // 核心版本 (第 14 項): 連線時核心 hello 影格的 serverVersion (核心自己的版本回報,
+    // 來源是核心 package.json, 不寫死); 總覽與關於頁顯示用。
+    this.coreVersion = "";
+    // 機器人活動紀錄 (第 12 項): 只存記憶體環形緩衝 (最近 50 筆, 重啟清空, 永不落盤)。
+    // 隱私紅線: 問題文字只留前 30 字片段, 且只存在這個陣列裡; log 檔不寫問題全文 (既有規格)。
+    this.activity = [];
+    // 每日計數持久化 (第 9 項審計修復): 舊版每日上限計數只在記憶體, App/引擎每次重啟就歸零,
+    // 「每日」上限形同分段計算。改存小 JSON (日期/已答數/防詐數), 啟動時載入當日值。
+    this.dailyStatePath = dailyStatePath;
+    this.loadDailyState();
+  }
+
+  loadDailyState() {
+    if (!this.dailyStatePath) return;
+    try {
+      const raw = JSON.parse(readFileSync(this.dailyStatePath, "utf8"));
+      if (raw && raw.date === localDateKey()) {
+        this.triggerState.daily = { date: raw.date, count: Number(raw.dailyCount) || 0 };
+        this.stats = { date: raw.date, answered: Number(raw.answered) || 0, triggered: Number(raw.triggered) || 0, scamChecked: Number(raw.scamChecked) || 0, scamWarned: Number(raw.scamWarned) || 0 };
+      }
+    } catch { /* 檔案不存在或損壞: 從零開始, 不擋啟動 */ }
+  }
+
+  persistDaily() {
+    if (!this.dailyStatePath) return;
+    try {
+      mkdirSync(dirname(this.dailyStatePath), { recursive: true });
+      writeFileSync(this.dailyStatePath, JSON.stringify({
+        date: this.triggerState.daily.date || localDateKey(),
+        dailyCount: this.triggerState.daily.count,
+        answered: this.stats.answered, triggered: this.stats.triggered,
+        scamChecked: this.stats.scamChecked, scamWarned: this.stats.scamWarned,
+      }), "utf8");
+    } catch { /* 寫入失敗不影響服務; 計數退回記憶體模式 */ }
+  }
+
+  // 活動紀錄一筆 (第 12 項): kind 見 activitySnapshot 的白話對照; question 只留前 30 字。
+  recordActivity({ kind, m, answerChars = null, ms = null, detail = "" }) {
+    const now = new Date();
+    const p2 = (n) => String(n).padStart(2, "0");
+    this.activity.unshift({
+      at: now.toISOString(),
+      // 本機時間字串 (使用者時區): App 面板直接顯示, 不必在殼端做時區換算
+      time: `${p2(now.getHours())}:${p2(now.getMinutes())}:${p2(now.getSeconds())}`,
+      kind,
+      chatId: m?.channelId ?? "",
+      chatName: this.chatNames.get(m?.channelId) ?? "",
+      senderName: m?.senderName ?? "",
+      question: typeof m?.text === "string" ? m.text.slice(0, 30) : "",
+      answerChars, ms, detail,
+    });
+    if (this.activity.length > 50) this.activity.length = 50;
+  }
+
+  activitySnapshot() {
+    return [...this.activity];
   }
   cfg() { return this.settings.get(); }
   rollStats() {
-    const d = new Date().toISOString().slice(0, 10);
+    const d = localDateKey();
     if (this.stats.date !== d) this.stats = { date: d, answered: 0, triggered: 0, scamChecked: 0, scamWarned: 0 };
   }
   status() {
@@ -184,6 +249,10 @@ export class HelperBot {
       kb: this.kb ? this.kb.status() : null,
       scam: { enabled: s.scam.enabled, threshold: s.scam.threshold, checkedToday: this.stats.scamChecked, warnedToday: this.stats.scamWarned },
       answeredToday: this.stats.answered,
+      // 第 14 項: 核心實際版本 (hello 影格的 serverVersion; 未連線時為空字串, 介面顯示「—」)
+      coreVersion: this.coreVersion,
+      // 第 12 項面板: 今日已回答 / 每日上限要成對顯示
+      dailyLimit: s.dailyLimit,
     };
   }
   async providerWithKey(providerId) {
@@ -470,6 +539,11 @@ export class HelperBot {
   async onFrame(data) {
     let frame;
     try { frame = JSON.parse(data.toString()); } catch { return; }
+    if (frame.type === "hello") {
+      // 核心版本回報 (第 14 項): hello 的 serverVersion 是核心自己的 package 版本
+      if (typeof frame.serverVersion === "string" && frame.serverVersion) this.coreVersion = frame.serverVersion;
+      return;
+    }
     if (frame.type === "auth:ready") {
       this.selfId = frame.profile?.userId ?? "";
       this.selfName = frame.profile?.displayName ?? "";
@@ -480,7 +554,11 @@ export class HelperBot {
     // 核心送來的聊天室清單 (機器人連線只會拿到 api.chats 白名單內的): 記下來, 並在連線完成後
     // 主動對每個聊天室補登近期歷史 (prefetchHistory), 讓引用續答認得離線/重啟前的回答。
     if (frame.type === "channels") {
-      const ids = (Array.isArray(frame.channels) ? frame.channels : []).map((c) => c?.channelId).filter((x) => typeof x === "string" && x);
+      const list = Array.isArray(frame.channels) ? frame.channels : [];
+      const ids = list.map((c) => c?.channelId).filter((x) => typeof x === "string" && x);
+      for (const c of list) {
+        if (c?.channelId && typeof c.name === "string" && c.name) this.chatNames.set(c.channelId, c.name);
+      }
       if (ids.length) {
         this.botChats = ids;
         void this.prefetchHistory(ids);
@@ -529,7 +607,9 @@ export class HelperBot {
     this.logger?.info("防詐騙", "判讀完成", { id: m.messageId, probability: verdict.probability, tactic: verdict.tactic, fallback: !!verdict.fallback, warned: verdict.probability >= s.scam.threshold });
     if (verdict.probability >= s.scam.threshold) {
       this.stats.scamWarned++;
+      this.persistDaily();
       await this.sendText(m.channelId, scamWarningText({ ...verdict, botName: s.botName }), m.messageId).catch((e) => this.logger?.error("防詐騙", "警告送出失敗", { error: String(e?.message ?? e) }));
+      this.recordActivity({ kind: "scam_warned", m, detail: verdict.tactic ?? "" });
     }
   }
 
@@ -544,8 +624,14 @@ export class HelperBot {
     // 引用續答: 引用的是機器人自己的訊息時, 視同被名字觸發 (認定方式見 isQuotedSelf)
     const quotedSelf = m.replyTo ? await this.isQuotedSelf(m) : false;
     const verdict = evaluateTrigger({ text: m.text, senderId: m.senderId, selfId: this.selfId, settings: s, state: this.triggerState, quotedSelf });
-    this.logger?.info("觸發判斷", verdict.triggered ? "命中觸發" : "未觸發", { id: m.messageId, reason: verdict.reason, name: verdict.matchedName || "", quote: m.replyTo ? (quotedSelf ? "self" : "other") : "" });
+    // 引用診斷欄位 (第 1 項續查): replyTo 有無與引用認定結果一律入 log —
+    // 2026-10-20 實機引用無回應時, 舊 log 連「這則訊息到底有沒有帶 replyTo」都查不到,
+    // 斷點只能定界不能定案; 之後任何引用問題都能直接從 log 判讀核心送達形狀。
+    this.logger?.info("觸發判斷", verdict.triggered ? "命中觸發" : "未觸發", { id: m.messageId, reason: verdict.reason, name: verdict.matchedName || "", replyTo: m.replyTo ? "yes" : "no", quote: m.replyTo ? (quotedSelf ? "self" : "other") : "" });
     if (!verdict.triggered) {
+      // 活動面板 (第 12 項): 被冷卻/每日上限擋下的也要留一筆, 管理員才看得出「有在擋」
+      if (verdict.reason === "cooldown") this.recordActivity({ kind: "cooldown", m });
+      if (verdict.reason === "daily_limit") this.recordActivity({ kind: "daily_limit", m });
       if (verdict.limitReached) {
         const last = this.triggerState.limitNoticeByUser.get(m.senderId) ?? 0;
         if (Date.now() - last > 3600000) {
@@ -560,6 +646,7 @@ export class HelperBot {
       // 使用者照引導馬上補上真正的問題 (同一分鐘內) 會被冷卻靜默擋下, 看起來像機器人壞掉。
       // 冷卻只記在真正的問答觸發上 (下方 markTriggered), 防連珠炮洗版的效果不變。
       await this.sendText(m.channelId, guidanceText(s.botName), m.messageId).catch(() => {});
+      this.recordActivity({ kind: "name_only", m });
       return;
     }
     markTriggered(this.triggerState, m.senderId);
@@ -574,6 +661,8 @@ export class HelperBot {
       await this.sendText(m.channelId, reply, m.messageId).catch((e) => this.logger?.error("機器人回覆", "創造者固定答覆送出失敗", { error: String(e?.message ?? e) }));
       markAnswered(this.triggerState);
       this.stats.answered++;
+      this.persistDaily();
+      this.recordActivity({ kind: "answered", m, answerChars: reply.length });
       const mem0 = this.memory.get(m.channelId) ?? [];
       this.memory.set(m.channelId, [...mem0, { role: "user", content: question }, { role: "assistant", content: reply }].slice(-(s.ai.memoryTurns ?? 6) * 2));
       this.logger?.info("機器人回覆", "已回覆創造者固定答覆 (未呼叫 AI)", { id: m.messageId });
@@ -598,6 +687,8 @@ export class HelperBot {
       await this.sendText(m.channelId, kbMissText(), m.messageId).catch(() => {});
       markAnswered(this.triggerState);
       this.stats.answered++;
+      this.persistDaily();
+      this.recordActivity({ kind: "answered", m, answerChars: kbMissText().length });
       return;
     }
     const mem = this.memory.get(m.channelId) ?? [];
@@ -605,7 +696,7 @@ export class HelperBot {
     // 人設注入 (第 3 項): 非空欄位逐項寫入 system prompt, 年紀由出生日自動計算, 並附空欄位誠實回答規則
     const personaSection = buildPersonaSection(s.persona);
     const messages = [
-      { role: "system", content: `${s.ai.systemPrompt}\n${nameLine}\n${personaSection}` },
+      { role: "system", content: `${s.ai.systemPrompt}\n${nameLine}\n${personaSection}\n${LINE_FORMAT_RULE}` },
       ...mem,
     ];
     if (hits.length) {
@@ -615,14 +706,24 @@ export class HelperBot {
       messages.push({ role: "user", content: question });
     }
     let answer;
+    let aiFailedKind = "";
+    const aiStartedAt = Date.now();
     try {
       const r = await this.chatWithAi(messages, { maxTokens: ANSWER_MAX_TOKENS });
       answer = r.content;
     } catch (e) {
-      // 備援訊息只給白話原因與下一步, 不把原始例外字串丟給群組同事看 (原始細節已由 chatWithAi 寫進 log)
+      // 備援訊息只給白話原因與下一步, 不把原始例外字串丟給群組同事看 (原始細節已由 chatWithAi 寫進 log)。
+      // 限流 (429 重試後仍忙) 用老吳指定的白話句, 不提管理員/設定頁 — 同事稍等再問即可。
       this.logger?.error("機器人回覆", "AI 回答失敗, 回覆備援訊息", { error: String(e?.message ?? e), detail: e?.detail ? String(e.detail) : undefined });
-      answer = "不好意思, 我現在連不上 AI 服務。下一步: 請管理員到控制台設定頁按「測試連線」確認 API Key 與網路, 或稍後再問我一次。";
+      if (e?.code === "AI_BUSY") {
+        aiFailedKind = "ai_busy";
+        answer = "我這邊有點忙，稍等幾秒再問我一次。";
+      } else {
+        aiFailedKind = "ai_failed";
+        answer = "不好意思, 我現在連不上 AI 服務。下一步: 請管理員到控制台設定頁按「測試連線」確認 API Key 與網路, 或稍後再問我一次。";
+      }
     }
+    const aiMs = Date.now() - aiStartedAt;
     // 參考來源開關 (第 1 項): settings.showSources 為 false 時不附加任何來源行 (預設就是 false);
     // true 時維持原行為, 在回答最後附上知識庫來源檔名。
     if (hits.length && s.showSources) {
@@ -637,6 +738,8 @@ export class HelperBot {
     });
     const count = markAnswered(this.triggerState);
     this.stats.answered++;
+    this.persistDaily();
+    this.recordActivity({ kind: aiFailedKind || "answered", m, answerChars: answer.length, ms: aiMs });
     const turns = [...mem, { role: "user", content: question }, { role: "assistant", content: answer }].slice(-(s.ai.memoryTurns ?? 6) * 2);
     this.memory.set(m.channelId, turns);
     this.logger?.info("機器人回覆", "已回覆", { id: m.messageId, chars: answer.length, today: count, kbHits: hits.length, delivery });
