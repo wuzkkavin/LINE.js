@@ -108,6 +108,7 @@ jobs:
           # 端點實測斷言 (2026-10-20 實機 404 教訓): /api/status 200 不夠, 兩個 POST 端點都要實際打通
           if ($result -notmatch 'helper_list_models_route=ok') { throw '探針未確認 /api/list-models 路由存在 (實機曾發生 404)' }
           if ($result -notmatch 'helper_test_ai_route=ok') { throw '探針未確認 /api/test-ai 路由存在且邏輯有跑' }
+          if ($result -notmatch 'helper_line_chats_route=ok') { throw '探針未確認 /api/line/chats 路由存在且未登入定案正確' }
           if ($result -notmatch 'helper_status_identity=True') { throw '探針未確認 helper 身分標記' }
 
       - name: GUI 冒煙 — 啟動、截圖、結束序列
