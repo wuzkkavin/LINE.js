@@ -127,6 +127,7 @@ struct App {
     page_msg: HashMap<String, String>,
     logs_slot: Slot<Value>,
     logs_text: String,
+    diag_slot: Slot<String>,
     avatar_tex: Option<egui::TextureHandle>,
     hidden: bool,
     confirm_quit: bool,
@@ -418,6 +419,7 @@ impl App {
             page_msg: HashMap::new(),
             logs_slot: Arc::new(Mutex::new(None)),
             logs_text: String::new(),
+            diag_slot: Arc::new(Mutex::new(None)),
             avatar_tex,
             hidden: start_hidden,
             confirm_quit: false,
@@ -1071,6 +1073,11 @@ impl App {
                 self.page_msg.insert("logdir".into(), dir.to_string());
             }
         }
+        // 診斷包匯出結果
+        if let Some(msg) = self.diag_slot.lock().unwrap().take() {
+            self.busy.insert("diag".into(), false);
+            self.page_msg.insert("diag".into(), msg);
+        }
         let _ = ctx;
     }
 }
@@ -1131,6 +1138,10 @@ impl App {
                 ui.vertical(|ui| {
                     let bot = status.as_ref().and_then(|s| s.get("bot").cloned()).unwrap_or(Value::Null);
                     let bot_name = bot.get("botName").and_then(|v| v.as_str()).unwrap_or("AI寶");
+                    // 狀態一致性原則: 引擎不在執行時, 登入/機器人/AI 資訊都只是「上次的舊資料」,
+                    // 不得照舊顯示綠燈 (2026-10-20 實機: 引擎異常停止, 總覽卻顯示 LINE 已登入, 畫面全綠實際已死)。
+                    let engine_ok = matches!(self.engine_snap.state, EngineState::Running | EngineState::ExternalRunning);
+                    let engine_starting = matches!(self.engine_snap.state, EngineState::Starting);
                     ui.label(egui::RichText::new(bot_name).size(22.0).strong().color(GREEN));
                     ui.horizontal(|ui| {
                         ui.label(status_dot(match self.engine_snap.state {
@@ -1140,25 +1151,62 @@ impl App {
                         }));
                         ui.label(format!("引擎: {}", self.engine_snap.label));
                     });
+                    // LINE 登入狀態 (核心 session): 只有引擎真的在跑時, 登入快照才可信
                     ui.horizontal(|ui| {
-                        ui.label(status_dot(match login.auth {
-                            AuthState::Ready => COLOR_OK,
-                            AuthState::Authenticating | AuthState::Restoring => COLOR_WARN,
-                            AuthState::Error => COLOR_BAD,
-                            _ => COLOR_IDLE,
-                        }));
-                        ui.label(match login.auth {
-                            AuthState::Ready => format!(
-                                "LINE: 已登入{}",
-                                login.profile_name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
-                            ),
-                            AuthState::Authenticating => "LINE: 登入中 (請看 LINE 登入頁)".to_string(),
-                            AuthState::Restoring => "LINE: 正在恢復上次登入…".to_string(),
-                            AuthState::Error => "LINE: 登入異常, 請到 LINE 登入頁處理".to_string(),
-                            _ => "LINE: 尚未登入".to_string(),
-                        });
+                        if !engine_ok {
+                            ui.label(status_dot(COLOR_IDLE));
+                            ui.label(if engine_starting {
+                                "LINE: 引擎啟動中, 登入狀態尚未取得".to_string()
+                            } else {
+                                "LINE: 未取得 (引擎目前沒有在執行)".to_string()
+                            });
+                        } else {
+                            ui.label(status_dot(match login.auth {
+                                AuthState::Ready => COLOR_OK,
+                                AuthState::Authenticating | AuthState::Restoring => COLOR_WARN,
+                                AuthState::Error => COLOR_BAD,
+                                _ => COLOR_IDLE,
+                            }));
+                            ui.label(match login.auth {
+                                AuthState::Ready => format!(
+                                    "LINE: 已登入{}",
+                                    login.profile_name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
+                                ),
+                                AuthState::Authenticating => "LINE: 登入中 (請看 LINE 登入頁)".to_string(),
+                                AuthState::Restoring => "LINE: 正在恢復上次登入…".to_string(),
+                                AuthState::Error => "LINE: 登入異常, 請到 LINE 登入頁處理".to_string(),
+                                _ => "LINE: 尚未登入".to_string(),
+                            });
+                        }
                     });
-                    if let Some(bot) = status.as_ref().and_then(|s| s.get("bot")) {
+                    // 機器人連線狀態 (bot 與核心的 WS): 與「LINE 已登入」分開顯示 —
+                    // 登入還在不代表機器人有連上 (換 Token 被踢線時就是登入在、機器人斷), 兩件事要分得出來。
+                    ui.horizontal(|ui| {
+                        if !engine_ok {
+                            ui.label(status_dot(COLOR_IDLE));
+                            ui.label("機器人: 未連線 (引擎未執行)".to_string());
+                        } else if bot.is_object() {
+                            let bc = bot
+                                .get("botConnected")
+                                .and_then(|v| v.as_bool())
+                                .or_else(|| bot.get("connected").and_then(|v| v.as_bool()))
+                                .unwrap_or(false);
+                            let line_state = bot.get("lineState").and_then(|v| v.as_str()).unwrap_or("");
+                            ui.label(status_dot(if bc { COLOR_OK } else { COLOR_WARN }));
+                            ui.label(if bc {
+                                "機器人: 已連線 (會回應群組訊息)".to_string()
+                            } else if line_state == "未設定 Token" {
+                                "機器人: 尚未設定 Token, 請到「機器人與觸發」頁完成開通".to_string()
+                            } else {
+                                "機器人: 未連線, 會自動重試連線; 一直沒連上請重新啟動引擎".to_string()
+                            });
+                        } else {
+                            ui.label(status_dot(COLOR_IDLE));
+                            ui.label("機器人: 狀態尚未取得…".to_string());
+                        }
+                    });
+                    if engine_ok {
+                        if let Some(bot) = status.as_ref().and_then(|s| s.get("bot")) {
                         let ai = bot.get("aiActive").and_then(|v| v.as_str()).unwrap_or("-");
                         let model = bot.get("aiModel").and_then(|v| v.as_str()).unwrap_or("-");
                         let answered = bot.get("answeredToday").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1169,8 +1217,9 @@ impl App {
                             let warned = scam.get("warnedToday").and_then(|v| v.as_u64()).unwrap_or(0);
                             ui.label(format!("防詐騙: 今日檢查 {checked} 則、警告 {warned} 則"));
                         }
-                    } else {
-                        ui.label(egui::RichText::new("設定服務尚未就緒, 請稍候…").weak());
+                        } else {
+                            ui.label(egui::RichText::new("設定服務尚未就緒, 請稍候…").weak());
+                        }
                     }
                 });
             });
@@ -1580,6 +1629,18 @@ impl App {
                     let chunks = kb.get("chunks").and_then(|v| v.as_u64()).unwrap_or(0);
                     let ready = kb.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
                     ui.label(format!("索引狀態: {}; 檔案 {} 個、片段 {} 段", if ready { "已就緒" } else { "尚無可用檔案" }, files, chunks));
+                    if kb.get("scanning").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        ui.label("索引正在背景整理中… (不影響其他功能, 整理好後這裡的數字會自動更新)");
+                    }
+                    // 檔案異常多只提醒不阻擋: 通常是誤把整個文件庫根目錄設進來 (實機曾掃到 7 千多個檔、卡 2 分鐘)
+                    if kb.get("largeFolder").and_then(|v| v.as_bool()).unwrap_or(false) || files > 2000 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "提醒: 這個資料夾有 {files} 個文件檔案, 數量很多, 每次掃描都會花比較久。建議另外建一個只放要給 AI 參考文件的專用資料夾, 會快很多。"
+                            ))
+                            .color(COLOR_WARN),
+                        );
+                    }
                 }
             }
             ui.horizontal(|ui| {
@@ -1673,18 +1734,38 @@ impl App {
                 if ui.button("開啟資料目錄").clicked() {
                     open_folder(&shell::data_dir());
                 }
+                // 一鍵匯出診斷包: 近 14 天紀錄 + 殼 log + 版本/狀態資訊打包成 zip (機密已遮罩)
+                let busy_diag = self.busy.get("diag").copied().unwrap_or(false);
+                if ui.button(if busy_diag { "匯出中…" } else { "匯出診斷包" }).clicked() && !busy_diag {
+                    let default_name = format!("aibao-diagnostic-{}.zip", shell::iso_now().chars().take(10).collect::<String>());
+                    if let Some(path) = rfd::FileDialog::new().set_file_name(&default_name).save_file() {
+                        self.busy.insert("diag".into(), true);
+                        let slot = self.diag_slot.clone();
+                        let ctx2 = ctx.clone();
+                        std::thread::spawn(move || {
+                            let msg = match shell::export_diagnostic(&path) {
+                                Ok(m) => m,
+                                Err(e) => format!("匯出失敗: {e}"),
+                            };
+                            *slot.lock().unwrap() = Some(msg);
+                            ctx2.request_repaint();
+                        });
+                    }
+                }
             });
+            if let Some(m) = self.page_msg.get("diag") {
+                ui.label(m.clone());
+            }
             if let Some(dir) = self.page_msg.get("logdir") {
                 ui.label(format!("紀錄資料夾: {dir}"));
             }
-            ui.label(egui::RichText::new("紀錄不會包含 API Key、Token 或訊息全文 (機密會被遮罩)。出問題時把這個資料夾的檔案給維護人員看即可。").weak());
+            ui.label(egui::RichText::new("紀錄不會包含 API Key、Token 或訊息全文 (機密會被遮罩)。出問題時按「匯出診斷包」把檔案給維護人員看即可。").weak());
             ui.add_space(6.0);
             egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                // 可選取複製: 用可選字 Label (舊作法是不可選的唯讀文字框, 使用者反應沒辦法複製 — 2026-10-20 實機)
                 ui.add(
-                    egui::TextEdit::multiline(&mut self.logs_text.clone())
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY)
-                        .interactive(false),
+                    egui::Label::new(egui::RichText::new(self.logs_text.clone()).monospace())
+                        .selectable(true),
                 );
             });
         });

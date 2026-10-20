@@ -103,3 +103,127 @@ impl ShellSettings {
         }
     }
 }
+
+// ---------- 診斷包匯出 (紀錄頁「匯出診斷包」) ----------
+// 內容: 版本資訊、helper 狀態與遮罩後設定 (經 helper API 拿, 天生不含機密)、近 14 天的 log 檔
+// (helper-*.log 與殼的 shell.log 都在同一個 logs 目錄; log 寫入時已過遮罩)。
+// 紅線: 不打包原始 settings.json、不碰機密庫/session — 那些東西永遠不離開這台電腦。
+
+/// 匯出診斷包到 dest (zip, stored 無壓縮), 回傳給使用者看的完成訊息。
+pub fn export_diagnostic(dest: &std::path::Path) -> Result<String, String> {
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let version_text = format!(
+        "AI寶 App 版本: {}\n引擎版本: {}\n匯出時間 (UTC): {}\n資料目錄: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        crate::engine::ENGINE_ID,
+        iso_now(),
+        data_dir().display()
+    );
+    files.push(("version.txt".to_string(), version_text.into_bytes()));
+    if let Ok(v) = crate::helper_api::get_status() {
+        if let Ok(text) = serde_json::to_string_pretty(&v) {
+            files.push(("status.json".to_string(), text.into_bytes()));
+        }
+    }
+    if let Ok(v) = crate::helper_api::get_settings() {
+        // /api/settings 回的是遮罩版 (Key 只剩末 4 碼), 可以放進診斷包
+        if let Ok(text) = serde_json::to_string_pretty(&v) {
+            files.push(("settings-masked.json".to_string(), text.into_bytes()));
+        }
+    }
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(14 * 86400);
+    let mut log_count = 0usize;
+    if let Ok(rd) = std::fs::read_dir(logs_dir()) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_log = name.ends_with(".log") && (name.starts_with("helper-") || name == "shell.log");
+            if !is_log {
+                continue;
+            }
+            let recent = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t >= cutoff)
+                .unwrap_or(false);
+            if !recent {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(entry.path()) {
+                files.push((format!("logs/{name}"), bytes));
+                log_count += 1;
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let zip = make_zip_stored(&files);
+    std::fs::write(dest, &zip).map_err(|e| format!("寫入診斷包失敗: {e}"))?;
+    log_line(&format!("已匯出診斷包: {} ({} 位元組, log {} 個)", dest.display(), zip.len(), log_count));
+    Ok(format!("已匯出診斷包到: {} (含近 14 天紀錄 {log_count} 個檔, 請把這個 zip 傳給維護人員)", dest.display()))
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for n in 0..256u32 {
+        let mut c = n;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xedb88320 ^ (c >> 1) } else { c >> 1 };
+        }
+        table[n as usize] = c;
+    }
+    let mut c = 0xffffffffu32;
+    for &b in data {
+        c = table[((c ^ b as u32) & 0xff) as usize] ^ (c >> 8);
+    }
+    c ^ 0xffffffff
+}
+
+/// 最小 ZIP (stored, 無壓縮) 產生器, 與 helper 端 makeZip 同格式, 避免為打包功能引入新相依。
+fn make_zip_stored(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut central: Vec<u8> = Vec::new();
+    for (name, data) in files {
+        let name_bytes = name.as_bytes();
+        let crc = crc32(data);
+        let offset = out.len() as u32;
+        out.extend_from_slice(&0x04034b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0x0800u16.to_le_bytes()); // UTF-8 檔名
+        out.extend_from_slice(&0u16.to_le_bytes()); // stored
+        out.extend_from_slice(&0u16.to_le_bytes()); // time
+        out.extend_from_slice(&0u16.to_le_bytes()); // date
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(data);
+
+        central.extend_from_slice(&0x02014b50u32.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0x0800u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        // name len 之後依序: extra len(2) + comment len(2) + disk(2) + int attr(2) + ext attr(4) = 12 bytes, 再接 offset(4)
+        central.extend_from_slice(&[0u8; 12]);
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name_bytes);
+    }
+    let central_start = out.len();
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x06054b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(central_start as u32).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
