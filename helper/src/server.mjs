@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { PROVIDER_DEFAULTS, SECRET_NAMES } from "./config.mjs";
 import { KB_LARGE_FOLDER_FILES } from "./kb.mjs";
 import { maskSecret } from "./secrets.mjs";
-import { applyCoreApiConfig, detectPackaged, readCoreApiStatus, runCliToken } from "./linecfg.mjs";
+import { applyCoreApiConfig, detectPackaged, readCoreApiStatus, removeCoreApiChat, runCliToken } from "./linecfg.mjs";
 import { fetchCoreChannels, shapeChatList } from "./corechats.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -201,12 +201,44 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
             : "這個帳號目前還沒有加入任何群組。請先用手機 LINE 把這個次要帳號邀請進你要用的群組, 再回來按一次「讀取我的群組清單」。",
         });
       }
+      if (req.method === "GET" && path === "/api/line/whitelist") {
+        // 已儲存白名單逐筆列出 (修復項 8): 只給計數看不到內容、不能管理; 名稱用核心快照對照解析,
+        // 核心讀不到時退回只給 ID 並標記 nameResolved=false, 清單本身永遠要列得出來。
+        const status = readCoreApiStatus(line);
+        let nameById = new Map();
+        let coreAvailable = false;
+        try {
+          const r = line.fetchChats
+            ? await line.fetchChats()
+            : await fetchCoreChannels({ lineApiUrl: settings.get().lineApiUrl });
+          if (r.status === "ok") {
+            coreAvailable = true;
+            for (const c of shapeChatList(r.channels, [])) nameById.set(c.id, c.name);
+          }
+        } catch { /* 核心不可用: 名稱留空, 清單照樣回 */ }
+        const chats = (status.chats ?? []).map((id) => ({
+          id,
+          name: nameById.get(id) ?? null,
+          nameResolved: nameById.has(id),
+        }));
+        return json(res, 200, { ok: true, apiEnabled: status.apiEnabled, coreAvailable, chats });
+      }
       if (req.method === "POST" && path === "/api/line/config-apply") {
         const body = await readBody(req);
         try {
           const r = applyCoreApiConfig({ dataDir: line.dataDir, repoRoot: line.repoRoot, chatId: String(body.chatId ?? "") });
           logger?.info("設定", "LINE 白名單已更新", { path: r.path, chats: r.chats.length });
           return json(res, 200, { ok: true, ...r, message: "已啟用機器人 API, 並把這個群組加入白名單。請把 AI寶 完全關閉再重新開啟, 才會生效; 重開後再回來做步驟三產生 Token。" });
+        } catch (e) {
+          return json(res, 200, { ok: false, message: String(e?.message ?? e) });
+        }
+      }
+      if (req.method === "POST" && path === "/api/line/config-remove") {
+        const body = await readBody(req);
+        try {
+          const r = removeCoreApiChat({ dataDir: line.dataDir, repoRoot: line.repoRoot, chatId: String(body.chatId ?? "") });
+          logger?.info("設定", "LINE 白名單已移除", { path: r.path, chats: r.chats.length });
+          return json(res, 200, { ok: true, ...r, message: "已把這個群組移出白名單。請把 AI寶 完全關閉再重新開啟, 才會生效。" });
         } catch (e) {
           return json(res, 200, { ok: false, message: String(e?.message ?? e) });
         }
@@ -255,7 +287,8 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         const view = await settings.publicView(secrets);
         const summary = { version, exportedAt: new Date().toISOString(), platform: process.platform, botStatus: bot ? bot.status() : null, settingsMasked: view, secretStoreKind: secrets?.kind ?? "none" };
         const files = [{ name: "summary.json", data: Buffer.from(JSON.stringify(summary, null, 2), "utf8") }];
-        for (const name of (logger?.listFiles() ?? []).slice(-3)) {
+        // 保留期內的 log 全部打包 (Logger 保留天數預設 14 天); 舊版只包最近 3 檔, 跨日問題常查不到
+        for (const name of logger?.listFiles() ?? []) {
           try { files.push({ name: `logs/${name}`, data: readFileSync(join(logger.dir, name)) }); } catch {}
         }
         const zip = makeZip(files);

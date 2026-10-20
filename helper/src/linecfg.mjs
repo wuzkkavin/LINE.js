@@ -128,6 +128,44 @@ export function applyCoreApiConfig({ dataDir, repoRoot, chatId } = {}) {
   return { path: found.path, backupPath, apiEnabled: verify.enabled, chats: verify.chats };
 }
 
+// 把 chatId 從 api.chats 移除, 回傳新全文 (行編輯, 只動 api 區塊內的清單項目行)。
+export function removeApiChat(text, chatId) {
+  const id = String(chatId ?? "").trim();
+  const lines = String(text ?? "").split(/\r?\n/);
+  const range = apiBlockRange(lines);
+  if (!range) throw new Error("設定檔裡找不到 api 設定區塊, 為安全起見不自動修改; 請把診斷包給維護人員看");
+  let removed = 0;
+  for (let i = range.end - 1; i > range.start; i--) {
+    const m = lines[i].match(/^\s+-\s*([cru][0-9a-f]{32})\s*(#.*)?$/);
+    if (m && m[1] === id) { lines.splice(i, 1); removed++; }
+  }
+  if (removed === 0) throw new Error("這個群組不在白名單裡 (可能已經被移除了), 請重新讀取清單確認。");
+  return lines.join("\n");
+}
+
+// 實際移除: 備份 (.bak) → 行編輯 → 重讀驗證; 驗證不過就還原並丟出白話錯誤 (與加入流程同一套安全規格)。
+export function removeCoreApiChat({ dataDir, repoRoot, chatId } = {}) {
+  if (!isValidChatId(chatId)) {
+    throw new Error("群組 ID 格式不對, 無法移除; 請重新讀取白名單清單再試一次。");
+  }
+  const id = chatId.trim();
+  const found = findCoreConfigPath({ dataDir, repoRoot });
+  if (!found.exists) {
+    throw new Error(`找不到核心設定檔 (預期在 ${found.path})。請先啟動 AI寶 一次讓它產生設定檔, 再回來操作。`);
+  }
+  const original = readFileSync(found.path, "utf8");
+  const backupPath = `${found.path}.bak`;
+  copyFileSync(found.path, backupPath);
+  const next = removeApiChat(original, id);
+  writeFileSync(found.path, next, "utf8");
+  const verify = parseApiSection(readFileSync(found.path, "utf8"));
+  if (verify.chats.includes(id)) {
+    writeFileSync(found.path, original, "utf8");
+    throw new Error("寫入後檢查沒通過, 已自動還原成原來的設定, 沒有改壞任何東西; 請把診斷包給維護人員看。");
+  }
+  return { path: found.path, backupPath, apiEnabled: verify.enabled, chats: verify.chats };
+}
+
 // 打包版產生 Token: 以同一個執行檔的 --role cli 角色向運行中的核心要求新 Token。
 // 核心 CLI 只把 Token 印在 stdout (其他說明走 stderr), 這裡只取 stdout 中像 Token 的那一行。
 export function runCliToken({ execPath = process.execPath, spawnImpl = spawn, timeoutMs = 30000 } = {}) {

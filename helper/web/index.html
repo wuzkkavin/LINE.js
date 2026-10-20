@@ -87,7 +87,7 @@ a.btn { text-decoration: none; }
 </header>
 <main class="wrap">
   <div class="grid" id="statusGrid">
-    <div class="card"><div class="stat-label">LINE 連線狀態</div><div class="stat-value" id="stLine">讀取中…</div><div class="stat-sub" id="stSelf"></div></div>
+    <div class="card"><div class="stat-label">LINE 登入 / 機器人連線</div><div class="stat-value" id="stLine">讀取中…</div><div class="stat-sub" id="stSelf"></div></div>
     <div class="card"><img class="bot-avatar" id="botAvatar" src="/assets/avatar.png" alt="AI寶 頭像" onerror="this.style.display='none';"><div class="stat-label">機器人名字 (觸發)</div><div class="stat-value" id="stName">—</div><div class="stat-sub" id="stMode"></div></div>
     <div class="card"><div class="stat-label">使用中的 AI</div><div class="stat-value" id="stAi">—</div><div class="stat-sub" id="stAiModel"></div></div>
     <div class="card"><div class="stat-label">知識庫</div><div class="stat-value" id="stKb">—</div><div class="stat-sub" id="stKbSub"></div></div>
@@ -112,6 +112,7 @@ a.btn { text-decoration: none; }
       <div style="margin-top:8px"><button type="button" class="ghost" id="btnWhitelist">加入白名單並啟用 API</button><span class="test-result" id="whitelistMsg"></span></div>
     </details>
     <div class="hint" id="lineCfgState">白名單狀態讀取中…</div>
+    <div id="wlList" style="margin-top:8px"></div>
     <div class="hint">白名單改好之後, 要把 AI寶 <strong>完全關閉再重新開啟</strong>才會生效; 重開後再繼續步驟三。</div>
     <h3>步驟三: 取得機器人 Token</h3>
     <div class="hint">Token 是機器人連上核心的鑰匙。打包版直接按「自動產生 Token」, 產生後會自動儲存、自動重新連線, 不用再貼一次。手邊已有 Token 的話, 貼到欄位按「儲存 Token」也可以。</div>
@@ -318,8 +319,12 @@ async function loadAll() {
   $("logDebug").checked = !!s.log.debug;
   $("logRetention").value = s.log.retentionDays || 14;
   const b = status.bot || {};
-  $("stLine").innerHTML = b.connected ? '<span class="pill">已連線</span>' : '<span class="pill off">未連線</span>';
-  $("stSelf").textContent = b.selfName ? `登入帳號:${b.selfName} (${b.lineState || ""})` : (b.lineState || "");
+  // 帳號登入 (核心 session) 與機器人連線 (bot WS) 是兩件事, 分開顯示:
+  // 換 Token 被踢線時就是「登入還在、機器人斷線」, 混在一起看不出來 (2026-10-20 實機)。
+  const lineOn = !!b.selfName || b.lineState === "已登入";
+  const botOn = (b.botConnected ?? b.connected) === true;
+  $("stLine").innerHTML = (lineOn ? '<span class="pill">LINE 已登入</span>' : '<span class="pill off">LINE 未登入</span>') + " " + (botOn ? '<span class="pill">機器人已連線</span>' : '<span class="pill off">機器人未連線</span>');
+  $("stSelf").textContent = (b.selfName ? `登入帳號:${b.selfName} (${b.lineState || ""})` : (b.lineState || "")) + (botOn ? "" : " 機器人未連線時不會回應群組訊息, 系統會自動重連, 請稍候; 一直沒連上請重新啟動 AI寶。");
   $("stName").textContent = b.botName || "(尚未設定名字)";
   $("stMode").textContent = "觸發方式:" + ({ loose: "寬鬆", standard: "標準", strict: "嚴格" })[s.triggerMode] + " · 在群組打到名字, 或引用機器人的回答追問, 就會回應";
   const ap = s.ai.providers[s.ai.active];
@@ -328,7 +333,7 @@ async function loadAll() {
   if (b.kb) { $("stKb").textContent = b.kb.ready ? `${b.kb.files} 個檔案 / ${b.kb.chunks} 段` : "尚無資料"; $("stKbSub").textContent = b.kb.folder || "尚未設定資料夾"; }
   $("stToday").textContent = `已回答 ${b.answeredToday ?? 0} 則`;
   $("stScam").innerHTML = s.scam.enabled ? `防詐騙:開啟 · 今日判讀 ${b.scam?.checkedToday ?? 0} 則 · 警告 ${b.scam?.warnedToday ?? 0} 則` : "防詐騙:關閉";
-  if (b.kb) $("kbStatus").textContent = `目前狀態:${b.kb.files} 個檔案、${b.kb.chunks} 段, 上次整理:${b.kb.updatedAt || "尚未整理"}`;
+  if (b.kb) $("kbStatus").textContent = `目前狀態:${b.kb.files} 個檔案、${b.kb.chunks} 段, 上次整理:${b.kb.updatedAt || "尚未整理"}` + (b.kb.scanning ? " (正在背景整理中, 不影響其他功能)" : "") + (b.kb.largeFolder ? " 提醒: 檔案數量很多 (超過 2000 個), 掃描會花比較久, 建議改用只放參考文件的專用小資料夾。" : "");
   loadLog();
 }
 function setModelOptions(id, models, current) {
@@ -366,6 +371,43 @@ async function loadLineCfg() {
       ? `目前狀態: 機器人 API ${r.apiEnabled ? "已啟用" : "尚未啟用"} · 白名單群組 ${r.chats.length} 個 · 設定檔位置: ${r.path} (打包版在資料目錄裡的 config.yaml)`
       : `目前狀態: 還找不到核心設定檔 (預期位置: ${r.path})。先啟動 AI寶 一次, 讓它產生設定檔, 再回來操作。`;
   } catch { $("lineCfgState").textContent = "白名單狀態讀取失敗, 請重新整理頁面"; }
+  loadWhitelist();
+}
+// 已儲存白名單逐筆清單 + 移除 (修復項 8): 名稱由後端對照核心快照解析, 讀不到名稱就顯示 ID 並註明。
+async function loadWhitelist() {
+  const box = $("wlList");
+  if (!box) return;
+  try {
+    const r = await (await fetch("/api/line/whitelist")).json();
+    if (!r.ok) { box.innerHTML = ""; return; }
+    if (!r.chats.length) { box.innerHTML = '<div class="hint">目前白名單是空的: 還沒有任何群組被加入。</div>'; return; }
+    box.innerHTML = "";
+    const title = document.createElement("div");
+    title.className = "hint";
+    title.textContent = "目前白名單 (已儲存):";
+    box.appendChild(title);
+    for (const c of r.chats) {
+      const row = document.createElement("div");
+      row.className = "hint";
+      const label = c.nameResolved && c.name ? `${c.name} (${c.id})` : `${c.id} (名稱待讀取: 核心清單讀不到時先顯示代號)`;
+      const span = document.createElement("span");
+      span.textContent = label + " ";
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "ghost"; b.textContent = "移除";
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        try {
+          const rr = await (await fetch("/api/line/config-remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chatId: c.id }) })).json();
+          $("whitelistMsg").textContent = rr.message || "";
+          $("whitelistMsg").style.color = rr.ok ? "var(--dark)" : "var(--err)";
+          if (rr.ok) { loadLineCfg(); }
+        } catch { $("whitelistMsg").textContent = "移除失敗: 連不上控制台服務"; $("whitelistMsg").style.color = "var(--err)"; }
+        b.disabled = false;
+      });
+      row.append(span, b);
+      box.appendChild(row);
+    }
+  } catch { box.innerHTML = ""; }
 }
 async function loadLog() {
   try { const r = await (await fetch("/api/logs")).json(); $("logTail").textContent = r.tail || "(今天還沒有 log)"; } catch {}

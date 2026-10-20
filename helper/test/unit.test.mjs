@@ -615,6 +615,56 @@ test("console: /api/line/chats 端點 (合併白名單狀態、空清單白話�
   assert.equal(nologin.code, "NOT_LOGGED_IN");
 });
 
+test("console: /api/line/whitelist 列出白名單 (名稱解析/核心不可用降級) 與 config-remove 移除一筆", async (t) => {
+  const dir = await tmp();
+  const { writeFileSync, readFileSync, existsSync } = await import("node:fs");
+  const gid = "c" + "a".repeat(32);
+  const gid2 = "c" + "b".repeat(32);
+  writeFileSync(join(dir, "config.yaml"), `api:\n  enabled: true\n  chats:\n    - ${gid}\n    - ${gid2}\n`);
+  const settings = new SettingsStore({ path: join(dir, "settings.json") });
+  const secrets = new MemorySecretStore();
+  const logger = new Logger({ dir: join(dir, "logs") });
+  const ai = createAiClient({});
+  const kb = new KnowledgeBase({ folder: "", indexPath: join(dir, "kb.json"), logger });
+  const bot = new HelperBot({ settings, secrets, ai, kb, logger });
+  let behavior = { status: "ok", channels: [{ channelId: gid, kind: "group", name: "已解析的群", memberCount: 3 }] };
+  const server = createConsoleServer({ settings, secrets, ai, kb, bot, logger, lineEnv: { dataDir: dir, repoRoot: join(dir, "nope"), packaged: true, fetchChats: async () => behavior } });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  // 名稱解析: 在核心快照裡的解得到名稱; 不在快照裡的只給 ID
+  const wl = await (await fetch(base + "/api/line/whitelist")).json();
+  assert.equal(wl.ok, true);
+  assert.equal(wl.coreAvailable, true);
+  assert.equal(wl.chats.length, 2);
+  assert.deepEqual(wl.chats[0], { id: gid, name: "已解析的群", nameResolved: true });
+  assert.deepEqual(wl.chats[1], { id: gid2, name: null, nameResolved: false });
+
+  // 核心不可用: 清單照樣列出, 名稱全降級為 ID
+  behavior = { status: "unreachable" };
+  const wl2 = await (await fetch(base + "/api/line/whitelist")).json();
+  assert.equal(wl2.ok, true);
+  assert.equal(wl2.coreAvailable, false);
+  assert.equal(wl2.chats.length, 2);
+  assert.equal(wl2.chats.every((c) => c.nameResolved === false && c.name === null), true);
+
+  // 移除一筆: config 落盤正確、.bak 有備份、清單即時反映
+  const rm = await (await fetch(base + "/api/line/config-remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chatId: gid }) })).json();
+  assert.equal(rm.ok, true);
+  assert.deepEqual(rm.chats, [gid2]);
+  assert.equal(existsSync(join(dir, "config.yaml.bak")), true);
+  const after = readFileSync(join(dir, "config.yaml"), "utf8");
+  assert.equal(after.includes(gid), false);
+  assert.equal(after.includes(gid2), true);
+  const wl3 = await (await fetch(base + "/api/line/whitelist")).json();
+  assert.deepEqual(wl3.chats.map((c) => c.id), [gid2]);
+
+  // 重複移除同一筆: 誠實報錯, 不假裝成功
+  const rm2 = await (await fetch(base + "/api/line/config-remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chatId: gid }) })).json();
+  assert.equal(rm2.ok, false);
+});
+
 test("bot: 被核心踢線後自動重連; 換 Token 後以新 Token 重連; 連不上時狀態誠實, 核心恢復後自癒", async (t) => {
   const dir = await tmp();
   const settings = new SettingsStore({ path: join(dir, "settings.json") });
