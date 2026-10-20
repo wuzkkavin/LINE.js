@@ -30,6 +30,11 @@ windows = { version = "0.58", features = [
   "Win32_Security",
   "Win32_System_JobObjects",
   "Win32_System_Threading",
+  # 結束序列加嚴 (殘留清除): 依埠找 listen 行程 (GetExtendedTcpTable)、依 PID 查映像路徑與強制結束、
+  # 掃行程快照找引擎目錄底下的殘留行程
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Networking_WinSock",
+  "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [build-dependencies]

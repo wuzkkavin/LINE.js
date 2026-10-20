@@ -108,9 +108,10 @@ pub fn run_probe() -> i32 {
         "shutdown_path={}",
         match outcome {
             StopOutcome::GracefulSignal => "signal_file",
-            StopOutcome::JobTerminate => "job_terminate",
+            StopOutcome::ForcedStop => "forced_stop",
             StopOutcome::AlreadyStopped => "already_stopped",
-            StopOutcome::External => "external",
+            StopOutcome::BlockedForeign(_) => "blocked_foreign",
+            StopOutcome::Residual(_) => "residual",
         }
     ));
     let deadline = Instant::now() + Duration::from_secs(10);

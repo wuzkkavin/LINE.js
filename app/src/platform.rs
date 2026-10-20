@@ -259,4 +259,217 @@ mod win_impl {
         }
         PathBuf::from(v.split_whitespace().next().unwrap_or(""))
     }
+
+    // ---- 結束序列加嚴: 殘留行程定位與強制結束 ----
+    // 背景 (2026-10-20 老吳實機定案): 舊世代引擎 (不支援 stop-request 訊號檔) 殘留時,
+    // 殼的優雅結束送不到, 舊版 stop() 又謊報成功。要真的清乾淨, 必須能 (1) 依埠找出正在 listen 的行程,
+    // (2) 查任意行程的映像檔路徑 (分辨是不是 AI寶 的引擎), (3) 強制結束單一行程,
+    // (4) 掃出資料目錄 engine/ 底下所有世代引擎的行程 (監督者本人在埠釋放後也可能還在)。
+    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+    use windows::Win32::Networking::WinSock::AF_INET6;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    fn port_be_u32(port: u16) -> u32 {
+        // MIB_TCPROW 的 dwLocalPort: 連接埠以網路位元組序存放在低 2 bytes, 高 2 bytes 為 0。
+        // 例: 3789 = 0x0ECD → dwLocalPort = 0x0000_CD0E。
+        (((port & 0x00ff) << 8) | (port >> 8)) as u32
+    }
+
+    /// 找出正在 listen 指定埠的所有行程 PID (IPv4 + IPv6)。
+    /// 用 GetExtendedTcpTable 的 OWNER_PID_LISTENER 表; 查不到或失敗回空清單 (呼叫端以 HTTP 探測為準, 這裡只是定位用)。
+    pub fn listening_pids(port: u16) -> Vec<u32> {
+        let mut pids: Vec<u32> = Vec::new();
+        let want = port_be_u32(port);
+        unsafe {
+            // IPv4
+            let mut size: u32 = 0;
+            let r = GetExtendedTcpTable(
+                None,
+                &mut size,
+                false,
+                2, // AF_INET
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
+            if r == ERROR_INSUFFICIENT_BUFFER.0 && size > 0 {
+                let mut buf = vec![0u8; size as usize];
+                let r2 = GetExtendedTcpTable(
+                    Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                    &mut size,
+                    false,
+                    2,
+                    TCP_TABLE_OWNER_PID_LISTENER,
+                    0,
+                );
+                if r2 == NO_ERROR.0 {
+                    let count = *(buf.as_ptr() as *const u32) as usize;
+                    let rows = buf.as_ptr().add(4) as *const MIB_TCPROW_OWNER_PID;
+                    for i in 0..count {
+                        let row = &*rows.add(i);
+                        if (row.dwLocalPort & 0xffff) == want && row.dwOwningPid != 0 {
+                            pids.push(row.dwOwningPid);
+                        }
+                    }
+                }
+            }
+            // IPv6
+            let mut size6: u32 = 0;
+            let r = GetExtendedTcpTable(
+                None,
+                &mut size6,
+                false,
+                AF_INET6.0 as u32,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
+            if r == ERROR_INSUFFICIENT_BUFFER.0 && size6 > 0 {
+                let mut buf = vec![0u8; size6 as usize];
+                let r2 = GetExtendedTcpTable(
+                    Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                    &mut size6,
+                    false,
+                    AF_INET6.0 as u32,
+                    TCP_TABLE_OWNER_PID_LISTENER,
+                    0,
+                );
+                if r2 == NO_ERROR.0 {
+                    let count = *(buf.as_ptr() as *const u32) as usize;
+                    let rows = buf.as_ptr().add(4) as *const MIB_TCP6ROW_OWNER_PID;
+                    for i in 0..count {
+                        let row = &*rows.add(i);
+                        if (row.dwLocalPort & 0xffff) == want && row.dwOwningPid != 0 {
+                            pids.push(row.dwOwningPid);
+                        }
+                    }
+                }
+            }
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+
+    /// 查行程的映像檔完整路徑; 行程已結束或無權限回 None。
+    pub fn process_image_path(pid: u32) -> Option<PathBuf> {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(
+                h,
+                PROCESS_NAME_FORMAT(0),
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            );
+            let _ = CloseHandle(h);
+            if ok.is_err() || len == 0 {
+                return None;
+            }
+            Some(PathBuf::from(OsString::from_wide(&buf[..len as usize])))
+        }
+    }
+
+    /// 強制結束單一行程 (TerminateProcess)。回傳是否成功送出結束。
+    pub fn terminate_pid(pid: u32) -> bool {
+        if pid == 0 || pid == std::process::id() {
+            return false;
+        }
+        unsafe {
+            match OpenProcess(PROCESS_TERMINATE, false, pid) {
+                Ok(h) => {
+                    let ok = TerminateProcess(h, 1).is_ok();
+                    let _ = CloseHandle(h);
+                    ok
+                }
+                Err(_) => false,
+            }
+        }
+    }
+
+    /// 掃全部行程, 回傳映像檔路徑與清單中任一項完全相同 (不分大小寫) 的行程 PID。
+    /// 用來確認某個 exe (例如舊世代引擎的監督者與其子行程共用同一個 exe 檔) 是否還有行程活著。
+    pub fn pids_with_image_in(paths: &[std::path::PathBuf]) -> Vec<u32> {
+        let mut out = Vec::new();
+        if paths.is_empty() {
+            return out;
+        }
+        let wanted: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_lowercase()).collect();
+        unsafe {
+            let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+                Ok(s) => s,
+                Err(_) => return out,
+            };
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut candidates: Vec<u32> = Vec::new();
+            if Process32FirstW(snap, &mut entry).is_ok() {
+                loop {
+                    if entry.th32ProcessID != 0 && entry.th32ProcessID != std::process::id() {
+                        candidates.push(entry.th32ProcessID);
+                    }
+                    if Process32NextW(snap, &mut entry).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = CloseHandle(snap);
+            for pid in candidates {
+                if let Some(p) = process_image_path(pid) {
+                    if wanted.contains(&p.to_string_lossy().to_lowercase()) {
+                        out.push(pid);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 掃全部行程, 回傳映像檔路徑位於 dir 底下 (含子目錄) 的行程 PID。
+    /// 用來找資料目錄 engine/<世代>/ 裡各世代引擎 (監督者與其子行程) 的殘留。
+    pub fn pids_with_image_under(dir: &Path) -> Vec<u32> {
+        let mut out = Vec::new();
+        let dir_norm = dir.to_string_lossy().to_lowercase();
+        unsafe {
+            let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+                Ok(s) => s,
+                Err(_) => return out,
+            };
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut candidates: Vec<u32> = Vec::new();
+            if Process32FirstW(snap, &mut entry).is_ok() {
+                loop {
+                    if entry.th32ProcessID != 0 && entry.th32ProcessID != std::process::id() {
+                        candidates.push(entry.th32ProcessID);
+                    }
+                    if Process32NextW(snap, &mut entry).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = CloseHandle(snap);
+            for pid in candidates {
+                if let Some(p) = process_image_path(pid) {
+                    let s = p.to_string_lossy().to_lowercase();
+                    if s == dir_norm || s.starts_with(&format!("{dir_norm}\\")) {
+                        out.push(pid);
+                    }
+                }
+            }
+        }
+        out
+    }
 }

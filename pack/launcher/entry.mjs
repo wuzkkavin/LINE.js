@@ -112,6 +112,11 @@ async function supervise(sea, paths) {
 
   const coreAlive = await probeHttp({ port: CORE_PORT });
   const helperAlive = await probeHttp({ port: HELPER_PORT });
+  // 半套存活診斷 (2026-10-20 殘留定案): 只剩一邊在跑時, 本監督者只補啟缺的那邊, 另一邊其實是別的世代/別的行程在佔。
+  // 舊版對這種 partial-alive 完全沒紀錄, 事後無從回溯是誰在埠上; 這行讓 launcher.log 能直接定案。
+  if (coreAlive !== helperAlive) {
+    log(`partial-alive 診斷: 核心=${coreAlive ? "有回應" : "無回應"}, 控制台=${helperAlive ? "有回應" : "無回應"} — 只補啟缺的那一邊, 已在跑的那邊不是本監督者啟動的 (可能是其他世代 AI寶 的殘留)`);
+  }
   if (coreAlive && helperAlive) {
     log("核心與控制台都已在執行, 本次只開啟瀏覽器, 不重複啟動");
     log(hasSession ? "已登入, 只開啟控制台" : "尚未登入, 同時開啟核心登入頁與控制台");

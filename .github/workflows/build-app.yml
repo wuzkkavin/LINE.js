@@ -210,16 +210,26 @@ jobs:
             $found = $false
             foreach ($i in 1..30) {
               Start-Sleep -Seconds 2
-              if ((Test-Path $logPath) -and ((Get-Content $logPath -Raw) -match '外來程式佔用')) { $found = $true; break }
+              if ((Test-Path $logPath) -and ((Get-Content $logPath -Raw) -match '不明程式佔用')) { $found = $true; break }
               if ($proc.HasExited) { break }
             }
             if (Test-Path $logPath) { Copy-Item $logPath (Join-Path $pwd 'foreign-shell.log') }
-            if (-not $found) { throw 'App 未偵測到外來佔用 (shell.log 沒有身分不符的紀錄)' }
+            if (-not $found) { throw 'App 未偵測到外來佔用 (shell.log 沒有世代分類 Foreign 的紀錄)' }
             Write-Host 'App 已偵測外來佔用並留下紀錄'
+            # 新預期 (2026-10-20 殘留定案): 埠上是不明程式時, 結束序列回 BlockedForeign —
+            # App 不動對方、也不關窗假裝結束, 而是留在畫面顯示說明。驗: --quit 後 45 秒 App 仍在 + log 有 BlockedForeign。
             Start-Process -FilePath $exe -ArgumentList '--quit' -Wait
-            $exited = $proc.WaitForExit(90000)
-            if (-not $exited) { throw '外來情境: App 在 --quit 後 90 秒內未結束' }
-            Write-Host 'App 已結束; 確認 stub 沒有被誤殺:'
+            $exited = $proc.WaitForExit(45000)
+            if ($exited) { throw '外來情境: App 面對不明程式佔用時不應關窗離開 (應回 BlockedForeign 並留在畫面說明)' }
+            Write-Host 'App 未關窗 (符合 BlockedForeign 預期)'
+            Start-Sleep -Seconds 2
+            $logNow = Get-Content $logPath -Raw
+            if ($logNow -notmatch 'BlockedForeign') { throw '外來情境: shell.log 未見 BlockedForeign 結束結果' }
+            Copy-Item $logPath (Join-Path $pwd 'foreign-shell.log') -Force
+            Write-Host 'shell.log 已確認 BlockedForeign 紀錄; 情境收尾: 人工結束 App 行程 (它本來就不該自己關)'
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+            Start-Sleep -Seconds 2
+            Write-Host '確認 stub 沒有被誤殺:'
             $s2 = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3
             if ($s2.StatusCode -ne 200) { throw '外來情境: stub 被誤殺 (對方行程不該被結束)' }
             Write-Host "stub 仍存活: $($s2.StatusCode)"
@@ -241,4 +251,218 @@ jobs:
             app-main.png
             gui-after-quit.txt
             foreign-shell.log
+          if-no-files-found: warn
+
+  # 舊世代建置 (結束殘留情境的前置): 三個歷史定版各自建出當代產物 —
+  # gen-0 = 4a54c35 網頁版世代引擎 (無 stop-request、helper 無身分標記),
+  # gen-1 = 1314fb3 第一代殼的引擎 payload,
+  # gen-2 殼 = 8ca33d1 第二代殼 App (就是被老吳實機抓到「結束沒清掉服務」的那代)。
+  build-legacy:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - name: 取出原始碼 (完整歷史, 情境要 checkout 歷史定版)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 設定 Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 設定 Rust 工具鏈
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 建置三個歷史定版 (gen-0 引擎、gen-1 引擎、gen-2 殼)
+        shell: pwsh
+        run: |
+          $legacy = Join-Path $env:RUNNER_TEMP 'legacy'
+          New-Item -ItemType Directory -Force $legacy | Out-Null
+          function Build-EngineAt([string]$ref, [string]$outName) {
+            git checkout $ref
+            if ($LASTEXITCODE -ne 0) { throw "checkout $ref 失敗" }
+            npm ci --include=dev
+            npm run build
+            Push-Location helper
+            npm ci
+            Pop-Location
+            Push-Location pack
+            npm ci
+            Remove-Item -Recurse -Force out -ErrorAction SilentlyContinue
+            node build.mjs --target win --skip-core-build
+            Pop-Location
+            $built = Join-Path $pwd 'pack/out/AI寶.exe'
+            if (-not (Test-Path $built)) { throw "$ref 引擎建置未產出 exe" }
+            Copy-Item $built (Join-Path $legacy $outName)
+            Write-Host "$outName built: $((Get-Item (Join-Path $legacy $outName)).Length) bytes"
+          }
+          # gen-0: 網頁版世代 (4a54c35)
+          Build-EngineAt '4a54c35f92d05540745522e27cd3b47b0889e9de' 'gen0-engine.exe'
+          # gen-1: 第一代殼世代的引擎 payload (1314fb3)
+          Build-EngineAt '1314fb3259d950d133d0b1bba642b7a168f33323' 'gen1-engine.exe'
+          # gen-2 殼: 第二代 App 本體 (8ca33d1), 內嵌它自己的引擎
+          git checkout '8ca33d15ea3be900d774e21e90a3c6f0a1fc87ab'
+          if ($LASTEXITCODE -ne 0) { throw 'checkout gen-2 ref 失敗' }
+          npm ci --include=dev
+          npm run build
+          Push-Location helper
+          npm ci
+          Pop-Location
+          Push-Location pack
+          npm ci
+          Remove-Item -Recurse -Force out -ErrorAction SilentlyContinue
+          node build.mjs --target win --skip-core-build
+          Pop-Location
+          New-Item -ItemType Directory -Force app/payload | Out-Null
+          Copy-Item 'pack/out/AI寶.exe' app/payload/engine.exe
+          Push-Location app
+          cargo build --release
+          Pop-Location
+          $appBuilt = Join-Path $pwd 'app/target/release/aibao-app.exe'
+          if (-not (Test-Path $appBuilt)) { throw 'gen-2 殼建置未產出 exe' }
+          Copy-Item $appBuilt (Join-Path $legacy 'app-gen2.exe')
+          Write-Host "app-gen2.exe built: $((Get-Item (Join-Path $legacy 'app-gen2.exe')).Length) bytes"
+
+      - name: 上傳舊世代產物
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-engines
+          path: |
+            ${{ runner.temp }}/legacy/gen0-engine.exe
+            ${{ runner.temp }}/legacy/gen1-engine.exe
+            ${{ runner.temp }}/legacy/app-gen2.exe
+          retention-days: 1
+
+  # 結束殘留情境 (2026-10-20 老吳實機「關掉 App 服務還在」的加嚴驗證):
+  # (a) 舊世代殘留 × 舊殼 (gen-2) = 紅燈重現: 舊殼結束後服務必須仍在 (證明情境抓得到原 bug);
+  # (b) gen-0 殘留 × 新殼: 新殼啟動時收編清除舊殘留、換上目前世代引擎, 結束後雙埠釋放且無殘留行程;
+  # (c) gen-1 殘留 × 新殼: 同 (b)。
+  legacy-scenarios:
+    needs: [build-app, build-legacy]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: 下載新版 App 與舊世代產物
+        uses: actions/download-artifact@v4
+        with:
+          name: aibao-app
+          path: dl-app
+
+      - name: 下載舊世代產物 (續)
+        uses: actions/download-artifact@v4
+        with:
+          name: legacy-engines
+          path: dl-legacy
+
+      - name: 殘留情境三組
+        shell: pwsh
+        run: |
+          $newApp = (Resolve-Path 'dl-app/AI寶.exe').Path
+          $gen0 = (Resolve-Path 'dl-legacy/gen0-engine.exe').Path
+          $gen1 = (Resolve-Path 'dl-legacy/gen1-engine.exe').Path
+          $gen2 = (Resolve-Path 'dl-legacy/app-gen2.exe').Path
+          $ev = Join-Path $pwd 'legacy-evidence'
+          New-Item -ItemType Directory -Force $ev | Out-Null
+
+          function Test-Http([string]$u) {
+            try { Invoke-WebRequest -UseBasicParsing -Uri $u -TimeoutSec 3 | Out-Null; return $true }
+            catch { return [bool]$_.Exception.Response }
+          }
+          function Wait-ServicesUp([int]$secs) {
+            $dl = (Get-Date).AddSeconds($secs)
+            while ((Get-Date) -lt $dl) {
+              if ((Test-Http 'http://127.0.0.1:3789/') -and (Test-Http 'http://127.0.0.1:3790/api/status')) { return $true }
+              Start-Sleep -Seconds 2
+            }
+            return $false
+          }
+          function Wait-PortsFree([int]$secs) {
+            $dl = (Get-Date).AddSeconds($secs)
+            while ((Get-Date) -lt $dl) {
+              if (-not (Test-Http 'http://127.0.0.1:3789/') -and -not (Test-Http 'http://127.0.0.1:3790/api/status')) { return $true }
+              Start-Sleep -Seconds 2
+            }
+            return $false
+          }
+          function Wait-IdentityCurrent([int]$secs) {
+            $dl = (Get-Date).AddSeconds($secs)
+            while ((Get-Date) -lt $dl) {
+              try {
+                $s = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3
+                if ($s.Content -match 'aibao-helper') { return $true }
+              } catch { }
+              Start-Sleep -Seconds 2
+            }
+            return $false
+          }
+          function Get-ImagePids([string]$path) {
+            @(Get-Process | Where-Object { try { $_.Path -eq $path } catch { $false } } | Select-Object -ExpandProperty Id)
+          }
+          function Kill-Image([string]$path) {
+            Get-ImagePids $path | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+          }
+
+          # ---------- 情境 (a): 舊世代殘留 × 舊殼 (gen-2) = 紅燈重現 ----------
+          Write-Host '=== 情境 (a): gen-0 殘留 × 舊殼 — 預期舊殼結束後服務仍殘留 (重現原 bug) ==='
+          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'scenA-data'
+          $supA = Start-Process $gen0 -PassThru
+          if (-not (Wait-ServicesUp 150)) { throw '情境A: gen-0 引擎 150 秒未就緒' }
+          Write-Host '情境A: gen-0 服務已就緒'
+          $oldApp = Start-Process $gen2 -PassThru
+          Start-Sleep -Seconds 25
+          Start-Process $gen2 -ArgumentList '--quit' -Wait
+          $exitedA = $oldApp.WaitForExit(120000)
+          Start-Sleep -Seconds 2
+          $residueA = (Test-Http 'http://127.0.0.1:3790/api/status') -or (Test-Http 'http://127.0.0.1:3789/')
+          @("scenario=a_old_shell_vs_gen0_residue", "old_app_exited=$exitedA", "residue_present=$residueA") | Set-Content (Join-Path $ev 'legacy-a.txt')
+          @("scenario=a_old_shell_vs_gen0_residue", "old_app_exited=$exitedA", "residue_present=$residueA") | Write-Host
+          if (-not $exitedA) { throw '情境A: 舊殼 120 秒未結束, 情境無法判定' }
+          if (-not $residueA) { throw '情境A: 紅燈重現失敗 — 舊殼結束後殘留應仍存在; 若不存在代表前提改變, 需人工複查' }
+          Write-Host '情境A: 紅燈重現成立 (舊殼回報結束、服務仍在) — 清場'
+          Kill-Image $gen0
+          Kill-Image $gen2
+          if (-not (Wait-PortsFree 60)) { throw '情境A: 清場後埠未釋放' }
+
+          # ---------- 情境 (b): gen-0 殘留 × 新殼 ----------
+          Write-Host '=== 情境 (b): gen-0 殘留 × 新殼 — 預期收編清除 + 結束後清乾淨 ==='
+          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'scenB-data'
+          $supB = Start-Process $gen0 -PassThru
+          if (-not (Wait-ServicesUp 150)) { throw '情境B: gen-0 引擎 150 秒未就緒' }
+          $appB = Start-Process $newApp -PassThru
+          if (-not (Wait-IdentityCurrent 240)) { throw '情境B: 新殼未在 240 秒內把舊世代服務換成目前世代引擎' }
+          Write-Host '情境B: 新殼已收編清除舊殘留並啟動目前世代引擎'
+          Start-Process $newApp -ArgumentList '--quit' -Wait
+          $exitedB = $appB.WaitForExit(120000)
+          $freeB = Wait-PortsFree 30
+          $gen0Left = @(Get-ImagePids $gen0).Count
+          @("scenario=b_new_shell_vs_gen0_residue", "app_exited=$exitedB", "ports_free=$freeB", "gen0_pids_left=$gen0Left", "cleanup_ok=$($exitedB -and $freeB -and $gen0Left -eq 0)") | Set-Content (Join-Path $ev 'legacy-b.txt')
+          @("scenario=b_new_shell_vs_gen0_residue", "app_exited=$exitedB", "ports_free=$freeB", "gen0_pids_left=$gen0Left") | Write-Host
+          if (-not ($exitedB -and $freeB -and $gen0Left -eq 0)) { throw '情境B: 新殼未把 gen-0 殘留清乾淨' }
+          Write-Host '情境B: 通過'
+
+          # ---------- 情境 (c): gen-1 殘留 × 新殼 ----------
+          Write-Host '=== 情境 (c): gen-1 殘留 × 新殼 — 預期收編清除 + 結束後清乾淨 ==='
+          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'scenC-data'
+          $supC = Start-Process $gen1 -PassThru
+          if (-not (Wait-ServicesUp 150)) { throw '情境C: gen-1 引擎 150 秒未就緒' }
+          $appC = Start-Process $newApp -PassThru
+          if (-not (Wait-IdentityCurrent 240)) { throw '情境C: 新殼未在 240 秒內把舊世代服務換成目前世代引擎' }
+          Write-Host '情境C: 新殼已收編清除舊殘留並啟動目前世代引擎'
+          Start-Process $newApp -ArgumentList '--quit' -Wait
+          $exitedC = $appC.WaitForExit(120000)
+          $freeC = Wait-PortsFree 30
+          $gen1Left = @(Get-ImagePids $gen1).Count
+          @("scenario=c_new_shell_vs_gen1_residue", "app_exited=$exitedC", "ports_free=$freeC", "gen1_pids_left=$gen1Left", "cleanup_ok=$($exitedC -and $freeC -and $gen1Left -eq 0)") | Set-Content (Join-Path $ev 'legacy-c.txt')
+          @("scenario=c_new_shell_vs_gen1_residue", "app_exited=$exitedC", "ports_free=$freeC", "gen1_pids_left=$gen1Left") | Write-Host
+          if (-not ($exitedC -and $freeC -and $gen1Left -eq 0)) { throw '情境C: 新殼未把 gen-1 殘留清乾淨' }
+          Write-Host '情境C: 通過'
+          Write-Host '殘留情境三組全數完成'
+
+      - name: 上傳情境存證
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-evidence
+          path: legacy-evidence/
           if-no-files-found: warn

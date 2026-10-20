@@ -450,8 +450,8 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
-    /// 開始結束序列: 背景執行緒執行 engine.stop() (停止訊號檔→Job 兜底), 完成後主執行緒依結果關視窗;
-    /// 若服務不是本視窗啟的、又停不下來 (StopOutcome::External), 不關窗, 改顯示白話說明 (不假裝已結束)。
+    /// 開始結束序列: 背景執行緒執行 engine.stop() (訊號優雅結束→強制清除→逐埠驗證), 完成後主執行緒依結果處理;
+    /// 停不下來 (BlockedForeign / Residual) 就不關窗, 改顯示白話說明與殘留明細 (不假裝已結束)。
     fn begin_quit(&mut self, ctx: &egui::Context) {
         if self.quitting {
             return;
@@ -549,18 +549,24 @@ impl eframe::App for App {
             }
         }
 
-        // 結束序列完成 → 依結果處理: 真的停了才關視窗; 停不下來 (外部引擎) 就取消結束並明說。
+        // 結束序列完成 → 依結果處理: 驗證真的停了才關視窗; 停不下來 (BlockedForeign / Residual) 取消結束並明說。
         if self.quitting {
             let outcome = self.quit_outcome.lock().unwrap().take();
             if let Some(outcome) = outcome {
-                if matches!(outcome, StopOutcome::External) {
-                    self.quitting = false;
-                    self.quit_blocked_msg = Some(
-                        "沒有把服務停下來: 目前在跑的 LINE 服務不是由這個視窗啟動的 (是另一個 AI寶 程式啟動的), 剛才已請它結束但它沒有停。這個視窗先不關, 服務還在執行中。要真正全部結束, 請到啟動它的那個 AI寶 程式按「結束服務並關閉程式」, 或到 Windows 工作管理員結束 AI寶 的行程。".to_string(),
-                    );
-                    shell::log_line("結束序列中止: 外部引擎未停止, 已顯示說明給使用者");
-                } else {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                match outcome {
+                    StopOutcome::BlockedForeign(msg) | StopOutcome::Residual(msg) => {
+                        self.quitting = false;
+                        self.quit_blocked_msg = Some(msg);
+                        shell::log_line("結束序列中止: 服務未完全停止, 已顯示說明給使用者 (不關窗)");
+                    }
+                    StopOutcome::ForcedStop => {
+                        // 有用到強制手段才清乾淨: 不粉飾, engine.stop 已留下完整階段紀錄, 這裡再記一筆後正常關窗
+                        shell::log_line("結束序列完成: 以強制手段清乾淨 (ForcedStop), 關閉視窗");
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    _ => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 }
             }
         }

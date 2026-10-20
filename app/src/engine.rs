@@ -14,12 +14,23 @@ pub const CORE_PORT: u16 = 3789;
 pub const HELPER_PORT: u16 = 3790;
 
 /// 埠被外來程式佔用時的白話訊息 (顯示在主視窗狀態區, 要讓使用者知道下一步怎麼做)。
-pub const FOREIGN_PORT_MESSAGE: &str = "連接埠被其他程式佔用了: 在這台電腦上回應的不是本程式的服務 (很可能是舊版 AI寶.exe 還開著)。請先完全關閉舊版 AI寶 — 只關主視窗還不夠, 要到工作管理員結束 AI寶.exe, 或在舊版的瀏覽器控制台頁面關閉後確認程式已結束 — 再重新開啟本程式。";
+/// 注意分界: 「不認識的程式」才是 Foreign; 舊版 AI寶 (無身分標記的自家舊世代) 歸 Legacy, 由殼收編並負責結束, 不走這段訊息。
+pub const FOREIGN_PORT_MESSAGE: &str = "連接埠被不明程式佔用了: 在這台電腦上回應的不是 AI寶 的服務 (任何世代都不是)。AI寶 先不啟動、也不會去動對方的程式。請先關閉佔用連接埠 3789 或 3790 的程式 (可以在工作管理員查看), 再重新開啟 AI寶。";
 
+/// 收編舊世代引擎時的 log/狀態用語 (不是錯誤: 是同產品舊版, 殼接手管理與結束)。
+pub const LEGACY_ADOPTED_MESSAGE: &str = "偵測到舊版 AI寶 的服務還在執行 (舊世代), 已由本程式接手管理; 之後按「結束服務並關閉程式」會一併把它清乾淨。";
+
+/// 單一埠上服務的世代分類 (結束序列加嚴的核心概念, 2026-10-20 老吳實機定案):
+/// 分類證據都來自實際回應內容, 不用猜的。
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum PortState {
-    Free,
-    Own,
+enum SvcClass {
+    /// 沒人 listen / 連不上
+    None,
+    /// 目前世代 (核心: LINE.js 網頁; helper: /api/status 帶 service 身分標記)
+    Current,
+    /// 舊世代 AI寶 (核心仍是 LINE.js 網頁; helper /api/status 是舊形狀 {version, bot, serverTime} 無身分標記)
+    Legacy,
+    /// 不明程式 (有回應但形狀不符任何世代)
     Foreign,
 }
 
@@ -36,14 +47,17 @@ pub enum EngineState {
 
 #[derive(Debug)]
 pub enum StopOutcome {
-    /// 監督者經停止訊號檔 (stop-request) 自行優雅退出 (session 有機會完成 DPAPI 封存)
+    /// 監督者經停止訊號檔 (stop-request) 自行優雅退出 (session 有機會完成 DPAPI 封存), 且雙埠已驗證釋放
     GracefulSignal,
-    /// 逾時未退, 以 Job Object 整樹清除 (兜底)
-    JobTerminate,
-    /// 本來就沒在跑
+    /// 優雅結束送不到或逾時, 改以強制手段 (Job Object / 依 listener PID 結束 / 引擎目錄掃除) 清乾淨, 且雙埠已驗證釋放。
+    /// 有用到強制手段就回這個 (不粉飾成優雅結束), UI 會在 log 留下紀錄。
+    ForcedStop,
+    /// 本來就沒在跑 (雙埠皆無服務)
     AlreadyStopped,
-    /// 外部啟動的引擎, 殼無法結束
-    External,
+    /// 埠上有不明程式 (Foreign): 不是 AI寶 的服務, 殼不動它、也不關窗, 附白話說明給 UI 顯示。
+    BlockedForeign(String),
+    /// 已用盡手段仍有殘留: 附逐埠/逐行程明細, UI 不關窗並顯示明細 (不准謊報成功)。
+    Residual(String),
 }
 
 pub struct EngineManager {
@@ -122,34 +136,65 @@ impl EngineManager {
         Ok(exe)
     }
 
-    fn ports_alive() -> bool {
-        http_status(CORE_PORT, "/").is_some() && http_status(HELPER_PORT, "/api/status").is_some()
+    /// 任一埠還有服務在回應就算「還活著」。舊版是 ports_alive() 用 AND (雙埠都要有回應),
+    /// 結果核心先死、helper 還在 (或反過來) 的半殘狀態會被誤判成「都停了」 — 結束序列加嚴時改為逐埠判定。
+    fn any_service_alive() -> bool {
+        http_status(CORE_PORT, "/").is_some() || http_status(HELPER_PORT, "/api/status").is_some()
     }
 
-    /// 3790 上的是不是「新版」helper: /api/status 必須帶 service 身分標記。
-    /// 為什麼要驗: 舊版 AI寶.exe (網頁版) 的 helper 也佔同一個 3790 埠、也有 /api/status,
-    /// 但沒有 /api/list-models、測試連線還是舊邏輯 — 不驗身分就會把舊的當成自己的,
-    /// 使用者按「取得可用模型」得到 HTTP 404、按「測試連線」被舊邏輯誤判 (2026-10-20 老吳實機踩到)。
-    fn helper_is_ours() -> bool {
+    /// 分類核心埠 (3789): 現行與舊世代的核心都是 LINE.js 網頁 (GET / 回 HTML);
+    /// 回 JSON 或其他形狀的是不明程式; 連不上是 None。
+    fn classify_core() -> SvcClass {
+        match http_get_text(CORE_PORT, "/") {
+            Some(text) => {
+                let head: String = text.chars().take(512).collect::<String>().to_lowercase();
+                if head.contains("<html") || head.contains("<!doctype") {
+                    SvcClass::Current
+                } else {
+                    SvcClass::Foreign
+                }
+            }
+            None => {
+                if http_status(CORE_PORT, "/").is_some() {
+                    SvcClass::Foreign
+                } else {
+                    SvcClass::None
+                }
+            }
+        }
+    }
+
+    /// 分類 helper 埠 (3790), 證據是 /api/status 的實際 JSON 形狀 (2026-10-20 查 git 歷史定案):
+    /// 目前世代: {service:"aibao-helper", capabilities, bot, ...}; 舊世代 (4a54c35 網頁版與 1314fb3 第一代殼同形):
+    /// {version, bot, serverTime} 無 service 欄位。有回應但兩種形狀都不是 (例如 CI 的 stub 只有 {version, bot}、缺 serverTime) → Foreign。
+    fn classify_helper() -> SvcClass {
         match http_get_text(HELPER_PORT, "/api/status") {
-            Some(text) => serde_json::from_str::<serde_json::Value>(&text)
-                .map(|v| v.get("service").and_then(|s| s.as_str()) == Some("aibao-helper"))
-                .unwrap_or(false),
-            None => false,
+            Some(text) => {
+                let v: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => return SvcClass::Foreign,
+                };
+                if v.get("service").and_then(|s| s.as_str()) == Some("aibao-helper") {
+                    return SvcClass::Current;
+                }
+                if v.get("version").is_some() && v.get("bot").is_some() && v.get("serverTime").is_some() {
+                    return SvcClass::Legacy;
+                }
+                SvcClass::Foreign
+            }
+            None => {
+                if http_status(HELPER_PORT, "/api/status").is_some() {
+                    SvcClass::Foreign
+                } else {
+                    SvcClass::None
+                }
+            }
         }
     }
 
-    /// 埠的狀態: 沒人用 / 是新版引擎 / 被別的程式佔用 (多半是舊版 AI寶.exe)。
-    fn probe_ports() -> PortState {
-        let core = http_status(CORE_PORT, "/").is_some();
-        let helper = http_status(HELPER_PORT, "/api/status").is_some();
-        if !core && !helper {
-            return PortState::Free;
-        }
-        if core && Self::helper_is_ours() {
-            return PortState::Own;
-        }
-        PortState::Foreign
+    /// 同時分類兩埠, 回傳 (核心, helper)。
+    fn probe_classes() -> (SvcClass, SvcClass) {
+        (Self::classify_core(), Self::classify_helper())
     }
 
     /// 啟動引擎。冪等: 已在跑就直接回報目前狀態。
@@ -158,21 +203,36 @@ impl EngineManager {
             EngineState::Running | EngineState::ExternalRunning | EngineState::Starting => return Ok(()),
             _ => {}
         }
-        // 已有引擎在跑 (不是我們啟的): 先驗身分 — 是新版引擎才接管狀態顯示;
-        // 是外來程式 (多半是舊版 AI寶.exe) 就明確擋下並說明, 不能把舊服務當成自己的用。
-        match Self::probe_ports() {
-            PortState::Own => {
-                self.state = EngineState::ExternalRunning;
-                shell::log_line("偵測到引擎已在執行 (非本程式啟動), 只顯示狀態");
-                return Ok(());
-            }
-            PortState::Foreign => {
-                let msg = FOREIGN_PORT_MESSAGE.to_string();
+        // 已有服務在跑 (不是我們啟的): 先依世代分類 —
+        // Foreign (不明程式): 明確擋下並說明, 不動對方、不用它的服務。
+        // Current (目前世代, 例如另一個新版 AI寶 或新版網頁版啟的): 收編為 ExternalRunning, 只顯示狀態, 結束時走 stop() 的收編路徑。
+        // Legacy (舊世代 AI寶): 不能直接收編來用 — 舊 helper 沒有目前世代的端點 (list-models 等), 收編等於重演 404 陷阱;
+        // 正確收編是先把舊殘留清乾淨 (與 stop() 同一條強制清除路徑), 再啟動目前世代引擎, 使用者打開新版 App 就是要用新版。
+        let (core_cls, helper_cls) = Self::probe_classes();
+        if core_cls == SvcClass::Foreign || helper_cls == SvcClass::Foreign {
+            let msg = FOREIGN_PORT_MESSAGE.to_string();
+            self.state = EngineState::Failed(msg.clone());
+            shell::log_line("偵測到連接埠被不明程式佔用 (世代分類=Foreign), 已擋下並提示使用者");
+            return Err(msg);
+        }
+        let any_alive = core_cls != SvcClass::None || helper_cls != SvcClass::None;
+        if any_alive && helper_cls == SvcClass::Legacy {
+            shell::log_line(LEGACY_ADOPTED_MESSAGE);
+            let legacy_images = Self::force_clear_services("啟動前收編舊世代");
+            if !Self::wait_ports_clear(Duration::from_secs(10)) {
+                let detail = Self::residual_detail();
+                let msg = format!("舊版 AI寶 的服務清不乾淨, 本程式先不啟動。殘留: {detail}。請到工作管理員結束 AI寶 的行程後再重新開啟本程式。");
                 self.state = EngineState::Failed(msg.clone());
-                shell::log_line("偵測到連接埠被外來程式佔用 (身分驗證不符), 已擋下並提示使用者");
+                shell::log_line(&format!("收編舊世代失敗: {detail}"));
                 return Err(msg);
             }
-            PortState::Free => {}
+            // 舊監督者收到子行程結束會自己收尾 (含 session 封存), 等它退場再啟動, 避免兩個監督者同時碰 session 檔
+            Self::wait_image_gone(&legacy_images, Duration::from_secs(8));
+            shell::log_line("舊世代殘留已清乾淨, 接著啟動目前世代引擎");
+        } else if any_alive {
+            self.state = EngineState::ExternalRunning;
+            shell::log_line("偵測到目前世代引擎已在執行 (非本程式啟動), 接手顯示狀態");
+            return Ok(());
         }
         let exe = Self::ensure_extracted()?;
         self.state = EngineState::Starting;
@@ -209,13 +269,14 @@ impl EngineManager {
         match self.state {
             EngineState::Starting | EngineState::Running => {
                 if self.proc_exited() {
-                    // 監督者結束但埠還在: 要驗身分 — 是新版引擎才算「別人接手」;
-                    // 是外來程式 (舊版 AI寶.exe) 就明確標示, 不能當成自己的引擎顯示。
-                    if Self::ports_alive() {
-                        if Self::helper_is_ours() {
-                            self.state = EngineState::ExternalRunning;
-                        } else {
+                    // 監督者結束但埠還在: 依世代分類標示 — 不明程式 (Foreign) 明確標示;
+                    // 其餘是 AI寶 某世代的服務還活著 (例如被別的實例接手), 收編為 ExternalRunning 顯示狀態。
+                    if Self::any_service_alive() {
+                        let (core_cls, helper_cls) = Self::probe_classes();
+                        if core_cls == SvcClass::Foreign || helper_cls == SvcClass::Foreign {
                             self.state = EngineState::Failed(FOREIGN_PORT_MESSAGE.to_string());
+                        } else {
+                            self.state = EngineState::ExternalRunning;
                         }
                     } else {
                         self.state = EngineState::Failed("引擎已停止 (監督者行程結束)".to_string());
@@ -223,14 +284,17 @@ impl EngineManager {
                     }
                     return;
                 }
-                if self.state == EngineState::Starting && Self::ports_alive() {
-                    if Self::helper_is_ours() {
+                if self.state == EngineState::Starting {
+                    // 就緒 = 雙埠都有回應且 helper 是目前世代 (少一邊都不算就緒, 半套存活不能裝作正常)
+                    let core_up = http_status(CORE_PORT, "/").is_some();
+                    let helper_cls = Self::classify_helper();
+                    if core_up && helper_cls == SvcClass::Current {
                         self.state = EngineState::Running;
                         shell::log_line("引擎就緒: 核心 3789 與 helper 3790 皆回應 (身分驗證通過)");
-                    } else {
-                        // 雙埠都有回應、但 3790 不是新版 helper: 自己的 helper 綁埠失敗, 埠被外來程式佔用
+                    } else if helper_cls == SvcClass::Foreign {
+                        // 雙埠有回應但 3790 不是 AI寶 的服務: 自己的 helper 綁埠失敗, 埠被不明程式佔用
                         self.state = EngineState::Failed(FOREIGN_PORT_MESSAGE.to_string());
-                        shell::log_line("引擎啟動時發現連接埠被外來程式佔用 (身分驗證不符)");
+                        shell::log_line("引擎啟動時發現連接埠被不明程式佔用 (世代分類=Foreign)");
                         return;
                     }
                 }
@@ -263,77 +327,188 @@ impl EngineManager {
         }
     }
 
-    /// 結束序列 (規格書 v3 第 7 節): 先以停止訊號檔請監督者優雅關閉 (等 12 秒), 逾時以 Job Object 兜底。
-    /// 為什麼不用 CTRL_BREAK: CREATE_NO_WINDOW 的行程沒有主控台, 控制事件送不到
-    /// (2026-10-20 雲端探針實測 GenerateConsoleCtrlEvent 失敗) — 規格書 v3 風險 2 的定案退路。
+    /// 結束序列 (規格書 v3 第 7 節 + 2026-10-20 殘留定案加嚴): 四階段, 每階段後都以「雙埠逐埠驗證釋放」為準,
+    /// 不再有「回傳成功但服務還在」的路徑。为什么不用 CTRL_BREAK: CREATE_NO_WINDOW 的行程沒有主控台,
+    /// 控制事件送不到 (2026-10-20 雲端探針實測失敗) — 規格書 v3 風險 2 的定案退路是停止訊號檔。
+    ///
+    /// 階段: (1) 訊號檔請監督者優雅結束 (自己的引擎與收編的目前世代引擎都支援; 舊世代不理會, 逾時往下走)
+    /// (2) Job Object 整樹 + 依 listener PID 強制結束 (涵蓋收編引擎與舊世代: 它們的監督者不在我們的 Job 裡)
+    /// (3) 掃資料目錄 engine/ 底下各世代引擎映像的行程補刀 (監督者本人在埠釋放後也算殘留)
+    /// (4) 逐埠最終驗證: 全清才回成功 (有動到強制手段回 ForcedStop); 還有殘留回 Residual 附明細, 絕不謊報。
+    /// 例外: 埠上是 Foreign (不明程式) 時, 在階段 1 之前就回 BlockedForeign — 不是我們的服務, 不動它也不關窗。
+    /// Failed 狀態 (多半是啟動時就被 Foreign 擋下) 一律走本函式完整分類判定 — 舊版沒有專屬分支、落進「自己引擎」區塊,
+    /// 又在逾時後謊報成功直接關窗, 是老吳實機「結束了但服務還在」的定案根因之二。
     pub fn stop(&mut self) -> StopOutcome {
-        match self.state {
-            EngineState::ExternalRunning => {
-                // 不是本殼啟動的引擎 (例如另一個 AI寶 視窗或新版網頁版啟的): 不能假裝關得掉。
-                // 但新版監督者都看同一個資料目錄的 stop-request 訊號檔, 放訊號請它優雅結束,
-                // 並以「埠真的釋放」為成功判準; 15 秒內沒停就誠實回 External, 由 UI 明說沒停成。
-                let stop_file = shell::data_dir().join("stop-request");
-                let _ = std::fs::write(&stop_file, b"stop");
-                shell::log_line("結束外部引擎: 已放出停止訊號檔, 等待埠釋放確認");
-                let deadline = Instant::now() + Duration::from_secs(15);
-                while Instant::now() < deadline {
-                    if !Self::ports_alive() {
-                        self.state = EngineState::Stopped;
-                        shell::log_line("外部引擎已結束 (埠已釋放)");
-                        return StopOutcome::GracefulSignal;
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                shell::log_line("外部引擎 15 秒內未結束 (埠仍有回應), 回報未停止");
-                return StopOutcome::External;
-            }
-            EngineState::NotStarted | EngineState::Stopped => return StopOutcome::AlreadyStopped,
-            _ => {}
+        // 先逐埠分類現況 (Failed / External / 任何狀態都一樣辦理, 不依 state 猜)
+        let (core_cls, helper_cls) = Self::probe_classes();
+        if core_cls == SvcClass::None && helper_cls == SvcClass::None {
+            return self.finish_stopped(StopOutcome::AlreadyStopped, "結束檢查: 雙埠皆無服務, 本來就沒在跑");
         }
+        if core_cls == SvcClass::Foreign || helper_cls == SvcClass::Foreign {
+            let detail = Self::residual_detail();
+            shell::log_line(&format!("結束被擋下: 埠上有不明程式 (非 AI寶 服務), 不動它也不關窗。現況: {detail}"));
+            return StopOutcome::BlockedForeign(format!(
+                "沒有把服務停下來: 連接埠 3789 或 3790 上回應的不是 AI寶 的服務 (不明程式), 本程式不會去結束別人的程式, 視窗先不關。現況: {detail}。請先到工作管理員結束佔用該連接埠的程式, 再重新開啟 AI寶。"
+            ));
+        }
+
+        // ---- 階段 1: 停止訊號檔優雅結束 (12 秒, 等待期間訊號被監督者啟動清除時自動補寫) ----
+        let stop_file = shell::data_dir().join("stop-request");
+        let _ = std::fs::write(&stop_file, b"stop");
+        shell::log_line("結束序列階段 1: 已放出停止訊號檔, 等待監督者優雅結束");
+        if Self::wait_services_clear(Duration::from_secs(12), Some(&stop_file)) {
+            let own_exited = self.proc.is_none() || self.proc_exited();
+            return self.finish_stopped(
+                StopOutcome::GracefulSignal,
+                if own_exited { "引擎已優雅結束 (停止訊號檔路徑, 雙埠已驗證釋放)" } else { "服務已優雅結束 (停止訊號檔路徑, 雙埠已驗證釋放)" },
+            );
+        }
+
+        // ---- 階段 2+3: 強制清除 (Job 整樹 + listener PID + 引擎目錄掃除) ----
+        shell::log_line("結束序列階段 2: 優雅結束逾時, 改走強制清除 (Job + listener PID + 引擎目錄掃除)");
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+            shell::log_line("結束序列階段 2: 已以 Job Object 整樹結束自己的引擎行程樹");
+        }
+        #[cfg(not(windows))]
+        if let Some(mut c) = self.proc.take() {
+            let _ = c.kill();
+        }
+        let _ = Self::force_clear_services("結束序列");
+        if Self::wait_services_clear(Duration::from_secs(10), None) {
+            return self.finish_stopped(StopOutcome::ForcedStop, "引擎已強制清乾淨 (雙埠已驗證釋放)");
+        }
+
+        // ---- 階段 4: 最終驗證 — 還有人活著就誠實回 Residual, 不關窗 ----
+        let detail = Self::residual_detail();
+        shell::log_line(&format!("結束序列未清乾淨, 回報殘留 (不關窗): {detail}"));
+        StopOutcome::Residual(format!(
+            "服務還沒有完全停下來, 這個視窗先不關, 以免你誤以為已經結束。殘留: {detail}。可以再按一次「結束服務並關閉程式」重試, 或到工作管理員結束上面列出的行程。"
+        ))
+    }
+
+    /// 統一收尾: 清掉殼持有的行程/Job 控制權並把狀態標為 Stopped (只在已驗證雙埠釋放後呼叫)。
+    fn finish_stopped(&mut self, outcome: StopOutcome, log_msg: &str) -> StopOutcome {
         #[cfg(windows)]
         {
-            let stop_file = shell::data_dir().join("stop-request");
-            let sent = std::fs::write(&stop_file, b"stop").is_ok();
-            shell::log_line(&format!("已放出停止訊號檔 ({}), 寫入={sent}", stop_file.display()));
-            if sent {
-                let deadline = Instant::now() + Duration::from_secs(15);
-                while Instant::now() < deadline {
-                    // 競態防護 (2026-10-20 雲端第二輪探針實測): 監督者啟動初期會清一次殘留訊號檔,
-                    // 若我們的訊號寫在它清除之前會被一起清掉; 等待期間只要檔案不見就補寫, 確保送達。
-                    if !stop_file.exists() && !self.proc_exited() {
-                        let _ = std::fs::write(&stop_file, b"stop");
-                    }
-                    if self.proc_exited() && !Self::ports_alive() {
-                        self.state = EngineState::Stopped;
-                        self.proc = None;
-                        self.job = None;
-                        self.pid = None;
-                        shell::log_line("引擎已優雅結束 (停止訊號檔路徑)");
-                        return StopOutcome::GracefulSignal;
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
+            // Job 設了 KILL_ON_JOB_CLOSE: 放掉 handle 等於再保險清一次整樹 (此時服務已驗證全停, 不會誤傷)
+            self.job = None;
+        }
+        self.proc = None;
+        self.pid = None;
+        self.state = EngineState::Stopped;
+        shell::log_line(log_msg);
+        outcome
+    }
+
+    /// 等到雙埠都沒有回應為止 (逐埠判定, 任一埠活著就繼續等)。
+    /// stop_file 有給時, 等待期間檔案不見就補寫 (監督者啟動初期會清一次殘留訊號檔的競態防護)。
+    fn wait_services_clear(total: Duration, stop_file: Option<&std::path::Path>) -> bool {
+        let deadline = Instant::now() + total;
+        loop {
+            if !Self::any_service_alive() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return !Self::any_service_alive();
+            }
+            if let Some(f) = stop_file {
+                if !f.exists() {
+                    let _ = std::fs::write(f, b"stop");
                 }
             }
-            if let Some(job) = &self.job {
-                job.terminate();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn wait_ports_clear(total: Duration) -> bool {
+        Self::wait_services_clear(total, None)
+    }
+
+    /// 強制清除埠上屬 AI寶 的服務 (呼叫端須已確認不是 Foreign):
+    /// Job Object 整樹 (自己的引擎) → 依兩埠 listener PID 強制結束 (收編/舊世代) → 掃 engine/ 目錄底下行程補刀。
+    /// 回傳被結束行程的映像路徑清單 (供呼叫端等待舊監督者退場用)。非 Windows 為開發樁, 只殺自己的子行程。
+    fn force_clear_services(context: &str) -> Vec<PathBuf> {
+        let mut images: Vec<PathBuf> = Vec::new();
+        #[cfg(windows)]
+        {
+            // 注: 自己的引擎另有 Job Object 整樹 (stop() 階段 2 先行、finish_stopped 放掉 handle 再掃一次);
+            // 這裡專門處理不在我們 Job 裡的行程: 收編/舊世代的 listener 與 engine 目錄底下的殘留監督者。
+            let engine_root = shell::data_dir().join("engine");
+            let mut targets: Vec<u32> = Vec::new();
+            for port in [CORE_PORT, HELPER_PORT] {
+                for pid in crate::platform::listening_pids(port) {
+                    if let Some(p) = crate::platform::process_image_path(pid) {
+                        images.push(p);
+                    }
+                    targets.push(pid);
+                }
             }
-            std::thread::sleep(Duration::from_millis(500));
-            self.state = EngineState::Stopped;
-            self.proc = None;
-            self.job = None;
-            self.pid = None;
-            shell::log_line("引擎以 Job Object 整樹結束 (兜底路徑)");
-            StopOutcome::JobTerminate
+            targets.extend(crate::platform::pids_with_image_under(&engine_root));
+            targets.sort_unstable();
+            targets.dedup();
+            for pid in &targets {
+                if crate::platform::terminate_pid(*pid) {
+                    shell::log_line(&format!("{context}: 已強制結束行程 pid={pid}"));
+                }
+            }
+            if targets.is_empty() {
+                shell::log_line(&format!("{context}: 強制清除未找到屬 AI寶 的行程 (埠上服務可能正在自行結束)"));
+            }
         }
         #[cfg(not(windows))]
         {
-            if let Some(mut c) = self.proc.take() {
-                let _ = c.kill();
-            }
-            self.state = EngineState::Stopped;
-            self.pid = None;
-            StopOutcome::JobTerminate
+            let _ = context;
         }
+        images.sort();
+        images.dedup();
+        images
+    }
+
+    /// 等映像路徑清單裡的行程全部消失 (舊監督者收到子行程結束後要自己收尾, 需要一點時間;
+    /// 等它退場再啟動新引擎, 避免兩個監督者同時碰 session 檔。逾時只記 log 不擋路)。
+    fn wait_image_gone(images: &[PathBuf], total: Duration) {
+        if images.is_empty() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let deadline = Instant::now() + total;
+            loop {
+                if crate::platform::pids_with_image_in(images).is_empty() {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    shell::log_line("等待舊監督者退場逾時, 仍繼續啟動 (新監督者會自行處理埠狀態)");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (images, total);
+        }
+    }
+
+    /// 逐埠殘留明細 (給 Residual/BlockedForeign 訊息與 log 用): 每埠的分類與 listener PID。
+    fn residual_detail() -> String {
+        let (core_cls, helper_cls) = Self::probe_classes();
+        let fmt = |port: u16, cls: SvcClass| -> String {
+            #[cfg(windows)]
+            let pids = crate::platform::listening_pids(port);
+            #[cfg(not(windows))]
+            let pids: Vec<u32> = Vec::new();
+            if cls == SvcClass::None {
+                format!("埠 {port}: 無服務")
+            } else if pids.is_empty() {
+                format!("埠 {port}: {cls:?} (查不到 listen 行程)")
+            } else {
+                format!("埠 {port}: {cls:?} (行程 {})", pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
+            }
+        };
+        format!("{}; {}", fmt(CORE_PORT, core_cls), fmt(HELPER_PORT, helper_cls))
     }
 
     pub fn state_label(&self) -> &'static str {
