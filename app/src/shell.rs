@@ -144,7 +144,9 @@ pub fn export_diagnostic(dest: &std::path::Path) -> Result<String, String> {
     if let Ok(rd) = std::fs::read_dir(logs_dir()) {
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_log = name.ends_with(".log") && (name.starts_with("helper-") || name == "shell.log" || name == "launcher.log");
+            // launcher-core.log 是啟動器導向的核心 stdout/stderr (2026-10-21 第二段納入):
+            // 以前沒包它, 核心側事故 (例如訊息解密失敗) 在診斷包裡完全沒證據。
+            let is_log = name.ends_with(".log") && (name.starts_with("helper-") || name == "shell.log" || name == "launcher.log" || name == "launcher-core.log");
             if !is_log {
                 continue;
             }
@@ -157,6 +159,14 @@ pub fn export_diagnostic(dest: &std::path::Path) -> Result<String, String> {
                 continue;
             }
             if let Ok(bytes) = std::fs::read(entry.path()) {
+                // 核心輸出會一直長大: 只節錄最後 256KB 並在檔頭註明, 不讓診斷包被它撐爆
+                let bytes = if name == "launcher-core.log" && bytes.len() > 256 * 1024 {
+                    let mut v = "（診斷包只節錄最後 256KB, 完整檔案在本機 logs/launcher-core.log）\n".as_bytes().to_vec();
+                    v.extend_from_slice(&bytes[bytes.len() - 256 * 1024..]);
+                    v
+                } else {
+                    bytes
+                };
                 files.push((format!("logs/{name}"), bytes));
                 log_count += 1;
             }

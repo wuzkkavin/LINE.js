@@ -818,6 +818,31 @@ impl App {
             } else if matches!(state0, EngineState::Starting) {
                 lines.push("引擎還在啟動, 請等左下角變成「引擎: 執行中」再到群組測試".to_string());
             }
+            // 訊息解密檢查 (2026-10-21 第二段): 引擎與連線都正常, 不代表讀得到訊息 —
+            // 群組成員變動後 LINE 換了讀訊息的鑰匙、跟這台電腦對不上時, 訊息會在核心
+            // 解密失敗、機器人完全收不到, 而且重新啟動修不好 (鑰匙存在登入狀態裡)。
+            // 修復要誠實講出這個病因並指引登出重登; 修復本身不能替使用者登出
+            // (登出重登要他拿手機掃 QR, 不是程式能代做的事)。
+            if let Ok(v) = helper_api::get_status() {
+                if let Some(dec) = v.get("bot").and_then(|b| b.get("decrypt")) {
+                    if dec.get("state").and_then(|x| x.as_str()) == Some("failed") {
+                        let total = dec.get("totalFailed").and_then(|x| x.as_u64()).unwrap_or(0);
+                        let names: Vec<String> = dec.get("issues").and_then(|x| x.as_array())
+                            .map(|a| a.iter().filter_map(|i| i.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
+                            .unwrap_or_default();
+                        let where_text = if names.is_empty() { String::new() } else { format!("(在『{}』)", names.join("』、『")) };
+                        lines.push(format!("檢查發現: 有 {total} 則訊息解密失敗{where_text} — 機器人讀不到那些訊息的內容, 所以不會回覆; 這是鑰匙對不上, 重新啟動修不好。第一步: 請到「LINE 登入」頁按「登出」, 再重新掃 QR 登入, 讓鑰匙重新對齊。若登出重登後還是讀不到, 第二步: 把機器人移出該群組、再重新邀請它加入 (重新入群會讓 LINE 把目前的鑰匙重新分發給它)。"));
+                    }
+                    // 漏接 (整個群組收不到) 是更嚴重的病徵, 要獨立講清楚, 不能混在解密失敗裡
+                    if let Some(missed_issues) = dec.get("missedIssues").and_then(|x| x.as_array()) {
+                        for issue in missed_issues {
+                            let name = issue.get("name").and_then(|n| n.as_str()).unwrap_or("未命名群組");
+                            let missed = issue.get("missed").and_then(|n| n.as_u64()).unwrap_or(0);
+                            lines.push(format!("檢查發現: 『{name}』有 {missed} 則訊息根本沒有送到機器人這裡 — 那個群組的訊息現在整個收不到, 叫它也不會回應。請先到「LINE 登入」頁登出後重新登入; 若還是收不到, 把機器人移出該群組、再重新邀請它加入。"));
+                        }
+                    }
+                }
+            }
             shell::log_line(&format!("一鍵修復完成: {}", lines.join(" / ")));
             *slot.lock().unwrap() = Some(lines);
             ctx2.request_repaint();
@@ -1935,6 +1960,44 @@ impl App {
                             let warned = scam.get("warnedToday").and_then(|v| v.as_u64()).unwrap_or(0);
                             ui.label(format!("防詐騙: 今日檢查 {checked} 則、警告 {warned} 則"));
                         }
+                        // 訊息解密健康 (2026-10-21 第二段): 有解不開的訊息要老實點燈,
+                        // 不讓「機器人已連線」的綠燈蓋住「其實讀不到訊息」(事故定案:
+                        // 成員變動後鑰匙對不上, 訊息在核心解密失敗, 以前全綠看不出來)。
+                        if let Some(dec) = bot.get("decrypt") {
+                            if dec.get("state").and_then(|v| v.as_str()) == Some("failed") {
+                                let total = dec.get("totalFailed").and_then(|v| v.as_u64()).unwrap_or(0);
+                                ui.label(egui::RichText::new(format!("⚠ 有 {total} 則訊息我讀不到, 那些訊息我不會回覆:")).color(self.palette.bad));
+                                if let Some(issues) = dec.get("issues").and_then(|v| v.as_array()) {
+                                    for issue in issues {
+                                        let name = issue.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                        let failed = issue.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        let senders: Vec<&str> = issue.get("senders").and_then(|v| v.as_array())
+                                            .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+                                            .unwrap_or_default();
+                                        let who = if senders.is_empty() { String::new() } else { format!("({} 的)", senders.join("、")) };
+                                        ui.label(format!("・在『{}』有 {} 則{}訊息讀不到", if name.is_empty() { "未命名群組" } else { name }, failed, who));
+                                    }
+                                }
+                                ui.label("處置: 先到「LINE 登入」頁登出後重新登入 (讓鑰匙重新對齊); 若還是讀不到, 下一步是把機器人移出該群組、再重新邀請它加入 (重新入群會讓 LINE 把目前的鑰匙重新發一份給它)。");
+                            }
+                            // 訊息漏接 (同批追加): 訊息有進群組歷史、卻完全沒有送到機器人這裡 —
+                            // 最壞情形是整個群組都收不到 (事故擴大時的現況), 文案要講到這個程度,
+                            // 不能只寫「有幾則漏接」讓人以為只是小毛病。
+                            if let Some(missed_issues) = dec.get("missedIssues").and_then(|v| v.as_array()) {
+                                for issue in missed_issues {
+                                    let name = issue.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let missed = issue.get("missed").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let when = issue.get("newestMissedTime").and_then(|v| v.as_str()).unwrap_or("");
+                                    ui.label(egui::RichText::new(format!(
+                                        "⚠ 『{}』整個群組的訊息都沒有送到我這裡 (最近一則是 {} 的訊息, 已漏接 {} 則), 現在在那個群組叫我也不會回應。",
+                                        if name.is_empty() { "未命名群組" } else { name }, when, missed
+                                    )).color(self.palette.bad));
+                                }
+                                if !missed_issues.is_empty() {
+                                    ui.label("處置: 先到「LINE 登入」頁登出後重新登入; 若還是收不到, 把機器人移出該群組、再重新邀請它加入。");
+                                }
+                            }
+                        }
                         } else {
                             ui.label(egui::RichText::new("設定服務尚未就緒, 請稍候…").weak());
                         }
@@ -2006,6 +2069,10 @@ impl App {
                     if ui.button("登出").clicked() {
                         self.confirm_logout = true;
                     }
+                    ui.add_space(6.0);
+                    // 什麼情況需要登出重登 (2026-10-21 第二段): 事故時老吳只能重啟亂試,
+                    // 把正解寫在登出按鈕旁邊, 以後不用再問人。
+                    ui.label(egui::RichText::new("什麼時候需要登出再重新登入? 如果機器人突然讀不到某位同事的訊息 (例如群組有人加入或離開之後), 那是 LINE 換了讀訊息的鑰匙、跟這台電腦對不上。先按上面的「登出」, 再重新掃 QR 登入, 讓鑰匙重新對齊。若登出重登後還是讀不到, 下一步是把機器人移出該群組、再重新邀請它加入 — 重新入群會讓 LINE 把目前的鑰匙重新分發給它。重新啟動程式修不好這個問題。").weak());
                 });
             }
             AuthState::Authenticating => {
