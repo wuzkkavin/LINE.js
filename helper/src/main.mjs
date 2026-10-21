@@ -45,6 +45,9 @@ logger.info("啟動", "控制台已啟動", { url: `http://127.0.0.1:${port}`, b
 console.log(`控制台: http://127.0.0.1:${port}`);
 
 bot.connect().catch((e) => logger.error("機器人", "連線 LINE 核心失敗", { error: String(e?.message ?? e) }));
+// 訊息解密健康偵測 (2026-10-21 第二段): 週期掃描白名單聊天室近期歷史的 decryptFailed,
+// 讓「核心解不開某些訊息」這種假綠燈事故在總覽看得出來。未連線時掃描自動跳過。
+bot.startDecryptWatch();
 
 process.on("SIGINT", () => { logger.info("啟動", "收到結束訊號, 關閉中"); bot.disconnect(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 1500); });
 process.on("uncaughtException", (e) => { logger.error("啟動", "未捕捉錯誤", { error: String(e?.stack ?? e) }); });

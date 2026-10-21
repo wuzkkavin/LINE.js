@@ -195,8 +195,39 @@ export const QUOTE_HISTORY_PAGES = 5;
 // 連線成功後主動補登的頁數: 3 頁 (300 則) 涵蓋離線期間與重啟前的近期訊息, 成本可控。
 export const HISTORY_PREFETCH_PAGES = 3;
 
+// --- 訊息解密健康偵測 (2026-10-21 第二段, 事故定案後的誠實顯示) ---
+// 事故: 群組成員變動後 LINE 換了該群組的 E2EE 共用鑰匙世代, 核心手上的寄件者公鑰快取
+// 與寄件者端脫節 (乙機制: 快取毒化、核心無失效邏輯), 該寄件者的訊息在核心解密階段
+// 就被靜默丟棄 — 不發事件、不留紀錄, 機器人與所有狀態燈卻全綠 (假綠燈)。
+// helper 在即時路徑對此零可見性 (解密失敗的訊息根本沒有影格送達), 唯一不改核心就能
+// 落地的偵測面是 history:fetch 回的 DTO: 解不開的文字訊息帶 decryptFailed: true。
+// 作法: 每 DECRYPT_SCAN_INTERVAL_MS 對白名單聊天室各抓最近一頁歷史 (一頁 = fetchHistoryPage
+// 的 100 則), 統計 decryptFailed。核心 history 限流是每連線每秒 10 次, 本掃描每聊天室
+// 每分鐘才 1 次, 與引用補查/補登共用預算綽綽有餘; 掃描失敗 (逾時等) 只退避, 不誤報、
+// 不把上次狀態洗掉。
+export const DECRYPT_SCAN_INTERVAL_MS = 60_000;
+// 掃描連續失敗時的退避倍率上限 (間隔 ×2、×4、×8 封頂), 任一輪成功就歸零。
+export const DECRYPT_SCAN_MAX_BACKOFF = 8;
+
+// --- 訊息漏接偵測 (2026-10-21 第二段追加, 事故擴大後的新訊號) ---
+// 事故擴大實錄: 起初只有老吳一人的訊息解密失敗, 約 20 分鐘後同群其他成員的
+// 明確提問也不再成為機器人事件 (另一群組同時正常)。第一段查證 §1.4 的機制可解釋:
+// 每筆解密失敗都觸發核心監聽重啟 (退避至 30 秒), 連續失敗疑使監聽陷入重啟循環
+// 或卡死, 連本來解得開的訊息也不再推送。這種「整個群組變聾」用 decryptFailed
+// 計數看不到 (漏掉的訊息本身是好的), 要靠比對歷史與事件的落差:
+// 訊息已進聊天室歷史、超過寬限時間, 卻從未以事件送達機器人 = 漏接。
+// 判準 (保守, 防誤報): 非解密失敗、非自己發送、有文字內容 (貼圖/照片不列入,
+// 避免機器人通道不推播某些類型時誤報)、非系統事件、非收回訊息、在本次連線
+// 開通後才出現 (斷線期間的訊息核心本來就不補送, 不算漏接)、出現已超過
+// DECRYPT_MISSED_GRACE_MS (事件正常是秒級送達), 且同聊天室累積
+// DECRYPT_MISSED_MIN_COUNT 則才點燈 (單則可能是罕見競態)。
+export const DECRYPT_MISSED_GRACE_MS = 120_000;
+export const DECRYPT_MISSED_MIN_COUNT = 2;
+// 每聊天室記住的「已收到事件」訊息 ID 上限 (漏接比對用; 只存 ID, 不存內容)。
+export const DECRYPT_SEEN_IDS_CAP = 300;
+
 export class HelperBot {
-  constructor({ settings, secrets, ai, kb, logger, registry, reconnectDelaysMs, dailyStatePath = "" } = {}) {
+  constructor({ settings, secrets, ai, kb, logger, registry, reconnectDelaysMs, dailyStatePath = "", decryptMissedOptions } = {}) {
     this.settings = settings; // SettingsStore
     this.secrets = secrets;
     this.ai = ai;
@@ -244,6 +275,28 @@ export class HelperBot {
     // 核心版本 (第 14 項): 連線時核心 hello 影格的 serverVersion (核心自己的版本回報,
     // 來源是核心 package.json, 不寫死); 總覽與關於頁顯示用。
     this.coreVersion = "";
+    // 訊息解密健康 (2026-10-21 第二段): 定期掃描白名單聊天室近期歷史的 decryptFailed 統計,
+    // 只存記憶體 (不落盤、不記訊息內容 — 解不開的本來也沒有內容)。
+    // decryptByChat: chatId -> { failed, scanned, lastFailAt (ISO), lastFailTime (本機 HH:MM),
+    // senders: [寄件者顯示名稱] }。decryptLastScanAt 為最近一輪完整掃描完成的時間;
+    // 還沒掃過任何一輪時 summary 的 state 是 unknown, 不准冒充正常 (誠實原則同 Jev)。
+    this.decryptByChat = new Map();
+    this.decryptLastScanAt = null;
+    this.decryptScanTimer = null;
+    this.decryptScanInFlight = false;
+    this.decryptScanFailures = 0; // 連續失敗輪數 (退避用)
+    // 訊息漏接偵測 (同批追加): decryptMissedByChat: chatId -> { missed, newestMissedAt, newestMissedTime };
+    // seenEventIds: chatId -> Set<messageId>, 只記真的從機器人 WS 送達過的事件 (歷史補登不算,
+    // 那正是要比對的落差); eventsLiveSince: 本次連線開通的時間, 漏接只看這之後出現的訊息。
+    this.decryptMissedByChat = new Map();
+    this.seenEventIds = new Map();
+    this.eventsLiveSince = 0;
+    this.decryptMissedOptions = {
+      graceMs: DECRYPT_MISSED_GRACE_MS, // 事件寬限: 出現超過這個時間還沒送達才算漏接
+      liveBufferMs: 5_000, // 連線開通後的小緩衝, 開通瞬間前後的訊息不列入
+      minCount: DECRYPT_MISSED_MIN_COUNT, // 同聊天室累積幾則才點燈
+      ...(decryptMissedOptions ?? {}),
+    };
     // 機器人活動紀錄 (第 12 項): 只存記憶體環形緩衝 (最近 50 筆, 重啟清空, 永不落盤)。
     // 隱私紅線: 問題文字只留前 30 字片段, 且只存在這個陣列裡; log 檔不寫問題全文 (既有規格)。
     this.activity = [];
@@ -333,6 +386,11 @@ export class HelperBot {
         jevState: this.jevState, jevLastOkAt: this.jevLastOkAt, jevLastError: this.jevLastError,
       },
       answeredToday: this.stats.answered,
+      // 訊息解密健康 (2026-10-21 第二段): 近期歷史裡有沒有核心解不開的訊息。
+      // state: unknown (尚未掃描) / ok / failed; failed 時 issues 逐聊天室列出
+      // 名稱、失敗則數、最近失敗時間與寄件者 — 總覽與一鍵修復據此誠實點燈,
+      // 不再像事故當下那樣全綠假裝正常。
+      decrypt: this.decryptSummary(),
       // 第 14 項: 核心實際版本 (hello 影格的 serverVersion; 未連線時為空字串, 介面顯示「—」)
       coreVersion: this.coreVersion,
       // 第 12 項面板: 今日已回答 / 每日上限要成對顯示
@@ -408,6 +466,7 @@ export class HelperBot {
         this.ws = ws;
         ws.on("open", () => {
           this.connected = true;
+          this.eventsLiveSince = Date.now(); // 漏接偵測的起算點: 只看本次連線開通後出現的訊息
           this.lineState = "已連線";
           this.reconnectAttempt = 0;
           this.historyPrefetchedChats.clear(); // 新連線: 離線期間的訊息要重新補登
@@ -420,7 +479,7 @@ export class HelperBot {
         });
         ws.on("close", () => {
           const isCurrent = this.ws === ws;
-          if (isCurrent) { this.ws = null; this.connected = false; }
+          if (isCurrent) { this.ws = null; this.connected = false; this.eventsLiveSince = 0; }
           done(false);
           if (this.intentionalClose.has(ws)) return; // 主動關閉 (disconnect/reconnect 換線), 不排重連
           if (isCurrent && this.wantConnected) {
@@ -478,6 +537,7 @@ export class HelperBot {
   }
 
   disconnect() {
+    this.stopDecryptWatch();
     this.wantConnected = false;
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.ws) {
@@ -590,6 +650,195 @@ export class HelperBot {
     }
   }
 
+  // --- 訊息解密健康偵測 (2026-10-21 第二段) ---
+  // 狀態彙總 (status().decrypt 與 log 轉移判定共用): state 三態 —
+  // unknown = 還沒完成過任何一輪掃描 (不冒充正常); ok = 掃過且沒有解密失敗;
+  // failed = 至少一個聊天室的近期歷史裡有 decryptFailed 訊息。
+  // issues 只列有失敗的聊天室 (依最近失敗時間新到舊), 附失敗數/掃描數/最近失敗時間/寄件者名稱。
+  decryptSummary() {
+    const issues = [];
+    let totalFailed = 0;
+    let totalScanned = 0;
+    for (const [chatId, r] of this.decryptByChat) {
+      totalScanned += r.scanned;
+      if (r.failed > 0) {
+        totalFailed += r.failed;
+        issues.push({
+          chatId,
+          name: this.chatNames.get(chatId) ?? "",
+          failed: r.failed,
+          scanned: r.scanned,
+          lastFailAt: r.lastFailAt,
+          lastFailTime: r.lastFailTime,
+          senders: [...r.senders],
+        });
+      }
+    }
+    issues.sort((a, b) => String(b.lastFailAt ?? "").localeCompare(String(a.lastFailAt ?? "")));
+    // 漏接彙總: 只列達到點燈門檻 (minCount) 的聊天室, 依最近漏接時間新到舊。
+    const missedIssues = [];
+    let totalMissed = 0;
+    for (const [chatId, r] of this.decryptMissedByChat) {
+      if (r.missed >= this.decryptMissedOptions.minCount) {
+        totalMissed += r.missed;
+        missedIssues.push({
+          chatId,
+          name: this.chatNames.get(chatId) ?? "",
+          missed: r.missed,
+          newestMissedAt: r.newestMissedAt,
+          newestMissedTime: r.newestMissedTime,
+        });
+      }
+    }
+    missedIssues.sort((a, b) => String(b.newestMissedAt ?? "").localeCompare(String(a.newestMissedAt ?? "")));
+    return {
+      state: this.decryptLastScanAt == null ? "unknown" : totalFailed > 0 ? "failed" : "ok",
+      totalFailed,
+      totalScanned,
+      chatsChecked: this.decryptByChat.size,
+      lastScanAt: this.decryptLastScanAt,
+      issues,
+      missedTotal: totalMissed,
+      missedIssues,
+    };
+  }
+
+  // 一輪掃描: 對每個白名單聊天室抓最近一頁歷史 (100 則), 統計 decryptFailed。
+  // 只更新記憶體狀態; log 只在「某聊天室由正常變異常」或「全部恢復正常」時寫一筆,
+  // 一般週期掃描不刷 log。單一聊天室抓取失敗就保留它上次的紀錄並讓整輪算失敗 (退避),
+  // 不把未知洗成正常。回傳本輪的 summary。
+  async scanDecryptHealthOnce() {
+    if (this.decryptScanInFlight) return this.decryptSummary();
+    if (!this.connected || !this.botChats.length) return this.decryptSummary();
+    this.decryptScanInFlight = true;
+    const wasAlerting = new Set([...this.decryptByChat].filter(([, r]) => r.failed > 0).map(([id]) => id));
+    let roundOk = true;
+    try {
+      for (const chatId of [...this.botChats]) {
+        let frame;
+        try {
+          frame = await this.fetchHistoryPage(chatId);
+        } catch (e) {
+          roundOk = false;
+          this.logger?.debugLog("訊息解密偵測", "掃描單一聊天室失敗, 保留上次紀錄", { chat: chatId, error: String(e?.message ?? e) });
+          continue;
+        }
+        const messages = Array.isArray(frame.messages) ? frame.messages : [];
+        let failed = 0;
+        let lastFailAtMs = 0;
+        const senders = new Set();
+        for (const hm of messages) {
+          if (hm?.decryptFailed !== true) continue;
+          failed++;
+          const t = Number(hm.createdAt) || 0;
+          if (t > lastFailAtMs) lastFailAtMs = t;
+          if (typeof hm.senderName === "string" && hm.senderName) senders.add(hm.senderName);
+        }
+        const prev = this.decryptByChat.get(chatId);
+        const rec = {
+          failed,
+          scanned: messages.length,
+          lastFailAt: failed > 0 && lastFailAtMs > 0 ? new Date(lastFailAtMs).toISOString() : null,
+          lastFailTime: "",
+          senders: [...senders].slice(0, 5),
+        };
+        if (rec.lastFailAt) {
+          const d = new Date(lastFailAtMs);
+          const p2 = (n) => String(n).padStart(2, "0");
+          rec.lastFailTime = `${p2(d.getHours())}:${p2(d.getMinutes())}`;
+        }
+        this.decryptByChat.set(chatId, rec);
+        // 狀態轉移才寫 log: 正常→異常 (首次偵測到) 講清楚哪個聊天室、幾則、最近一則時間;
+        // 異常→正常 (例如已登出重登、鑰匙重新對齊) 也留一筆, 供事後對照事故時間線。
+        if (failed > 0 && !(prev && prev.failed > 0)) {
+          this.logger?.warn("訊息解密偵測", "偵測到無法解密的訊息 (核心讀不到內容, 機器人不會回覆這些訊息)", {
+            chat: chatId, name: this.chatNames.get(chatId) ?? "", failed, scanned: messages.length,
+            lastFailAt: rec.lastFailAt, senders: rec.senders,
+          });
+        } else if (failed === 0 && prev && prev.failed > 0) {
+          this.logger?.info("訊息解密偵測", "先前無法解密的訊息已不在近期範圍內 (可能已重新登入或已超出掃描範圍)", {
+            chat: chatId, name: this.chatNames.get(chatId) ?? "",
+          });
+        }
+        // 漏接比對 (同一頁順帶做, 不多打任何請求): 判準見 DECRYPT_MISSED_* 常數註解。
+        const mo = this.decryptMissedOptions;
+        let missed = 0;
+        let newestMissedAtMs = 0;
+        if (this.selfId && this.eventsLiveSince) {
+          const seen = this.seenEventIds.get(chatId);
+          const nowMs = Date.now();
+          for (const hm of messages) {
+            if (hm?.decryptFailed === true || hm?.unsent === true) continue;
+            if (hm?.contentType === "CHATEVENT") continue;
+            if (!hm?.messageId || hm.senderId === this.selfId) continue;
+            if (typeof hm.text !== "string" || !hm.text) continue;
+            const t = Number(hm.createdAt) || 0;
+            if (!(t > this.eventsLiveSince + mo.liveBufferMs)) continue; // 連線開通前 (含斷線期間) 的訊息本來就不補送
+            if (!(nowMs - t > mo.graceMs)) continue; // 還在事件寬限內, 不算漏
+            if (seen?.has(hm.messageId)) continue; // 有送達過
+            missed++;
+            if (t > newestMissedAtMs) newestMissedAtMs = t;
+          }
+        }
+        const missedRec = {
+          missed,
+          newestMissedAt: missed > 0 && newestMissedAtMs > 0 ? new Date(newestMissedAtMs).toISOString() : null,
+          newestMissedTime: "",
+        };
+        if (missedRec.newestMissedAt) {
+          const d = new Date(newestMissedAtMs);
+          const p2 = (n) => String(n).padStart(2, "0");
+          missedRec.newestMissedTime = `${p2(d.getHours())}:${p2(d.getMinutes())}`;
+        }
+        const prevMissed = this.decryptMissedByChat.get(chatId);
+        const wasMissAlert = prevMissed ? prevMissed.missed >= mo.minCount : false;
+        const isMissAlert = missed >= mo.minCount;
+        this.decryptMissedByChat.set(chatId, missedRec);
+        if (isMissAlert && !wasMissAlert) {
+          this.logger?.warn("訊息解密偵測", "偵測到訊息漏接 (訊息已在聊天室歷史裡, 卻沒有送到機器人這裡; 該聊天室可能已完全收不到)", {
+            chat: chatId, name: this.chatNames.get(chatId) ?? "", missed, newestMissedAt: missedRec.newestMissedAt,
+          });
+        } else if (!isMissAlert && wasMissAlert) {
+          this.logger?.info("訊息解密偵測", "先前的訊息漏接已解除", {
+            chat: chatId, name: this.chatNames.get(chatId) ?? "",
+          });
+        }
+      }
+    } finally {
+      this.decryptScanInFlight = false;
+    }
+    if (roundOk) {
+      this.decryptLastScanAt = new Date().toISOString();
+      this.decryptScanFailures = 0;
+    } else {
+      this.decryptScanFailures++;
+    }
+    const nowAlerting = new Set([...this.decryptByChat].filter(([, r]) => r.failed > 0).map(([id]) => id));
+    if (wasAlerting.size > 0 && nowAlerting.size === 0 && roundOk) {
+      this.logger?.info("訊息解密偵測", "全部聊天室的訊息都可正常讀取了", {});
+    }
+    return this.decryptSummary();
+  }
+
+  // 週期掃描的看守計時器: main.mjs 在啟動後呼叫一次即可; 未連線/無白名單時該輪自動跳過。
+  // 連續失敗輪數會拉長間隔 (退避, 上限 DECRYPT_SCAN_MAX_BACKOFF 倍), 成功即恢復原間隔。
+  startDecryptWatch(intervalMs = DECRYPT_SCAN_INTERVAL_MS) {
+    if (this.decryptScanTimer) return;
+    const tick = async () => {
+      await this.scanDecryptHealthOnce().catch((e) => this.logger?.debugLog("訊息解密偵測", "掃描發生錯誤", { error: String(e?.message ?? e) }));
+      if (!this.decryptScanTimer) return; // 已被 stopDecryptWatch 停掉
+      const backoff = Math.min(2 ** this.decryptScanFailures, DECRYPT_SCAN_MAX_BACKOFF);
+      this.decryptScanTimer = setTimeout(tick, intervalMs * backoff);
+      this.decryptScanTimer.unref?.();
+    };
+    this.decryptScanTimer = setTimeout(tick, intervalMs);
+    this.decryptScanTimer.unref?.();
+  }
+
+  stopDecryptWatch() {
+    if (this.decryptScanTimer) { clearTimeout(this.decryptScanTimer); this.decryptScanTimer = null; }
+  }
+
   // 被引用的訊息是不是機器人自己發的:
   // 先查登記簿 (收到的影格、自己的 sent 影格、連線後主動補登的歷史都有登記); 查不到才向核心要歷史補查
   // (最多 QUOTE_HISTORY_PAGES 頁, 理由見該常數註解), 歷史裡每則訊息都帶 senderId, 順便整頁補登記。
@@ -661,7 +910,19 @@ export class HelperBot {
       else p.resolve(frame); // sent / history 都走這裡
       return;
     }
-    if (frame.type === "message") await this.onMessage(frame.message);
+    if (frame.type === "message") {
+      // 漏接偵測的「已送達」證據: 真的從 WS 進來的訊息事件才登記 (含非文字訊息);
+      // 歷史補登/補查讀到的不算 — 那正是掃描要比對的落差。只存 ID, 上限見常數。
+      const mid = frame.message?.messageId;
+      if (typeof mid === "string" && mid) {
+        const cid = frame.message.channelId ?? "";
+        let set = this.seenEventIds.get(cid);
+        if (!set) { set = new Set(); this.seenEventIds.set(cid, set); }
+        set.add(mid);
+        if (set.size > DECRYPT_SEEN_IDS_CAP) { for (const old of set) { set.delete(old); break; } }
+      }
+      await this.onMessage(frame.message);
+    }
   }
 
   async onMessage(m) {
@@ -673,6 +934,13 @@ export class HelperBot {
     // 每則看到的訊息都登記寄件者 (含機器人自己的): 之後被引用時才認得出來源
     if (m.messageId && m.senderId) this.registry.register(m.messageId, m.senderId, m.channelId ?? "");
     if (m.senderId === this.selfId) { this.logger?.debugLog("觸發判斷", "忽略自己發的訊息", { id: m.messageId }); return; }
+    // 系統事件不觸發 (2026-10-21 第二段追加): 成員加入/離開等系統通知在核心是
+    // contentType CHATEVENT (或原始碼 "18"), 內文是核心組好的顯示字串 (例如
+    // 「妖狐藏馬 新增 AI寶 至群組」), 裡面常含機器人名字 — 寬鬆模式下舊版會被名字
+    // 觸發、把系統通知當提問認真回覆 (2026-10-21 實機: 退群重邀後機器人回覆了
+    // 自己的入群通知)。系統事件不是提問, 一律不觸發問答、也不送防詐騙判讀;
+    // 寄件者登記已在上方完成, 不影響引用認定。
+    if (m.contentType === "CHATEVENT" || m.contentType === "18") { this.logger?.debugLog("觸發判斷", "系統事件訊息, 不觸發", { id: m.messageId }); return; }
     // 兩件事並行評估: 防詐騙自動掃描 + 名字觸發; 先處理觸發問答, 詐騙警告獨立進行
     const triggerPromise = this.handleTrigger(m, s);
     const scamPromise = this.handleAutoScam(m, s);

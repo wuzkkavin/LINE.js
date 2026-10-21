@@ -323,6 +323,27 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         for (const name of logger?.listFiles() ?? []) {
           try { files.push({ name: `logs/${name}`, data: readFileSync(join(logger.dir, name)) }); } catch {}
         }
+        // 核心最近輸出尾段 (2026-10-21 第二段): 啟動器把核心的 stdout/stderr 導到同一個 logs
+        // 目錄的 launcher-core.log; 以前診斷包沒包它, 核心側事故 (例如訊息解密失敗) 完全沒證據。
+        // 檔案會一直長大, 只節錄最後 256KB 並在檔頭註明; 找不到檔案時在 summary.coreLog
+        // 誠實記錄原因 (開發模式或引擎尚未啟動), 不硬湊。
+        const CORE_LOG_TAIL = 256 * 1024;
+        try {
+          const coreLogPath = join(logger.dir, "launcher-core.log");
+          if (existsSync(coreLogPath)) {
+            const raw = readFileSync(coreLogPath);
+            const data = raw.length > CORE_LOG_TAIL
+              ? Buffer.concat([Buffer.from("（診斷包只節錄最後 256KB, 完整檔案在本機 logs/launcher-core.log）\n", "utf8"), raw.subarray(raw.length - CORE_LOG_TAIL)])
+              : raw;
+            files.push({ name: "logs/launcher-core.log", data });
+            summary.coreLog = { included: true, bytes: raw.length, tailed: raw.length > CORE_LOG_TAIL };
+          } else {
+            summary.coreLog = { included: false, reason: "找不到 launcher-core.log (引擎尚未啟動, 或目前是開發模式)" };
+          }
+        } catch (e) {
+          summary.coreLog = { included: false, reason: `讀取核心 log 失敗: ${String(e?.message ?? e)}` };
+        }
+        files[0] = { name: "summary.json", data: Buffer.from(JSON.stringify(summary, null, 2), "utf8") };
         const zip = makeZip(files);
         res.writeHead(200, { "Content-Type": "application/zip", "Content-Disposition": "attachment; filename=helper-diagnostic.zip", "Content-Length": zip.length });
         return res.end(zip);

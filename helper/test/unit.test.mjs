@@ -1026,8 +1026,9 @@ async function startBotHarness(t, { settingsOver = {}, kbFolder = "", aiHandler 
   t.after(() => bot.disconnect());
   await waitUntilUnit(() => bot.selfId === "u-me", 4000, "bot auth ready");
   const inject = (messageId, senderId, text) => botSocket.send(JSON.stringify({ type: "message", message: { messageId, channelId: HARNESS_CHAT, senderId, text } }));
+  const injectRaw = (message) => botSocket.send(JSON.stringify({ type: "message", message }));
   const waitSent = (pred, label) => waitUntilUnit(() => sentFrames.filter((f) => f.type === "message:send").find(pred), 6000, label);
-  return { bot, settings, aiBodies, inject, waitSent };
+  return { bot, settings, aiBodies, inject, injectRaw, waitSent, sentFrames };
 }
 
 test("bot: 創造者問題直接回固定答覆 (不呼叫 AI); Excel 誰開發的照常問 AI; 所有格問句也命中", async (t) => {
@@ -1049,6 +1050,22 @@ test("bot: 創造者問題直接回固定答覆 (不呼叫 AI); Excel 誰開發�
   h.inject("m4", "u-d", "AI寶，版權屬於誰？");
   const sent4 = await h.waitSent((f) => f.replyTo === "m4", "custom creator reply");
   assert.equal(sent4.text, "我是老吳做的機器人");
+  assert.equal(h.aiBodies.length, 1);
+});
+
+test("bot: 系統事件 (CHATEVENT) 不觸發問答 — 寬鬆模式含名字也不回; 一般提問照常", async (t) => {
+  // 實機情境 (2026-10-21): 退群重邀後, 入群系統通知「妖狐藏馬 新增 AI寶 至群組」
+  // 內文含機器人名字, 寬鬆模式下被當成提問認真回覆。系統事件理應不觸發。
+  const h = await startBotHarness(t, { settingsOver: { triggerMode: "loose", cooldownSec: 0 } });
+  h.injectRaw({ messageId: "sys1", channelId: HARNESS_CHAT, senderId: "u-a", text: "妖狐藏馬 新增 AI寶 至群組", contentType: "CHATEVENT" });
+  h.injectRaw({ messageId: "sys2", channelId: HARNESS_CHAT, senderId: "u-a", text: "妖狐藏馬 新增 AI寶 至群組", contentType: "18" });
+  await new Promise((r) => setTimeout(r, 700));
+  assert.equal(h.aiBodies.length, 0, "系統事件不應呼叫 AI");
+  assert.equal(h.sentFrames.filter((f) => f.type === "message:send").length, 0, "系統事件不應送出任何回覆");
+  // 對照: 同樣寬鬆模式下, 真人提問照常觸發
+  h.inject("q1", "u-a", "AI寶, Excel 怎麼凍結窗格?");
+  const sent = await h.waitSent((f) => f.replyTo === "q1", "normal question still answered");
+  assert.ok(sent.text.length > 0);
   assert.equal(h.aiBodies.length, 1);
 });
 

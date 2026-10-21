@@ -93,7 +93,7 @@ a.btn { text-decoration: none; }
 </header>
 <main class="wrap">
   <div class="grid" id="statusGrid">
-    <div class="card"><div class="stat-label">LINE 登入 / 機器人連線</div><div class="stat-value" id="stLine">讀取中…</div><div class="stat-sub" id="stSelf"></div></div>
+    <div class="card"><div class="stat-label">LINE 登入 / 機器人連線</div><div class="stat-value" id="stLine">讀取中…</div><div class="stat-sub" id="stSelf"></div><div class="stat-sub" id="stDecrypt"></div></div>
     <div class="card"><img class="bot-avatar" id="botAvatar" src="/assets/avatar.png" alt="AI寶 頭像" onerror="this.style.display='none';"><div class="stat-label">機器人名字 (觸發)</div><div class="stat-value" id="stName">—</div><div class="stat-sub" id="stMode"></div></div>
     <div class="card"><div class="stat-label">使用中的 AI</div><div class="stat-value" id="stAi">—</div><div class="stat-sub" id="stAiModel"></div><div class="stat-sub" id="stCoreVer"></div></div>
     <div class="card"><div class="stat-label">知識庫</div><div class="stat-value" id="stKb">—</div><div class="stat-sub" id="stKbSub"></div></div>
@@ -105,6 +105,7 @@ a.btn { text-decoration: none; }
     <div class="hint">第一次使用要完成這四步, AI寶 才能進群組回答問題。一步一步來, 做完一步再做下一步。</div>
     <h3>步驟一: 用次要帳號登入 LINE</h3>
     <div class="hint">打開核心登入頁, 用手機 LINE 掃畫面上的 QR 碼, 再輸入畫面上的 PIN 碼。<strong>一定要用次要帳號登入, 不要用主帳號。</strong></div>
+    <div class="hint">什麼時候要登出再重新登入? 如果機器人突然讀不到某位同事的訊息 (例如群組有人加入或離開之後), 那是 LINE 換了讀訊息的鑰匙、跟這台電腦對不上。請在核心登入頁先登出、再重新掃 QR 登入, 讓鑰匙重新對齊; 若還是讀不到, 下一步是把機器人移出該群組、再重新邀請它加入 (重新入群會重新分發鑰匙)。重新啟動程式修不好這個問題。</div>
     <div style="margin-top:8px"><a class="btn" href="http://127.0.0.1:3789/" target="_blank" rel="noopener"><button type="button">開啟核心登入頁</button></a></div>
     <h3>步驟二: 把機器人加入群組, 並把群組加入白名單</h3>
     <div class="hint">先在手機 LINE 把剛登入的次要帳號邀請進要使用 AI寶 的群組。然後回來按「讀取我的群組清單」, 群組會自己列出來, 用點的加入白名單就好, 不用自己找代號。</div>
@@ -395,6 +396,28 @@ async function loadAll() {
   $("stAiModel").textContent = ap ? ap.model : "";
   $("stCoreVer").textContent = b.coreVersion ? `核心 LINE.js：v${b.coreVersion}` : "核心 LINE.js：—";
   if (b.kb) { $("stKb").textContent = b.kb.ready ? `${b.kb.files} 個檔案 / ${b.kb.chunks} 段` : "尚無資料"; $("stKbSub").textContent = b.kb.folder || "尚未設定資料夾"; }
+  // 訊息解密健康 (與 /api/status 的 bot.decrypt 同欄位): 有解不開的訊息就老實顯示,
+  // 不讓「連線正常」蓋住「讀不到訊息」這種假綠燈 (2026-10-21 事故定案)。
+  const dec = b.decrypt || {};
+  const decWarns = [];
+  if (dec.state === "failed") {
+    const parts = (dec.issues || []).map((i) => `在『${i.name || "未命名群組"}』有 ${i.failed} 則`);
+    decWarns.push(`${parts.join("、")}訊息我讀不到, 那些訊息我不會回覆。`);
+  }
+  // 漏接 = 訊息進了群組歷史卻完全沒送到機器人這裡, 最壞情形是整個群組都收不到
+  for (const mi of dec.missedIssues || []) {
+    decWarns.push(`『${mi.name || "未命名群組"}』整個群組的訊息都沒有送到我這裡 (已漏接 ${mi.missed} 則), 現在在那個群組叫我也不會回應。`);
+  }
+  if (decWarns.length) {
+    $("stDecrypt").textContent = `⚠ ${decWarns.join(" ")}處置: 先到 LINE 登入頁登出後重新登入 (讓鑰匙重新對齊); 若還是讀不到/收不到, 把機器人移出該群組再重新邀請加入 (重新入群會重新分發鑰匙)。`;
+    $("stDecrypt").style.color = "var(--err)";
+  } else if (dec.state === "ok") {
+    $("stDecrypt").textContent = "訊息讀取檢查: 正常 (近期訊息都讀得到)";
+    $("stDecrypt").style.color = "";
+  } else {
+    $("stDecrypt").textContent = "";
+    $("stDecrypt").style.color = "";
+  }
   $("stToday").textContent = `已回答 ${b.answeredToday ?? 0} 則`;
   $("stScam").innerHTML = s.scam.enabled ? `防詐騙:開啟 · 今日判讀 ${b.scam?.checkedToday ?? 0} 則 · 警告 ${b.scam?.warnedToday ?? 0} 則` : "防詐騙:關閉";
   if (b.kb) $("kbStatus").textContent = `目前狀態:${b.kb.files} 個檔案、${b.kb.chunks} 段, 上次整理:${b.kb.updatedAt || "尚未整理"}` + (b.kb.scanning ? " (正在背景整理中, 不影響其他功能)" : "") + (b.kb.largeFolder ? " 提醒: 檔案數量很多 (超過 2000 個), 掃描會花比較久, 建議改用只放參考文件的專用小資料夾。" : "");
