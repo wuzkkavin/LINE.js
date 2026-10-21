@@ -14,6 +14,7 @@ import { chatEventMids, chatEventText, isChatEvent } from "./chatEvent.js";
 import { contentTypeName, messageCard } from "./cards.js";
 import { isEmptySquareStatus, squareReactions, talkReactions } from "./reactions.js";
 import { SessionStorage } from "./session.js";
+import { auditE2EEKeySlots, idTail, parseEnvelopeKeyIds, pubKeyFingerprint, RepeatThrottle, summarizeDecryptTrace } from "./e2eeDebug.js";
 
 export interface QRCallbacks {
   onQRUrl: (url: string) => void;
@@ -189,6 +190,11 @@ export class EvexLineProvider implements LineProvider {
   // messages seen here, so the browser cannot use this session to probe arbitrary LINE objects.
   private mediaOrigins = new Map<string, { raw: LineMessage; square: boolean }>();
   private previewDecrypts = new Map<string, { raw: LineMessage; undecryptable: boolean }>();
+  // Debug build (debug/e2ee-trace): read-only E2EE tracing state — fingerprints and ids only.
+  private e2eeThrottle = new RepeatThrottle();
+  private e2eeKnownPubKeys = new Set<string>();
+  private e2eePubKeySnapshotReady = false;
+  private e2eeCreatorDiffAt = 0;
 
   constructor(
     private readonly storage: SessionStorage,
@@ -336,6 +342,34 @@ export class EvexLineProvider implements LineProvider {
       }
     });
     this.listen();
+    // Debug build: one read-only audit of the stored E2EE key slots per login.
+    void this.auditE2eeKeys(client, profile.userId).catch(() => {});
+  }
+
+  /** Debug build: audits the stored E2EE key slots after login. Read-only; never throws. */
+  private async auditE2eeKeys(client: Client, myMid: string): Promise<void> {
+    let registeredPromise: Promise<Array<{ keyId: unknown; keyData: unknown }>> | undefined;
+    const registered = () => (registeredPromise ??= (async () => {
+      const raw = await client.base.talk.getE2EEPublicKeys() as unknown;
+      if (!Array.isArray(raw)) return [];
+      return raw.map((key) => {
+        const record = key && typeof key === "object" ? key as Record<string, unknown> : {};
+        return { keyId: record.keyId ?? record["2"], keyData: record.keyData ?? record["4"] };
+      });
+    })());
+    const result = await auditE2EEKeySlots({
+      myMid,
+      getAll: () => this.storage.getAll(),
+      registeredKey: async (keyId) => {
+        const found = (await registered()).find((key) => String(key.keyId) === keyId);
+        return typeof found?.keyData === "string" ? Buffer.from(found.keyData) : undefined;
+      },
+      verifyPair: (privKey, pubKey) => client.base.e2ee.verifyE2EEKeyPair(privKey, pubKey),
+    }, (line) => console.info(line));
+    if (result.complete) {
+      this.e2eeKnownPubKeys = new Set(result.publicKeyEntries);
+      this.e2eePubKeySnapshotReady = true;
+    }
   }
 
   /** The message's media is no longer fetchable through us, and the hub replaces what it shows. */
@@ -385,11 +419,121 @@ export class EvexLineProvider implements LineProvider {
   /** Fail closed: an E2EE message that cannot be decrypted stays a "cannot decrypt" placeholder, never a guess. */
   private async decryptTalk(client: Client, raw: LineMessage): Promise<{ raw: LineMessage; undecryptable: boolean }> {
     if (!raw.contentMetadata?.e2eeVersion) return { raw, undecryptable: false };
+    const trace = await this.beginE2eeTrace(client, raw);
     try {
-      return { raw: await client.base.e2ee.decryptE2EEMessage(raw), undecryptable: false };
+      const decrypted = await client.base.e2ee.decryptE2EEMessage(raw);
+      await trace.finish(true);
+      return { raw: decrypted, undecryptable: false };
     } catch {
+      await trace.finish(false);
       return { raw, undecryptable: true };
     }
+  }
+
+  /**
+   * Debug build: observes one decryptE2EEMessage call from the outside — the
+   * envelope key ids plus the cache entries the library reads and writes
+   * around the call (the unwrap runs inside the library; its inputs and
+   * outputs are exactly those entries). Read-only: storage is only ever
+   * `get`, and any failure of the tracing itself degrades to a no-op, so
+   * decryption behaviour is unchanged.
+   */
+  private async beginE2eeTrace(client: Client, raw: LineMessage): Promise<{ finish: (ok: boolean) => Promise<void> }> {
+    const noop = { finish: async () => {} };
+    try {
+      const myMid = client.base.profile?.mid ?? "";
+      const toType = String(raw.toType);
+      const isUser = toType === "USER" || toType === "0";
+      const isGroup = !isUser;
+      const chat = isUser ? (raw.from === myMid ? raw.to : raw.from) : raw.to;
+      const sender = raw.from;
+      const isSelf = sender === myMid;
+      const { senderKeyId, receiverKeyId } = parseEnvelopeKeyIds(raw.chunks as readonly unknown[] | undefined);
+      const gen = isGroup ? receiverKeyId : undefined;
+      const peerMid = isGroup ? sender : isSelf ? raw.to : raw.from;
+      const peerKeyId = isGroup ? senderKeyId : isSelf ? receiverKeyId : senderKeyId;
+      const peerName = peerKeyId !== undefined && !isSelf ? `e2eePublicKeys:${peerMid}:${peerKeyId}` : undefined;
+      const readPeer = async (): Promise<{ present: boolean; fp: string }> => {
+        if (!peerName) return { present: isSelf, fp: "-" };
+        const value = await this.storage.get(peerName).catch(() => undefined);
+        return typeof value === "string" && value
+          ? { present: true, fp: pubKeyFingerprint(Buffer.from(value, "base64")) }
+          : { present: false, fp: "-" };
+      };
+      const readGroupKey = async (): Promise<boolean> => {
+        if (!isGroup || gen === undefined) return false;
+        for (const name of [`e2eeGroupKeys:${chat}:${gen}`, `e2eeGroupKeys:${chat}`]) {
+          const value = await this.storage.get(name).catch(() => undefined);
+          if (typeof value !== "string" || !value) continue;
+          try {
+            if (Number((JSON.parse(value) as { keyId?: unknown }).keyId) === gen) return true;
+          } catch { /* not a group key record */ }
+        }
+        return false;
+      };
+      const before = { group: await readGroupKey(), peer: await readPeer() };
+      return {
+        finish: async (ok: boolean) => {
+          try {
+            const after = { group: await readGroupKey(), peer: await readPeer() };
+            const summary = summarizeDecryptTrace({
+              isGroup, isSelf,
+              groupKeyBefore: before.group, groupKeyAfter: after.group,
+              peerKeyBefore: before.peer.present, peerKeyAfter: after.peer.present,
+              ok,
+            });
+            const notable = summary.groupKeySource === "fetched" || summary.peerKeySource === "fetched";
+            const line = `E2EE_DEBUG v=1 kind=decrypt chat=${idTail(chat)} sender=${idTail(sender)} senderKeyId=${senderKeyId ?? "-"} gen=${gen ?? "-"} recvKeyId=${receiverKeyId ?? "-"} groupKeySource=${summary.groupKeySource} peerKeyFp=${after.peer.fp !== "-" ? after.peer.fp : before.peer.fp} peerKeySource=${summary.peerKeySource} result=${ok ? "ok" : "fail"} step=${summary.step}`;
+            if (notable) {
+              console.info(line);
+            } else {
+              const repeats = this.e2eeThrottle.check(`decrypt|${chat}|${sender}|${gen ?? "-"}|${ok ? "ok" : summary.step}`, ok ? 600_000 : 60_000);
+              if (repeats !== undefined) console.info(repeats > 0 ? `${line} repeats=${repeats}` : line);
+            }
+            if (isGroup && summary.groupKeySource === "fetched") {
+              await this.logE2eeUnwrap(chat, gen, true, peerName, myMid);
+            } else if (isGroup && !ok && !before.group && !after.group) {
+              await this.logE2eeUnwrap(chat, gen, false, peerName, myMid);
+            }
+          } catch { /* tracing must never disturb decryption */ }
+        },
+      };
+    } catch {
+      return noop;
+    }
+  }
+
+  /**
+   * Debug build: a group key was newly unwrapped, or an unwrap was attempted
+   * and the key never landed in the cache. The creator's public key is
+   * observable only as the cache entry the unwrap leaves behind, found by
+   * diffing the snapshot taken at login (at most one diff a minute, and only
+   * entries that are neither this message's peer key nor our own are
+   * attributed to the creator).
+   */
+  private async logE2eeUnwrap(chat: string, gen: number | undefined, ok: boolean, peerName: string | undefined, myMid: string): Promise<void> {
+    let creatorTail = "-";
+    let creatorKeyId = "-";
+    let creatorFp = "-";
+    const now = Date.now();
+    if (this.e2eePubKeySnapshotReady && now - this.e2eeCreatorDiffAt >= 60_000) {
+      this.e2eeCreatorDiffAt = now;
+      try {
+        const all = await this.storage.getAll();
+        const fresh = Object.keys(all).filter((name) => name.startsWith("e2eePublicKeys:") && !this.e2eeKnownPubKeys.has(name));
+        for (const name of fresh) this.e2eeKnownPubKeys.add(name);
+        const candidates = fresh.filter((name) => name !== peerName && name.split(":")[1] !== myMid);
+        const candidate = candidates.length === 1 ? candidates[0] : undefined;
+        if (candidate) {
+          const parts = candidate.split(":");
+          creatorTail = idTail(parts[1]);
+          creatorKeyId = parts[2] ?? "-";
+          const value = all[candidate];
+          if (typeof value === "string" && value) creatorFp = pubKeyFingerprint(Buffer.from(value, "base64"));
+        }
+      } catch { /* keep "-" */ }
+    }
+    console.info(`E2EE_DEBUG v=1 kind=unwrap chat=${idTail(chat)} gen=${gen ?? "-"} creatorTail=${creatorTail} creatorKeyId=${creatorKeyId} creatorFp=${creatorFp} result=${ok ? "ok" : "fail"}`);
   }
 
   private rememberMedia(raw: LineMessage, square: boolean): string | undefined {
@@ -1089,12 +1233,60 @@ export class EvexLineProvider implements LineProvider {
       if (!String((error as { data?: { code?: unknown } } | undefined)?.data?.code ?? "").includes("E2EE")) throw error;
     }
     if (this.client !== client) throw new Error("NOT_AUTHENTICATED");
-    const chunks = await client.base.e2ee.encryptE2EEMessage(to, { ...contentMetadata, text }, "NONE");
+    let chunks: Awaited<ReturnType<typeof client.base.e2ee.encryptE2EEMessage>>;
+    try {
+      chunks = await client.base.e2ee.encryptE2EEMessage(to, { ...contentMetadata, text }, "NONE");
+    } catch (error) {
+      void this.traceE2eeSend(client, to, error).catch(() => {});
+      throw error;
+    }
+    void this.traceE2eeSend(client, to).catch(() => {});
     if (this.client !== client) throw new Error("NOT_AUTHENTICATED");
     return client.base.talk.sendMessage({
       to, contentType: "NONE", chunks, e2ee: true, ...reply,
       contentMetadata: { ...contentMetadata, e2eeVersion: "2", contentType: "0", e2eeMark: "2" },
     });
+  }
+
+  /** Debug build: which self key a send used, resolved read-only in the library's slot order. */
+  private async readSelfKeySlot(myMid: string): Promise<{ keyId: string; fp: string }> {
+    const parse = (value: unknown): { keyId?: unknown; pubKey?: unknown } | undefined => {
+      if (typeof value !== "string") return undefined;
+      try {
+        const data: unknown = JSON.parse(value);
+        return data && typeof data === "object" ? data as { keyId?: unknown; pubKey?: unknown } : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    let data = parse(await this.storage.get(`e2eeKeys:${myMid}`).catch(() => undefined));
+    if (data && (typeof data.keyId === "number" || typeof data.keyId === "string")) {
+      const byId = parse(await this.storage.get(`e2eeKeys:${data.keyId}`).catch(() => undefined));
+      if (byId?.pubKey) data = byId;
+    }
+    const keyId = data && (typeof data.keyId === "number" || typeof data.keyId === "string") ? String(data.keyId) : "-";
+    const fp = typeof data?.pubKey === "string" && data.pubKey ? pubKeyFingerprint(Buffer.from(data.pubKey, "base64")) : "-";
+    return { keyId, fp };
+  }
+
+  /** Debug build: records one E2EE send (or the encrypt step's failure). Read-only; never throws. */
+  private async traceE2eeSend(client: Client, to: string, error?: unknown): Promise<void> {
+    const myMid = client.base.profile?.mid ?? "";
+    const self = await this.readSelfKeySlot(myMid);
+    let gen = "-";
+    const groupValue = await this.storage.get(`e2eeGroupKeys:${to}`).catch(() => undefined);
+    if (typeof groupValue === "string" && groupValue) {
+      try {
+        const keyId = (JSON.parse(groupValue) as { keyId?: unknown }).keyId;
+        if (typeof keyId === "number" || typeof keyId === "string") gen = String(keyId);
+      } catch { /* not a group key record */ }
+    }
+    if (error) {
+      const name = error instanceof Error ? error.name.replace(/[^A-Za-z0-9_]/g, "").slice(0, 40) || "unknown" : "unknown";
+      console.info(`E2EE_DEBUG v=1 kind=send chat=${idTail(to)} senderKeyId=${self.keyId} selfFp=${self.fp} gen=${gen} result=fail step=encrypt err=${name}`);
+    } else {
+      console.info(`E2EE_DEBUG v=1 kind=send chat=${idTail(to)} senderKeyId=${self.keyId} selfFp=${self.fp} gen=${gen} result=ok`);
+    }
   }
 
   async sendSticker(channel: ChannelRef, packageId: number, stickerId: number): Promise<Message> {
