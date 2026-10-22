@@ -127,6 +127,13 @@
 - 注意：本地工作副本同步前落後 origin 46 筆且 app/ 有 3 檔未提交舊稿（2026-10-20 03:02 的 engine/platform 早期稿，origin 已有更新的已提交版本），已存入 git stash（pre-sync-2026-10-22）與 goals/cadcraft/hidden_files/win-dirty-pre-sync-2026-10-22.patch 保全，未丟棄。
 - 本次未做：原生 App（AI寶-App.exe）未重打包（本次每日同步只跑 build-windows 引擎版），其內嵌引擎仍為 v1.8.0 世代；是否補跑 build-app 待主代理裁示。未驗證：真帳號下 admin-token 推送／兌換與 E2EE 修正的實際行為（待老吳實機）。
 
+## 6.9 原生 App 補跑 v1.8.1（2026-10-22，§6.8 後續，經裁示補跑 build-app）
+
+- 雲端：build-app run 39713204547（head 2a0a353）四 job 全 success（build-engine／build-app／build-legacy／legacy-scenarios；本日 runner 明顯較慢，總時長約 46 分鐘，長尾在 build-legacy 歷史定版建置）。探針全 ok：engine_bytes=105,067,520（與 §6.8 build-windows v1.8.1 引擎同大小）、engine_id=410d96ce7e27565a-105067520、helper 身分／bot 欄位／list-models／test-ai／chats／whitelist 路由全 ok、login_roundtrip=ok、shutdown_path=signal_file、ports_freed=true；GUI 結束 residual=none、雙埠 False；主視窗截圖親自檢視（總覽正常、粉圓體、定版頭像、頁尾版權宣告＋上游出處入鏡）。
+- payload 世代查證：下載成品以 strings 實查含 chat:admin-token（14 處，含 :changed／:consumed 與 hello capabilities ["chat:admins","chat:admin-token"]）及版本戳記 serverVersion "1.8.1"、"1.8.1+0.1.0+66bd26c07558"——內嵌引擎已由 v1.8.0 世代升至 v1.8.1（含 E2EE 群組金鑰解密修正 #2 與聊天室一次性管理員權杖）。
+- 成品：AI寶-App.exe 128,016,896 bytes（較上版 +9,728，與引擎增量一致）、MD5 7fc0bc6c9f3a747bb4c42a5b30451daa、SHA256 f380a9261deb7c19339a4837a34ade869a20487ead45708eb7c47035e9f7cffd。Drive 同 id 1BWJiznBeMoeQbIaS7jxbKagiNBcnrmfX 原地換新（回讀大小＋MD5 一致、trashed=false）；Release aibao-app-v1 資產 AI-Bao-App.exe 同步換新（回讀 size＋sha256 一致）；run artifacts 4 件已全刪（複查 total_count=0）。
+- 未驗證（待老吳實機，比照歷次）：真帳號下 admin-token 推送／兌換、成員變動後 E2EE 解密修正的實際行為；裝新版前須先完全結束舊版 App；歷次未驗證項（引用續答真機、群組清單、聊天室畫面真機渲染與切頁縮匣不殘影、自啟動重開機等）照舊未驗。
+
 ## 7. 操作手冊（常用指令）
 
 - 上游測試：Repo 根目錄 npm ci --include=dev；npm run typecheck；npm test（207 項，約 1 分鐘）。
