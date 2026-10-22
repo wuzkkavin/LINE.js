@@ -12,7 +12,7 @@ import { createTriggerState, evaluateTrigger, markAnswered, markTriggered, local
 import { KnowledgeBase } from "../src/kb.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, ruleFallbackJudge, PerMinuteLimiter } from "../src/scam.mjs";
 import { createConsoleServer } from "../src/server.mjs";
-import { parseApiSection, applyApiConfig, applyCoreApiConfig, readCoreApiStatus, isValidChatId } from "../src/linecfg.mjs";
+import { parseApiSection, applyApiConfig, applyCoreApiConfig, readCoreApiStatus, isValidChatId, removeApiChat } from "../src/linecfg.mjs";
 import { MessageSenderRegistry } from "../src/msgregistry.mjs";
 import { HelperBot, isCreatorIntent, calculateAge, buildPersonaSection, buildScopeSection, cleanAnswerText, QUOTE_HISTORY_PAGES, answerFilename, splitLongText, TEXT_SEND_LIMIT, LINE_FORMAT_RULE } from "../src/bot.mjs";
 import { coreEndpoints, fetchCoreChannels, shapeChatList } from "../src/corechats.mjs";
@@ -423,6 +423,12 @@ test("linecfg: config.yaml api 區塊解析與白名單寫入 (備份、驗證�
   assert.deepEqual(parseApiSection(applyApiConfig(applied, gid2)).chats, [gid, gid2], "第二個群組應接在清單後面");
   assert.equal(isValidChatId(gid), true);
   assert.equal(isValidChatId("hello"), false);
+  // 社群 (OpenChat) 是 m 開頭, 與群組 c 開頭同為 33 碼 (2026-10-22 修復: 舊版只收 c/r/u,
+  // 社群永遠加不進白名單)。解析/加入/移除三條路都要認得 m 開頭。
+  const mid = "m" + "e".repeat(32);
+  assert.equal(isValidChatId(mid), true);
+  assert.deepEqual(parseApiSection(applyApiConfig(applied, mid)).chats, [gid, mid], "社群應能加入清單並被解析讀回");
+  assert.deepEqual(parseApiSection(removeApiChat(applyApiConfig(applied, mid), mid)).chats, [gid], "社群應能從清單移除");
   writeFileSync(join(dir, "config.yaml"), sample);
   const r = applyCoreApiConfig({ dataDir: dir, repoRoot: join(dir, "nope"), chatId: gid });
   assert.equal(r.apiEnabled, true);

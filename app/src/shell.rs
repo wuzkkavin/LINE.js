@@ -79,6 +79,13 @@ pub struct ShellSettings {
     /// 以 serde default 補 forest (森林綠, 出廠預設), 不影響既有偏好。
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 開啟程式時是否自動登入並啟用服務 (2026-10-22 老吳交代新增, 預設關閉)。
+    /// 關閉時: 程式開啟後引擎不啟動、停在未登入狀態, 由使用者按「登入並啟用」才開始。
+    /// 與「隨 Windows 開機自動啟動」(HKCU Run) 互相獨立: 自啟動只負責把程式叫起來
+    /// (縮系統匣待命), 要不要接著登入由這個欄位決定。舊設定檔沒有此欄位時
+    /// serde default = false (不自動登入), 符合老吳定的出廠預設。
+    #[serde(default)]
+    pub auto_login: bool,
 }
 
 fn default_true() -> bool {
@@ -91,7 +98,7 @@ fn default_theme() -> String {
 
 impl Default for ShellSettings {
     fn default() -> Self {
-        Self { show_window_on_start: true, tray_hint_shown: false, theme: default_theme() }
+        Self { show_window_on_start: true, tray_hint_shown: false, theme: default_theme(), auto_login: false }
     }
 }
 

@@ -7,9 +7,12 @@ import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { isSea } from "node:sea";
 
-// LINE 聊天室/群組 ID 格式: c (群組) / r (聊天室) / u (個人) 開頭加 32 碼十六進位
+// LINE 聊天室/群組 ID 格式 (與核心 AGENTS 規則 7 對齊): u (個人) / c (群組) / r (聊天室) /
+// s / m (社群 OpenChat) 開頭加 32 碼十六進位, 共 33 碼。
+// 為什麼要放寬 (2026-10-22 修復): 舊版只收 c/r/u, 社群的 m 開頭永遠被擋在白名單外
+// (老吳真機實測: 「對話機器人技術交流」社群加不進來, 畫面還誤寫「應該是 c 開頭」)。
 export function isValidChatId(id) {
-  return typeof id === "string" && /^[cru][0-9a-f]{32}$/.test(id.trim());
+  return typeof id === "string" && /^[crums][0-9a-f]{32}$/.test(id.trim());
 }
 
 export function detectPackaged() {
@@ -49,7 +52,7 @@ export function parseApiSection(text) {
     if (/^\s+enabled:\s*true\b/.test(line)) enabled = true;
     if (/^\s+chats:\s*(#.*)?$/.test(line)) { inChats = true; continue; }
     if (inChats) {
-      const item = line.match(/^\s+-\s*([cru][0-9a-f]{32})\s*(#.*)?$/);
+      const item = line.match(/^\s+-\s*([crums][0-9a-f]{32})\s*(#.*)?$/);
       if (item) { chats.push(item[1]); continue; }
       if (/^\s+\S/.test(line) && !/^\s*#/.test(line)) inChats = false;
     }
@@ -108,7 +111,7 @@ export function readCoreApiStatus({ dataDir, repoRoot } = {}) {
 // 實際寫入: 備份 (.bak) → 行編輯 → 重讀驗證; 驗證不過就還原並丟出白話錯誤。
 export function applyCoreApiConfig({ dataDir, repoRoot, chatId } = {}) {
   if (!isValidChatId(chatId)) {
-    throw new Error("群組 ID 格式不對: 應該是 c 開頭、共 33 碼的英數字。請回核心頁面, 用「複製聊天室 ID」重新複製一次再貼上。");
+    throw new Error("聊天室 ID 格式不對: 應該是共 33 碼（群組是 c 開頭、社群是 m 開頭）。請回核心頁面, 用「複製聊天室 ID」重新複製一次再貼上。");
   }
   const id = chatId.trim();
   const found = findCoreConfigPath({ dataDir, repoRoot });
@@ -136,7 +139,7 @@ export function removeApiChat(text, chatId) {
   if (!range) throw new Error("設定檔裡找不到 api 設定區塊, 為安全起見不自動修改; 請把診斷包給維護人員看");
   let removed = 0;
   for (let i = range.end - 1; i > range.start; i--) {
-    const m = lines[i].match(/^\s+-\s*([cru][0-9a-f]{32})\s*(#.*)?$/);
+    const m = lines[i].match(/^\s+-\s*([crums][0-9a-f]{32})\s*(#.*)?$/);
     if (m && m[1] === id) { lines.splice(i, 1); removed++; }
   }
   if (removed === 0) throw new Error("這個群組不在白名單裡 (可能已經被移除了), 請重新讀取清單確認。");
@@ -146,7 +149,7 @@ export function removeApiChat(text, chatId) {
 // 實際移除: 備份 (.bak) → 行編輯 → 重讀驗證; 驗證不過就還原並丟出白話錯誤 (與加入流程同一套安全規格)。
 export function removeCoreApiChat({ dataDir, repoRoot, chatId } = {}) {
   if (!isValidChatId(chatId)) {
-    throw new Error("群組 ID 格式不對, 無法移除; 請重新讀取白名單清單再試一次。");
+    throw new Error("聊天室 ID 格式不對, 無法移除; 請重新讀取白名單清單再試一次。");
   }
   const id = chatId.trim();
   const found = findCoreConfigPath({ dataDir, repoRoot });

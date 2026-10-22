@@ -141,7 +141,7 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
       if (req.method === "POST" && path === "/api/outbox/pause") {
         if (!outbox) return json(res, 400, { ok: false, message: "待發清單尚未啟用" });
         const body = await readBody(req);
-        const r = outbox.setPaused(body?.id, body?.paused !== false, typeof body?.note === "string" ? body.note : "");
+        const r = outbox.setPaused(body?.id, body?.paused !== false, typeof body?.note === "string" ? body.note : "", typeof body?.reason === "string" ? body.reason : "");
         return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, entry: r.entry } : { ok: false, message: r.errors.join("；") });
       }
       if (req.method === "POST" && path === "/api/outbox/defer") {
@@ -164,6 +164,8 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
       }
       // 管理員通知: 事件紀錄查詢 + 殼端送出結果寫回 + 待送清單 (殼端輪詢領取)
       if (req.method === "GET" && path === "/api/admin-events") {
+        // 領取前先結算到期的合併彙總 (節流窗已過的被合併事件補送一則彙總, 見 adminnotify)
+        if (adminEvents?.collectDueSummaries) { try { adminEvents.collectDueSummaries(); } catch { /* 彙總失敗不擋查詢 */ } }
         return json(res, 200, { ok: true, events: adminEvents ? adminEvents.list() : [], pending: adminEvents ? adminEvents.pendingNotify() : [] });
       }
       if (req.method === "POST" && path === "/api/admin-events/sent") {

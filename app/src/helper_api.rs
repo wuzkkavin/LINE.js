@@ -203,9 +203,10 @@ pub fn record_outbox_retry_result(id: &str, results: serde_json::Value, note: &s
     post_json("/api/outbox/retry-result", serde_json::json!({ "id": id, "results": results, "note": note }), 15)
 }
 
-/// 暫停/恢復一筆待發 (群組鑰匙不正常時用暫停; 修好後使用者按恢復)
-pub fn pause_outbox(id: &str, paused: bool, note: &str) -> Result<serde_json::Value, String> {
-    post_json("/api/outbox/pause", serde_json::json!({ "id": id, "paused": paused, "note": note }), 15)
+/// 暫停/恢復一筆待發。reason: "decrypt" = 鑰匙異常被護欄自動暫停 (恢復正常後會自動繼續);
+/// "manual" = 使用者在畫面按的 (不會自動恢復)。恢復時 reason 傳空字串。
+pub fn pause_outbox(id: &str, paused: bool, note: &str, reason: &str) -> Result<serde_json::Value, String> {
+    post_json("/api/outbox/pause", serde_json::json!({ "id": id, "paused": paused, "note": note, "reason": reason }), 15)
 }
 
 /// 順延一筆待發到指定時間 (有人剛進群的鑰匙交接護欄)

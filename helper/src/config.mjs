@@ -52,6 +52,11 @@ export function defaultSettings() {
     triggerMode: "standard",
     cooldownSec: 20,
     dailyLimit: 100,
+    // 開啟程式時自動登入並啟用服務 (2026-10-22 老吳交代, 預設關閉, 與兩版同步):
+    // Ubuntu 版由 main.mjs 的啟動閘門與控制台「登入並啟用」按鈕使用 (服務照常啟動,
+    // 機器人先不連線, 等使用者按了才連); Windows 版的同名行為由 App 殼的
+    // ShellSettings.auto_login 管, helper 這欄不參與 (保留同形狀方便兩邊設定檔對照)。
+    autoStart: false,
     lineApiUrl: "ws://127.0.0.1:3789/api/ws",
     ai: {
       active: "openai",

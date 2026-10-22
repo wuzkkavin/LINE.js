@@ -239,6 +239,10 @@ struct App {
     /// 這次程式啟動的時間 (epoch 毫秒): 排程「程式沒開時錯過」的判定基準 (pagesend::plan_entry)
     send_engine_started_ms: i64,
     last_send_tick: Option<std::time::Instant>,
+    last_notify_tick: Option<std::time::Instant>,
+    /// 最近一次「管理員通知送不出去」的白話原因 (送成功就清除); 顯示在通知紀錄卡上方,
+    /// 讓失敗看得見, 不再只留在 log 裡 (2026-10-22 修復)。
+    notify_last_error: Option<String>,
     send_tick_slot: Slot<Value>,
     // 管理員通知 (第四階段): 事件紀錄與候選名單 (機器人與觸發頁顯示/勾選)
     admin_events: Vec<Value>,
@@ -461,9 +465,14 @@ fn main() {
         .with_maximize_button(false)
         .with_maximized(false)
         .with_visible(!start_hidden);
-    // 視窗/工作列圖示: 給預先縮好的 64px 圖 (理由見 icon_rgba), 不再直交 233x232 原圖
-    if let Some((rgba, w, h)) = icon_rgba(64) {
-        viewport = viewport.with_icon(egui::IconData { rgba, width: w, height: h });
+    // 視窗/工作列圖示: 給預先縮好的 64px 圖 (理由見 icon_rgba), 不再直交 233x232 原圖。
+    // 解碼失敗不再靜默 (2026-10-22 修復): 舊版失敗就沒圖示、也沒任何紀錄, 真機回報
+    // 「工具列 icon 沒顯示」時無從查起; 現在至少 log 留證據、總覽也會提示。
+    match icon_rgba(64) {
+        Some((rgba, w, h)) => {
+            viewport = viewport.with_icon(egui::IconData { rgba, width: w, height: h });
+        }
+        None => shell::log_line("視窗/工作列圖示載入失敗: 品牌圖示解碼失敗, 工作列將顯示預設圖示"),
     }
     let options = eframe::NativeOptions {
         viewport,
@@ -554,9 +563,22 @@ fn refresh_line_cfg_status(app: &mut App) {
 fn build_tray() -> Option<Tray> {
     use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
     // 系統匣圖示: 給預先縮好的 32px 圖 (涵蓋 100% 到 200% DPI 的 16/20/24 顯示尺寸,
-    // 理由見 icon_rgba), 不再讓 Windows 把 233x232 原圖即時縮小而產生黑邊
-    let (rgba, w, h) = icon_rgba(32)?;
-    let normal = tray_icon::Icon::from_rgba(rgba.clone(), w, h).ok()?;
+    // 理由見 icon_rgba), 不再讓 Windows 把 233x232 原圖即時縮小而產生黑邊。
+    // 每一步失敗都記 log (2026-10-22 修復): 舊版全程用 ? 靜默吞掉, 系統匣沒出現也查不到原因。
+    let (rgba, w, h) = match icon_rgba(32) {
+        Some(v) => v,
+        None => {
+            shell::log_line("系統匣圖示建立失敗: 品牌圖示解碼失敗");
+            return None;
+        }
+    };
+    let normal = match tray_icon::Icon::from_rgba(rgba.clone(), w, h) {
+        Ok(v) => v,
+        Err(e) => {
+            shell::log_line(&format!("系統匣圖示建立失敗: 圖示轉換失敗 ({e})"));
+            return None;
+        }
+    };
     // 灰階版: 未登入/異常時用 (飽和度降為 0)
     let mut gray = rgba.clone();
     for px in gray.chunks_exact_mut(4) {
@@ -565,7 +587,13 @@ fn build_tray() -> Option<Tray> {
         px[1] = g;
         px[2] = g;
     }
-    let gray_icon = tray_icon::Icon::from_rgba(gray, w, h).ok()?;
+    let gray_icon = match tray_icon::Icon::from_rgba(gray, w, h) {
+        Ok(v) => v,
+        Err(e) => {
+            shell::log_line(&format!("系統匣圖示建立失敗: 灰階圖示轉換失敗 ({e})"));
+            return None;
+        }
+    };
 
     let menu = Menu::new();
     let open_item = MenuItem::new("開啟主視窗", true, None);
@@ -581,12 +609,18 @@ fn build_tray() -> Option<Tray> {
     let open_id = open_item.id().clone();
     let restart_id = restart_item.id().clone();
     let quit_id = quit_item.id().clone();
-    let icon = tray_icon::TrayIconBuilder::new()
+    let icon = match tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("AI寶 — 啟動中")
         .with_icon(normal.clone())
         .build()
-        .ok()?;
+    {
+        Ok(v) => v,
+        Err(e) => {
+            shell::log_line(&format!("系統匣圖示建立失敗: 系統匣註冊失敗 ({e})"));
+            return None;
+        }
+    };
     let icon_id = icon.id().clone();
     Some(Tray {
         _icon: icon,
@@ -624,12 +658,17 @@ impl App {
         spawn_helper_poller(snap.clone(), cc.egui_ctx.clone());
 
         let engine = Arc::new(Mutex::new(EngineManager::new()));
-        {
+        // 啟動行為 (2026-10-22 老吳交代改為可選): 「開啟程式時自動登入並啟用服務」
+        // 預設關閉 — 關閉時不啟動引擎, 程式停在未登入狀態, 等使用者按「登入並啟用」。
+        // --autostart (開機自啟動) 只影響縮系統匣與否, 不再連帶自動登入。
+        if shell_settings.auto_login {
             let mut mgr = engine.lock().unwrap();
             if let Err(e) = mgr.start() {
                 shell::log_line(&format!("引擎啟動失敗: {e}"));
                 mgr.state = EngineState::Failed(e);
             }
+        } else {
+            shell::log_line("自動登入已關閉: 程式開啟後停在未啟用狀態, 等使用者按「登入並啟用」");
         }
 
         let avatar_tex = decode_image_rgba(AVATAR_BYTES).map(|(rgba, w, h)| {
@@ -726,6 +765,8 @@ impl App {
             materials_attempted: false,
             send_engine_started_ms: pagesend::now_ms(),
             last_send_tick: None,
+            last_notify_tick: None,
+            notify_last_error: None,
             send_tick_slot: Arc::new(Mutex::new(None)),
             admin_events: Vec::new(),
             admin_events_slot: Arc::new(Mutex::new(None)),
@@ -767,8 +808,12 @@ impl App {
             #[cfg(windows)]
             tray,
         };
+        #[cfg(windows)]
+        if app.tray.is_none() {
+            shell::log_line("本次啟動沒有系統匣圖示 (建立失敗, 原因見上方紀錄)");
+        }
         if autostart_arg {
-            shell::log_line("以 --autostart 模式啟動 (縮系統匣, 引擎自動拉起)");
+            shell::log_line("以 --autostart 模式啟動 (縮系統匣待命; 要不要登入看「自動登入」設定)");
         }
         refresh_line_cfg_status(&mut app);
         app
@@ -814,6 +859,19 @@ impl App {
             let _ = mgr.stop();
             if let Err(e) = mgr.start() {
                 shell::log_line(&format!("重新啟動引擎失敗: {e}"));
+                mgr.state = EngineState::Failed(e);
+            }
+        });
+    }
+
+    /// 「登入並啟用」: 使用者主動按下才啟動引擎 (自動登入關閉時的入口)。
+    /// 只 start 不 stop: start 本身對已在跑的引擎是無動作, 不會打斷現有連線。
+    fn start_engine(&mut self) {
+        let engine = self.engine.clone();
+        std::thread::spawn(move || {
+            let mut mgr = engine.lock().unwrap();
+            if let Err(e) = mgr.start() {
+                shell::log_line(&format!("啟用引擎失敗: {e}"));
                 mgr.state = EngineState::Failed(e);
             }
         });
@@ -1213,9 +1271,13 @@ fn send_entry_items(ch: &mut pagesend::PageChannel, entry: &Value, prev: Option<
 
 /// 把待送的管理員通知送掉 (第四階段): @ 送不出去 (核心保留訊息裡沒有這個人) 就改純文字點名重送,
 /// 結果與原因都寫回事件紀錄, 畫面與紀錄只出現白話。
-fn send_admin_events(ch: &mut pagesend::PageChannel) {
-    let Ok(v) = helper_api::get_admin_events() else { return };
+/// 回傳 (有沒有真的送成功至少一筆, 最後一筆失敗的白話原因) — 呼叫端據此在畫面顯示
+/// 「通知目前送不出去」的狀態, 不讓失敗只留在 log 裡 (2026-10-22 修復)。
+fn send_admin_events(ch: &mut pagesend::PageChannel) -> (bool, Option<String>) {
+    let Ok(v) = helper_api::get_admin_events() else { return (false, Some("通知清單讀不到, 請稍後再試".to_string())) };
     let pending = v.get("pending").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    let mut sent_any = false;
+    let mut last_error: Option<String> = None;
     for ev in &pending {
         let id = ev.get("id").and_then(|x| x.as_str()).unwrap_or("");
         let chat = ev.get("chatId").and_then(|x| x.as_str()).unwrap_or("");
@@ -1244,7 +1306,9 @@ fn send_admin_events(ch: &mut pagesend::PageChannel) {
         };
         let _ = helper_api::mark_admin_event_sent(id, ok, &note);
         shell::log_line(&format!("管理員通知送出: id={id} ok={ok} note={note}"));
+        if ok { sent_any = true; } else { last_error = Some(note.clone()); }
     }
+    (sent_any, last_error)
 }
 
 /// 排程一輪 (背景執行緒呼叫): 讀待發清單與解密狀態, 照 pagesend::plan_entry 逐筆處置;
@@ -1252,20 +1316,39 @@ fn send_admin_events(ch: &mut pagesend::PageChannel) {
 fn run_send_engine_once(started_ms: i64) -> Value {
     let mut notes: Vec<String> = Vec::new();
     let mut changed = false;
-    let entries = match helper_api::get_outbox() {
+    let mut entries = match helper_api::get_outbox() {
         Ok(v) => v.get("entries").and_then(|e| e.as_array()).cloned().unwrap_or_default(),
         Err(e) => return serde_json::json!({ "changed": false, "notes": [format!("待發清單讀不到: {e}")] }),
     };
-    // 鑰匙不正常的聊天室: 只認 helper 明確回報 state=failed 的 issues, 未掃描 (unknown) 不亂暫停
+    // 「現在真的讀不到」的聊天室: 只認 helper 的 blockingChats (即時活狀態判定, 見 helper
+    // bot.decryptSummary)。2026-10-22 修復: 舊版拿歷史掃描的 issues 當暫停依據, 裡面混著
+    // 舊世代不可復原的歷史訊息 — 群組明明即時可解可回, 待發卻被永久暫停、訊息發不出去。
     let mut failed_chats: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Ok(st) = helper_api::get_status() {
-        let dec = st.get("bot").and_then(|b| b.get("decrypt"));
-        if dec.and_then(|d| d.get("state")).and_then(|s| s.as_str()) == Some("failed") {
-            if let Some(issues) = dec.and_then(|d| d.get("issues")).and_then(|i| i.as_array()) {
-                for i in issues {
-                    if let Some(id) = i.get("chatId").and_then(|c| c.as_str()) {
-                        failed_chats.insert(id.to_string());
-                    }
+        if let Some(arr) = st.get("bot").and_then(|b| b.get("decrypt")).and_then(|d| d.get("blockingChats")).and_then(|i| i.as_array()) {
+            for i in arr {
+                if let Some(id) = i.as_str() {
+                    failed_chats.insert(id.to_string());
+                }
+            }
+        }
+    }
+    // 自動恢復: 先前被鑰匙護欄暫停 (pauseReason=decrypt) 的待發, 群組已不在擋事清單就
+    // 自動改回待發 (本地快照同步改, 這一輪就能接著評估送出)。人工暫停 (manual 或舊
+    // 資料沒有 reason) 不自動動 — 那是使用者自己按的。
+    for e in &mut entries {
+        let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let chat_id = e.get("chatId").and_then(|v| v.as_str()).unwrap_or("");
+        let auto_resumable = e.get("status").and_then(|v| v.as_str()) == Some("paused")
+            && e.get("pauseReason").and_then(|v| v.as_str()) == Some("decrypt")
+            && !failed_chats.contains(chat_id);
+        if auto_resumable && !id.is_empty() {
+            if helper_api::pause_outbox(&id, false, "這個群組的訊息已恢復正常, 自動繼續發送", "").is_ok() {
+                changed = true;
+                notes.push(format!("待發 {id} 已自動恢復 (群組訊息恢復正常)"));
+                if let Some(obj) = e.as_object_mut() {
+                    obj.insert("status".into(), serde_json::json!("pending"));
+                    obj.insert("pauseReason".into(), serde_json::json!(""));
                 }
             }
         }
@@ -1277,9 +1360,9 @@ fn run_send_engine_once(started_ms: i64) -> Value {
         let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("");
         match pagesend::plan_entry(e, now, started_ms, &failed_chats, &joins) {
             pagesend::Plan::PauseDecrypt => {
-                if helper_api::pause_outbox(id, true, "這個群組有訊息讀不到 (鑰匙對不上), 先暫停不發; 修好後請在待發清單按「恢復」").is_ok() {
+                if helper_api::pause_outbox(id, true, "這個群組現在有訊息讀不到 (鑰匙對不上), 先暫停不發; 等訊息恢復正常會自動繼續, 也可以在待發清單按「恢復」", "decrypt").is_ok() {
                     changed = true;
-                    notes.push(format!("待發 {id} 已暫停 (群組鑰匙不正常)"));
+                    notes.push(format!("待發 {id} 已暫停 (群組現在讀不到訊息)"));
                 }
             }
             pagesend::Plan::SkipMissed => {
@@ -1300,9 +1383,19 @@ fn run_send_engine_once(started_ms: i64) -> Value {
     }
     // 有沒有待送的管理員通知 (決定要不要開連線)
     let has_notify = helper_api::get_admin_events().map(|v| v.get("pending").and_then(|p| p.as_array()).map(|a| !a.is_empty()).unwrap_or(false)).unwrap_or(false);
+    let mut notify_error: Option<String> = None;
     if !to_send.is_empty() || has_notify {
         match pagesend::PageChannel::connect() {
             Ok(mut ch) => {
+                // 管理員通知優先 (2026-10-22 修復): 舊版先送完所有排程待發才送通知,
+                // 通知被排程壅塞拖慢, 體感像沒回應。改成連線一開先送通知。
+                if has_notify {
+                    let (sent_any, err) = send_admin_events(&mut ch);
+                    changed = true; // 通知紀錄有更新, 順帶觸發畫面重讀
+                    if !sent_any {
+                        notify_error = err;
+                    }
+                }
                 for e in &to_send {
                     let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let results = send_entry_items(&mut ch, e, None);
@@ -1312,17 +1405,41 @@ fn run_send_engine_once(started_ms: i64) -> Value {
                         notes.push(format!("待發 {id} 已送出 ({ok_count} 項成功)"));
                     }
                 }
-                if has_notify {
-                    send_admin_events(&mut ch);
-                    changed = true; // 通知紀錄有更新, 順帶觸發畫面重讀
-                }
             }
             Err(e) => {
                 notes.push(format!("這輪送不出: {e}"));
+                if has_notify {
+                    notify_error = Some(format!("管理員通知目前送不出去: {e}"));
+                }
             }
         }
     }
-    serde_json::json!({ "changed": changed, "notes": notes })
+    serde_json::json!({ "changed": changed, "notes": notes, "notifyError": notify_error })
+}
+
+/// 管理員通知快速路 (2026-10-22 修復): 每 5 秒檢查一次待送通知, 有待送才開連線送出,
+/// 不跟 20 秒一輪的排程擠。舊版通知最壞要等滿 20 秒、再排在所有排程待發之後,
+/// 老吳真機體感「呼叫管理員有點慢、甚至沒回應」。
+fn run_notify_once() -> Value {
+    let has_notify = helper_api::get_admin_events().map(|v| v.get("pending").and_then(|p| p.as_array()).map(|a| !a.is_empty()).unwrap_or(false)).unwrap_or(false);
+    if !has_notify {
+        return serde_json::json!({ "changed": false, "notes": [], "notifyError": null });
+    }
+    match pagesend::PageChannel::connect() {
+        Ok(mut ch) => {
+            let (sent_any, err) = send_admin_events(&mut ch);
+            if sent_any {
+                serde_json::json!({ "changed": true, "notes": ["管理員通知已送出"], "notifyError": null })
+            } else {
+                let msg = err.unwrap_or_else(|| "管理員通知目前送不出去".to_string());
+                serde_json::json!({ "changed": true, "notes": [format!("管理員通知送出失敗: {msg}")], "notifyError": msg })
+            }
+        }
+        Err(e) => {
+            let msg = format!("管理員通知目前送不出去: {e}");
+            serde_json::json!({ "changed": false, "notes": [msg.clone()], "notifyError": msg })
+        }
+    }
 }
 
 /// 本機時區對 UTC 的偏移秒數 (事件時間顯示用; 只在啟動時問一次作業系統)。
@@ -2007,6 +2124,12 @@ impl App {
         if self.busy.get("save").copied().unwrap_or(false) {
             return;
         }
+        // 存檔前檢查 (2026-10-22 修復): 「有人提到關鍵字」的規則沒填關鍵字 = 永遠不會
+        // 通知, 舊版靜靜存下去, 使用者以為有設好。直接擋下並講清楚哪一筆要補。
+        if self.form.notify_rules.iter().any(|r| r.enabled && r.kind == "keyword" && r.keyword.trim().is_empty()) {
+            self.form.save_msg = Some("有一筆「有人提到關鍵字」的通知還沒填關鍵字, 這一筆不會通知任何人。請先把關鍵字填好再儲存。".to_string());
+            return;
+        }
         self.busy.insert("save".into(), true);
         let body = self.collect_settings_body();
         let slot = self.save_slot.clone();
@@ -2049,6 +2172,12 @@ impl App {
         // 排程一輪的結果: 只記 log; 有異動就讓待發清單與通知紀錄在下一幀重讀
         if let Some(v) = self.send_tick_slot.lock().unwrap().take() {
             self.busy.insert("send_tick".into(), false);
+            // 管理員通知的送出狀態: 有白話原因就顯示在通知紀錄卡上, 送通了就清除
+            match v.get("notifyError") {
+                Some(Value::String(s)) => self.notify_last_error = Some(s.clone()),
+                Some(_) => self.notify_last_error = None,
+                None => {}
+            }
             if let Some(notes) = v.get("notes").and_then(|n| n.as_array()) {
                 for n in notes {
                     if let Some(s) = n.as_str() {
@@ -2398,19 +2527,27 @@ impl App {
                         });
                         ui.label(format!("今日已回答: {answered} 次"));
                         if let Some(scam) = bot.get("scam") {
+                            let scanned = scam.get("scannedToday").and_then(|v| v.as_u64()).unwrap_or(0);
                             let checked = scam.get("checkedToday").and_then(|v| v.as_u64()).unwrap_or(0);
                             let warned = scam.get("warnedToday").and_then(|v| v.as_u64()).unwrap_or(0);
-                            ui.label(format!("防詐騙: 今日檢查 {checked} 則、警告 {warned} 則"));
+                            ui.label(format!("防詐騙: 今日掃描 {scanned} 則訊息、送判讀 {checked} 則、警告 {warned} 則"));
                         }
                         // 訊息解密健康 (2026-10-21 第二段): 有解不開的訊息要老實點燈,
                         // 不讓「機器人已連線」的綠燈蓋住「其實讀不到訊息」(事故定案:
                         // 成員變動後鑰匙對不上, 訊息在核心解密失敗, 以前全綠看不出來)。
                         if let Some(dec) = bot.get("decrypt") {
                             if dec.get("state").and_then(|v| v.as_str()) == Some("failed") {
-                                let total = dec.get("totalFailed").and_then(|v| v.as_u64()).unwrap_or(0);
-                                ui.label(egui::RichText::new(format!("⚠ 有 {total} 則訊息我讀不到, 那些訊息我不會回覆:")).color(self.palette.bad));
-                                if let Some(issues) = dec.get("issues").and_then(|v| v.as_array()) {
-                                    for issue in issues {
+                                // 顯示分流 (2026-10-22 修復, 依真機診斷包定案): 「現在真的讀不到」
+                                // (blocking, 即時訊息也解不開) 與「只有舊世代歷史訊息解不開、
+                                // 目前收發正常」是兩回事 — 舊版混成一句「有 N 則讀不到」把整群
+                                // 判死, 還連帶擋下發送。分開講, 只有 blocking 才給處置。
+                                let issues = dec.get("issues").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                                let blocking: Vec<&Value> = issues.iter().filter(|i| i.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false)).collect();
+                                let history_only: Vec<&Value> = issues.iter().filter(|i| !i.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false)).collect();
+                                if !blocking.is_empty() {
+                                    let total: u64 = blocking.iter().map(|i| i.get("failed").and_then(|v| v.as_u64()).unwrap_or(0)).sum();
+                                    ui.label(egui::RichText::new(format!("⚠ 有 {total} 則訊息我現在讀不到, 那些訊息我不會回覆:")).color(self.palette.bad));
+                                    for issue in &blocking {
                                         let name = issue.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                         let failed = issue.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
                                         let senders: Vec<&str> = issue.get("senders").and_then(|v| v.as_array())
@@ -2419,8 +2556,16 @@ impl App {
                                         let who = if senders.is_empty() { String::new() } else { format!("({} 的)", senders.join("、")) };
                                         ui.label(format!("・在『{}』有 {} 則{}訊息讀不到", if name.is_empty() { "未命名群組" } else { name }, failed, who));
                                     }
+                                    ui.label("處置: 先到「LINE 登入」頁登出後重新登入 (讓鑰匙重新對齊); 若還是讀不到, 下一步是把機器人移出該群組、再重新邀請它加入 (重新入群會讓 LINE 把目前的鑰匙重新發一份給它)。");
                                 }
-                                ui.label("處置: 先到「LINE 登入」頁登出後重新登入 (讓鑰匙重新對齊); 若還是讀不到, 下一步是把機器人移出該群組、再重新邀請它加入 (重新入群會讓 LINE 把目前的鑰匙重新發一份給它)。");
+                                for issue in &history_only {
+                                    let name = issue.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let failed = issue.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    ui.label(egui::RichText::new(format!(
+                                        "『{}』目前收發正常; 有 {} 則舊訊息因為先前的鑰匙事故無法讀取 (不影響現在的訊息, 那些舊訊息我不會回覆)。",
+                                        if name.is_empty() { "未命名群組" } else { name }, failed
+                                    )).color(self.palette.warn));
+                                }
                             }
                             // 訊息漏接 (同批追加): 訊息有進群組歷史、卻完全沒有送到機器人這裡 —
                             // 最壞情形是整個群組都收不到 (事故擴大時的現況), 文案要講到這個程度,
@@ -2446,9 +2591,17 @@ impl App {
                     }
                 });
             });
+            if matches!(self.engine_snap.state, EngineState::NotStarted) {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("目前尚未啟用: 還沒有登入 LINE, 不會回應群組訊息。按下面的「登入並啟用」開始; 想讓它以後打開就自動登入, 到「程式設定」打開『開啟程式時自動登入並啟用服務』。").color(self.palette.warn));
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("重新啟動引擎").clicked() {
+                if matches!(self.engine_snap.state, EngineState::NotStarted) {
+                    if primary_btn(ui, self.palette, "登入並啟用").clicked() {
+                        self.start_engine();
+                    }
+                } else if ui.button("重新啟動引擎").clicked() {
                     self.restart_engine();
                 }
                 let repairing = self.busy.get("repair").copied().unwrap_or(false);
@@ -2469,6 +2622,10 @@ impl App {
             if let EngineState::Failed(msg) = &self.engine_snap.state {
                 ui.label(egui::RichText::new(format!("引擎異常: {msg}")).color(self.palette.bad));
             }
+            #[cfg(windows)]
+            if self.tray.is_none() {
+                ui.label(egui::RichText::new("右下角系統匣圖示建立失敗 (原因已寫進程式紀錄): 要結束程式請用「程式設定」頁的『結束服務並關閉程式』, 並請把這行訊息回報給維護人員。").color(self.palette.warn));
+            }
         });
         ui.add_space(10.0);
         card(ui, self.palette, "使用方式", |ui| {
@@ -2483,6 +2640,19 @@ impl App {
         ui.heading("LINE 登入");
         ui.add_space(8.0);
         let login = self.login_snapshot();
+        if matches!(self.engine_snap.state, EngineState::NotStarted) {
+            card(ui, self.palette, "尚未啟用", |ui| {
+                ui.label("程式還沒有啟用: 目前沒有登入 LINE, 也不會回應群組訊息。");
+                ui.label("按下面的按鈕就會開始登入 (之前登入過的話會用保存的登入狀態自動恢復, 不用再掃一次 QR 碼)。");
+                ui.add_space(6.0);
+                if ui.button("登入並啟用").clicked() {
+                    self.start_engine();
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("想讓它每次打開程式就自動登入, 到「程式設定」打開『開啟程式時自動登入並啟用服務』。").weak());
+            });
+            return;
+        }
         if self.engine_unavailable() {
             card(ui, self.palette, "引擎尚未就緒", |ui| {
                 ui.label(format!("目前引擎狀態: {}", self.engine_snap.label));
@@ -2625,6 +2795,7 @@ impl App {
                 let answered = status.get("answeredToday").and_then(|v| v.as_u64()).unwrap_or(0);
                 let limit = status.get("dailyLimit").and_then(|v| v.as_u64()).unwrap_or(0);
                 let scam = status.get("scam").cloned().unwrap_or(Value::Null);
+                let scanned = scam.get("scannedToday").and_then(|v| v.as_u64()).unwrap_or(0);
                 let checked = scam.get("checkedToday").and_then(|v| v.as_u64()).unwrap_or(0);
                 let warned = scam.get("warnedToday").and_then(|v| v.as_u64()).unwrap_or(0);
                 ui.horizontal(|ui| {
@@ -2635,7 +2806,7 @@ impl App {
                     ui.separator();
                     ui.label(format!("今日已回答 {answered} / 上限 {limit}"));
                     ui.separator();
-                    ui.label(format!("防詐騙: 檢查 {checked}、警告 {warned}"));
+                    ui.label(format!("防詐騙: 掃描 {scanned}、判讀 {checked}、警告 {warned}"));
                 });
             } else if self.activity_msg.is_none() {
                 ui.label("正在讀取聊天情況…");
@@ -3066,7 +3237,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("群組 ID:");
                     let mut chat_id = self.page_msg.get("chatid").cloned().unwrap_or_default();
-                    if ui.add(egui::TextEdit::singleline(&mut chat_id).desired_width(320.0).hint_text("c 開頭共 33 碼")).changed() {
+                    if ui.add(egui::TextEdit::singleline(&mut chat_id).desired_width(320.0).hint_text("共 33 碼 (群組 c 開頭、社群 m 開頭)")).changed() {
                         self.page_msg.insert("chatid".into(), chat_id);
                     }
                 });
@@ -3195,7 +3366,7 @@ impl App {
         });
         ui.add_space(10.0);
         card(ui, self.palette, "通知事件清單 (發生什麼事要通知管理員)", |ui| {
-            ui.label(egui::RichText::new("一筆一筆設定: 發生哪種事、要通知哪幾位管理員。這裡的開關和關鍵字改完按下面「儲存通知設定」才算數。同一種事 10 分鐘內只通知一次, 一天最多 20 次, 超過的會合併寫進紀錄, 不會一直 @ 人。").weak());
+            ui.label(egui::RichText::new("一筆一筆設定: 發生哪種事、要通知哪幾位管理員。這裡的開關和關鍵字改完按下面「儲存通知設定」才算數。同一種事 10 分鐘內先通知第一筆, 其他先合併起來、不會一直 @ 人; 過了 10 分鐘會再補送一則彙總通知, 不會漏掉。一天最多通知 20 次。").weak());
             let admins = self.form.notify_admins.clone();
             let mut remove_idx: Option<usize> = None;
             for (idx, rule) in self.form.notify_rules.iter_mut().enumerate() {
@@ -3213,6 +3384,13 @@ impl App {
                         ui.label("關鍵字:");
                         ui.add(egui::TextEdit::singleline(&mut rule.keyword).desired_width(200.0).hint_text("例: 報價, 客訴"));
                     });
+                    // 目前關鍵字用白話再顯示一次 (2026-10-22 修復): 只看輸入框容易看漏/看不清
+                    // 到底有沒有填、填的是什麼; 空的時候直接警告這筆不會通知。
+                    if rule.keyword.trim().is_empty() {
+                        ui.label(egui::RichText::new("還沒填關鍵字: 這一筆不會通知任何人, 請先填關鍵字。").color(self.palette.bad));
+                    } else {
+                        ui.label(egui::RichText::new(format!("目前關鍵字: 『{}』— 群組訊息裡出現這個詞, 就會通知管理員。", rule.keyword.trim())).weak());
+                    }
                 }
                 if admins.is_empty() {
                     ui.label(egui::RichText::new("尚無管理員名單, 這一筆先存著, 名單設定好後在這裡勾要通知誰。").weak());
@@ -3257,15 +3435,21 @@ impl App {
                     self.spawn_admin_events_load(&ctx);
                 }
             });
+            if let Some(err) = &self.notify_last_error {
+                ui.label(egui::RichText::new(err.clone()).color(self.palette.bad));
+                ui.add_space(4.0);
+            }
             if self.admin_events.is_empty() {
                 ui.label(egui::RichText::new("還沒有通知紀錄。有設定通知事件、而且真的發生事情時, 會記在這裡 (有沒有真的送出去、為什麼改用寫名字, 都會註明)。").weak());
             }
             for ev in self.admin_events.iter().take(15) {
                 let label = ev.get("kindLabel").and_then(|v| v.as_str()).unwrap_or("通知");
+                let label = if ev.get("isSummary").and_then(|v| v.as_bool()).unwrap_or(false) { format!("彙總補送・{label}") } else { label.to_string() };
                 let chat = ev.get("chatName").and_then(|v| v.as_str()).unwrap_or("");
                 let ts = ev.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
                 let when = fmt_event_time(ts);
                 let merged = ev.get("mergedCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                let merged_total = ev.get("mergedTotal").and_then(|v| v.as_u64()).unwrap_or(0);
                 let sent_ok = ev.get("sentOk");
                 let sent_state = match sent_ok.and_then(|v| v.as_bool()) {
                     Some(true) => "已通知管理員".to_string(),
@@ -3278,7 +3462,14 @@ impl App {
                         }
                     }
                 };
-                let merged_note = if merged > 0 { format!(" (同類事件另合併了 {merged} 次)") } else { String::new() };
+                // 合併狀態要分清 (2026-10-22 修復): 還有幾則合併中 (稍後補送彙總) / 已補送完
+                let merged_note = if merged > 0 {
+                    format!(" (同類事件另有 {merged} 則合併中, 稍後會補送一則彙總通知)")
+                } else if merged_total > 0 {
+                    format!(" (同類事件曾合併 {merged_total} 則, 已補送彙總通知)")
+                } else {
+                    String::new()
+                };
                 ui.label(format!("{when}・{label}・『{chat}』— {sent_state}{merged_note}"));
                 let note = ev.get("note").and_then(|v| v.as_str()).unwrap_or("");
                 if !note.is_empty() {
@@ -3366,7 +3557,7 @@ impl App {
         let slot = self.outbox_action_slot.clone();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
-            let r = helper_api::pause_outbox(&id, paused, if paused { "已暫停" } else { "已恢復, 照排程繼續" });
+            let r = helper_api::pause_outbox(&id, paused, if paused { "已暫停" } else { "已恢復, 照排程繼續" }, if paused { "manual" } else { "" });
             *slot.lock().unwrap() = Some(match r {
                 Ok(v) => v,
                 Err(e) => serde_json::json!({ "ok": false, "message": e }),
@@ -3410,13 +3601,31 @@ impl App {
     }
 
     /// 排程計時 (第三階段): 每 20 秒一輪。到期判斷 (含三項護欄) 與送出都在背景執行緒做,
-    /// 結果進 send_tick_slot; 同一輪順帶把待送的管理員通知送掉 (第四階段)。
+    /// 結果進 send_tick_slot。
+    /// 管理員通知走快速路 (2026-10-22 修復): 每 5 秒檢查一次, 有待送就先送 — 不跟排程
+    /// 擠同一輪。兩條路共用 busy 旗標與結果 slot, 同一時間只跑一條 (連線只開一條)。
     fn send_engine_tick(&mut self, ctx: &egui::Context) {
-        let due = self.last_send_tick.map(|t| t.elapsed() > Duration::from_secs(20)).unwrap_or(true);
-        if !due || self.busy.get("send_tick").copied().unwrap_or(false) {
+        if self.busy.get("send_tick").copied().unwrap_or(false) {
             return;
         }
         if !matches!(self.engine_snap.state, EngineState::Running) {
+            return;
+        }
+        let notify_due = self.last_notify_tick.map(|t| t.elapsed() > Duration::from_secs(5)).unwrap_or(true);
+        if notify_due {
+            self.last_notify_tick = Some(std::time::Instant::now());
+            self.busy.insert("send_tick".into(), true);
+            let slot = self.send_tick_slot.clone();
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let summary = run_notify_once();
+                *slot.lock().unwrap() = Some(summary);
+                ctx2.request_repaint();
+            });
+            return;
+        }
+        let due = self.last_send_tick.map(|t| t.elapsed() > Duration::from_secs(20)).unwrap_or(true);
+        if !due {
             return;
         }
         self.last_send_tick = Some(std::time::Instant::now());
@@ -4090,7 +4299,7 @@ impl App {
                 let current = platform::autostart_get();
                 let mut enabled = current.is_some();
                 let before = enabled;
-                ui.checkbox(&mut enabled, "隨 Windows 啟動並自動登入");
+                ui.checkbox(&mut enabled, "隨 Windows 開機自動啟動");
                 if enabled != before {
                     if enabled {
                         if let Ok(exe) = std::env::current_exe() {
@@ -4112,7 +4321,7 @@ impl App {
                         }
                     }
                 }
-                ui.label("勾選後, 每次登入 Windows, AI寶 會自己在右下角系統匣上線並自動登入 LINE, 不用你動手。取消勾選就完全移除, 不留殘留。");
+                ui.label("勾選後, 每次登入 Windows, AI寶 會自己打開, 縮在右下角系統匣待命。這個開關只負責把程式叫起來; 要不要接著自動登入 LINE, 由下面那個開關決定, 兩個互不影響。取消勾選就完全移除, 不留殘留。");
                 if let Some(cur) = &current {
                     ui.label(egui::RichText::new(format!("目前登錄: {cur}")).size(12.0).weak());
                 }
@@ -4124,6 +4333,19 @@ impl App {
             {
                 ui.label("自啟動設定只在 Windows 版提供。");
             }
+            ui.add_space(6.0);
+            // 自動登入開關 (2026-10-22 新增, 與開機自啟動互相獨立): 預設關閉。
+            // 打開的當下若引擎還沒啟動, 直接啟用 (馬上生效, 不用重開程式);
+            // 關閉只影響「下次打開程式」: 下次會停在未登入, 等使用者按「登入並啟用」。
+            let mut auto_login = self.shell_settings.auto_login;
+            if ui.checkbox(&mut auto_login, "開啟程式時自動登入並啟用服務").changed() {
+                self.shell_settings.auto_login = auto_login;
+                self.shell_settings.save();
+                if auto_login && matches!(self.engine_snap.state, EngineState::NotStarted) {
+                    self.start_engine();
+                }
+            }
+            ui.label("不勾選 (出廠預設): 每次打開 AI寶, 它會先停在未登入的狀態, 要你按「登入並啟用」才會開始服務。勾選: 打開就自動登入、直接上工。跟上面「隨 Windows 開機自動啟動」是兩個獨立開關: 可以只開機自啟動、不自動登入 (開機後在系統匣待命, 等你按登入), 也可以兩個都開或都關。");
             ui.add_space(6.0);
             let mut show = self.shell_settings.show_window_on_start;
             if ui.checkbox(&mut show, "雙擊啟動時直接顯示主視窗 (取消勾選則直接縮到系統匣)").changed() {
@@ -4230,8 +4452,21 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_image_rgba;
+    use super::{decode_image_rgba, icon_rgba};
     use std::io::Cursor;
+
+    #[test]
+    fn brand_icon_decodes_for_taskbar_and_tray() {
+        // 問題 1 (2026-10-22): 真機回報「下方工具列 icon 沒顯示」。內嵌品牌圖本身必須
+        // 解得開、且能產出工作列 (64) 與系統匣 (32) 兩種預縮尺寸 — 先證明圖與縮放沒壞,
+        // 真機若仍沒顯示, 問題就在建立流程 (已改為失敗必記 log + 總覽提示)。
+        for size in [32u32, 64] {
+            let (rgba, w, h) = icon_rgba(size).expect("品牌圖示應可解碼並縮放");
+            assert_eq!((w, h), (size, size));
+            assert_eq!(rgba.len(), (size * size * 4) as usize);
+            assert!(rgba.chunks_exact(4).any(|px| px[3] > 0), "圖示不應整張透明");
+        }
+    }
 
     fn encode(img: &image::DynamicImage, format: image::ImageFormat) -> Vec<u8> {
         let mut buf = Vec::new();

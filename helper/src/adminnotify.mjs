@@ -108,25 +108,36 @@ export class AdminEventStore {
     writeFileSync(this.path, JSON.stringify({ version: 1, events: this.events.slice(0, 500) }, null, 2), { mode: 0o600 });
     this.events = this.events.slice(0, 500);
   }
+  // 今日已用掉的通知額度: 只計「決定通知且沒有送失敗」的事件。
+  // 為什麼排除送失敗 (2026-10-22 修復): 舊版在 record 當下就標 notified 並計入上限,
+  // 送出鏈一壞, 20 筆「從沒送達」的通知就把整天額度吃光, 後面的事件全被靜默擋下。
   todayNotifyCount(ts = this.now()) {
     const key = dayKey(ts);
-    return this.events.filter((e) => e.notified && dayKey(e.ts) === key).reduce((n, e) => n + 1, 0);
+    return this.events.filter((e) => e.notified && e.sentOk !== false && dayKey(e.ts) === key).reduce((n, e) => n + 1, 0);
   }
   // 記一筆事件並決定要不要真的通知。message 是要送進群組的通知本文 (白話, 由事件來源組好);
   // 殼端送出時在本文前面加上 @管理員 的部分。回傳 { action: 'notify'|'record', reason, event }
   record({ kind, chatId, chatName = "", detail = "", targets = [], message = "" }) {
     if (!NOTIFY_EVENT_KINDS[kind]) return { action: "record", reason: "unknown-kind", event: null };
     const ts = this.now();
-    const recent = this.events.find((e) => e.notified && e.kind === kind && e.chatId === chatId && ts - e.ts < this.throttleMs);
+    // 節流錨點: 同種類+同聊天室、節流窗內、且「沒有送失敗」的已通知事件。
+    // 送失敗的事件不當錨點 (2026-10-22 修復): 否則第一筆 @ 失敗後, 窗內所有同類事件
+    // 都被合併進一筆從沒送達的通知, 使用者體感就是「只有第一筆會、後面全沒回應」。
+    const recent = this.events.find((e) => e.notified && e.sentOk !== false && e.kind === kind && e.chatId === chatId && ts - e.ts < this.throttleMs);
     if (recent) {
       recent.mergedCount = (recent.mergedCount ?? 0) + 1;
       recent.lastMergedAt = ts;
+      // 合併的內容要留明細, 節流窗過後 collectDueSummaries 會補送一則彙總 (不再石沉大海)
+      recent.mergedItems = Array.isArray(recent.mergedItems) ? recent.mergedItems : [];
+      recent.mergedItems.push({ ts, detail });
+      if (recent.mergedItems.length > 20) recent.mergedItems.splice(0, recent.mergedItems.length - 20);
       this.save();
       return { action: "record", reason: "throttled", event: recent };
     }
     const event = {
       id: randomUUID(), ts, kind, kindLabel: NOTIFY_EVENT_KINDS[kind].label,
-      chatId, chatName, detail, targets, message, notified: false, mergedCount: 0, note: "",
+      chatId, chatName, detail, targets, message, notified: false, mergedCount: 0, mergedItems: [], mergedTotal: 0,
+      isSummary: false, summaryOf: "", summarySentAt: null, note: "",
       sentAt: null, sentOk: null,
     };
     if (this.todayNotifyCount(ts) >= this.dailyCap) {
@@ -139,6 +150,48 @@ export class AdminEventStore {
     this.events.unshift(event);
     this.save();
     return { action: "notify", reason: "", event };
+  }
+  // 節流窗過後, 把「被合併掉」的事件補送一則彙總通知 (2026-10-22 修復, 老吳真機回報
+  // 「通知好像只有第一筆會」的主因: 舊版合併後永遠不補送)。
+  // 條件: 原事件已實際嘗試送出 (sentAt 有值)、還有未補的合併筆數、且最後一筆合併
+  // 之後已靜默滿一個節流窗 (避免事件還在連發時急著彙總)。彙總事件走一般 pending 路徑
+  // 由殼端送出; 今日額度已滿時先不產生, 合併明細保留, 隔日再補。
+  // 呼叫時機: 每次有人來領 pending (server 端點 / Ubuntu sendengine) 先呼叫一次。
+  collectDueSummaries() {
+    const ts = this.now();
+    const made = [];
+    for (const e of this.events) {
+      if (e.isSummary || !e.notified || e.sentAt == null) continue;
+      const pending = e.mergedCount ?? 0;
+      if (pending <= 0) continue;
+      const quietSince = e.lastMergedAt ?? e.ts;
+      if (ts - quietSince < this.throttleMs) continue;
+      if (this.todayNotifyCount(ts) >= this.dailyCap) break;
+      const items = Array.isArray(e.mergedItems) ? e.mergedItems : [];
+      const p2 = (n) => String(n).padStart(2, "0");
+      const fmt = (t) => { const d = new Date(t); return `${p2(d.getHours())}:${p2(d.getMinutes())}`; };
+      const firstT = items.length ? fmt(items[0].ts) : fmt(e.ts);
+      const lastT = items.length ? fmt(items[items.length - 1].ts) : firstT;
+      const samples = items.slice(-3).map((i) => i.detail).filter(Boolean);
+      const where = e.chatName ? `『${e.chatName}』` : "群組";
+      const detail = `彙總補送: 先前同類事件另有 ${pending} 則被合併（${firstT}–${lastT}）`;
+      const message = `${e.kindLabel}彙總：${where}剛才同類事件另外還有 ${pending} 則（${firstT} 到 ${lastT}），第一筆通知時先合併，現在補上彙總。${samples.length ? `內容包括：${samples.join("；")}` : ""}`;
+      const summary = {
+        id: randomUUID(), ts, kind: e.kind, kindLabel: e.kindLabel,
+        chatId: e.chatId, chatName: e.chatName, detail, targets: e.targets ?? [], message,
+        notified: true, mergedCount: 0, mergedItems: [], mergedTotal: 0,
+        isSummary: true, summaryOf: e.id, summarySentAt: null, note: "",
+        sentAt: null, sentOk: null,
+      };
+      e.mergedTotal = (e.mergedTotal ?? 0) + pending;
+      e.mergedCount = 0;
+      e.mergedItems = [];
+      e.summarySentAt = ts;
+      this.events.unshift(summary);
+      made.push(summary);
+    }
+    if (made.length) this.save();
+    return made;
   }
   // 殼端實際送出後把結果寫回來: 送成功/失敗都註明, 失敗原因只記白話分類 (見殼端 pagesend 的錯誤對照)。
   markSent(id, ok, note = "") {
