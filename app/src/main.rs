@@ -14,6 +14,7 @@ mod shell;
 mod theme;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,6 +38,43 @@ const AVATAR_BYTES: &[u8] = include_bytes!("../../helper/assets/ai-bao-avatar.pn
 const ICON_BYTES: &[u8] = include_bytes!("../../helper/assets/ai-bao-icon.png");
 
 type Slot<T> = Arc<Mutex<Option<T>>>;
+
+/// 引擎操作單一進行鎖 (2026-10-22 實機循環事故修復): 重新啟動引擎/一鍵修復/結束序列
+/// 這類會 stop+start 引擎的操作, 同一時間只准一個在進行; 後到的要求直接略過並記 log,
+/// 不 spawn 執行緒排隊。舊版每次呼叫 restart_engine 都 spawn 一條執行緒去等引擎 mutex,
+/// 重複觸發 (連點、事件重複投遞) 會被序列化成一長串 stop→start 循環: 引擎每被停一次,
+/// 登入頁的 QR 就被清掉一次, 使用者永遠登入不了, 而且全程沒有任何來源紀錄可查。
+/// 現在每個入口都帶來源標籤寫進 log, 事故時看 shell.log 就知道是誰在什麼時候觸發。
+#[derive(Clone)]
+struct EngineOpGate {
+    busy: Arc<AtomicBool>,
+}
+
+impl EngineOpGate {
+    fn new() -> Self {
+        Self { busy: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// 嘗試取得進行權: 已有操作進行中就記一筆「略過」並回 false (不排隊、不重入)。
+    fn try_begin(&self, what: &str, caller: &str) -> bool {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            shell::log_line(&format!("{what}要求被略過 (來源: {caller}): 已有引擎操作進行中, 不排隊、不重入"));
+            false
+        } else {
+            shell::log_line(&format!("{what}開始 (來源: {caller})"));
+            true
+        }
+    }
+
+    fn end(&self, what: &str) {
+        self.busy.store(false, Ordering::SeqCst);
+        shell::log_line(&format!("{what}結束"));
+    }
+
+    fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum AppSignal {
@@ -185,6 +223,8 @@ impl Default for EngineState {
 
 struct App {
     engine: Arc<Mutex<EngineManager>>,
+    /// 引擎操作單一進行鎖: 重啟/修復/結束共用, 防重複觸發排隊成 stop→start 循環。
+    engine_gate: EngineOpGate,
     engine_snap: EngineSnap,
     login: SharedLogin,
     login_tx: Sender<WsCommand>,
@@ -260,6 +300,8 @@ struct App {
     page_msg: HashMap<String, String>,
     logs_slot: Slot<Value>,
     logs_text: String,
+    /// 紀錄頁進頁自動讀取只嘗試一次 (比照 wl_attempted 的教訓: 不每幀重打)。
+    logs_attempted: bool,
     diag_slot: Slot<String>,
     repair_slot: Slot<Vec<String>>,
     repair_lines: Vec<String>,
@@ -718,6 +760,7 @@ impl App {
         let tray = build_tray();
         let mut app = Self {
             engine,
+            engine_gate: EngineOpGate::new(),
             engine_snap: EngineSnap::default(),
             login,
             login_tx,
@@ -782,6 +825,7 @@ impl App {
             page_msg: HashMap::new(),
             logs_slot: Arc::new(Mutex::new(None)),
             logs_text: String::new(),
+            logs_attempted: false,
             diag_slot: Arc::new(Mutex::new(None)),
             repair_slot: Arc::new(Mutex::new(None)),
             repair_lines: Vec::new(),
@@ -833,14 +877,18 @@ impl App {
 
     /// 開始結束序列: 背景執行緒執行 engine.stop() (訊號優雅結束→強制清除→逐埠驗證), 完成後主執行緒依結果處理;
     /// 停不下來 (BlockedForeign / Residual) 就不關窗, 改顯示白話說明與殘留明細 (不假裝已結束)。
-    fn begin_quit(&mut self, ctx: &egui::Context) {
+    fn begin_quit(&mut self, ctx: &egui::Context, caller: &str) {
         if self.quitting {
             return;
         }
+        // 結束序列不被進行鎖擋下 (使用者要結束就該能結束), 但要留下來源紀錄;
+        // 若剛好有重啟/修復進行中, log 會寫明, 本執行緒接著等引擎 mutex 依序處理。
+        let _ = self.engine_gate.try_begin("結束序列", caller);
         self.quitting = true;
         self.confirm_quit = false;
         self.show_window(ctx);
         let engine = self.engine.clone();
+        let gate = self.engine_gate.clone();
         let slot = self.quit_outcome.clone();
         std::thread::spawn(move || {
             let outcome = {
@@ -849,11 +897,19 @@ impl App {
             };
             shell::log_line(&format!("結束序列完成: {outcome:?}"));
             *slot.lock().unwrap() = Some(outcome);
+            gate.end("結束序列");
         });
     }
 
-    fn restart_engine(&mut self) {
+    fn restart_engine(&mut self, caller: &str) {
+        // 單一進行鎖: 已有引擎操作進行中就直接略過這次要求 (不 spawn 執行緒排隊)。
+        // 舊版每次呼叫都 spawn 一條執行緒等 mutex, 重複觸發會被序列化成一長串
+        // stop→start 循環 (2026-10-22 實機事故: 19 次循環、QR 每次出現就被砍掉)。
+        if !self.engine_gate.try_begin("重新啟動引擎", caller) {
+            return;
+        }
         let engine = self.engine.clone();
+        let gate = self.engine_gate.clone();
         std::thread::spawn(move || {
             let mut mgr = engine.lock().unwrap();
             let _ = mgr.stop();
@@ -861,19 +917,27 @@ impl App {
                 shell::log_line(&format!("重新啟動引擎失敗: {e}"));
                 mgr.state = EngineState::Failed(e);
             }
+            drop(mgr);
+            gate.end("重新啟動引擎");
         });
     }
 
     /// 「登入並啟用」: 使用者主動按下才啟動引擎 (自動登入關閉時的入口)。
     /// 只 start 不 stop: start 本身對已在跑的引擎是無動作, 不會打斷現有連線。
-    fn start_engine(&mut self) {
+    fn start_engine(&mut self, caller: &str) {
+        if !self.engine_gate.try_begin("啟用引擎", caller) {
+            return;
+        }
         let engine = self.engine.clone();
+        let gate = self.engine_gate.clone();
         std::thread::spawn(move || {
             let mut mgr = engine.lock().unwrap();
             if let Err(e) = mgr.start() {
                 shell::log_line(&format!("啟用引擎失敗: {e}"));
                 mgr.state = EngineState::Failed(e);
             }
+            drop(mgr);
+            gate.end("啟用引擎");
         });
     }
 
@@ -887,15 +951,36 @@ impl App {
         if self.busy.get("repair").copied().unwrap_or(false) {
             return;
         }
+        // 與重啟/結束共用單一進行鎖: 已有引擎操作進行中就不另起修復 (不排隊、不重入)。
+        if !self.engine_gate.try_begin("一鍵修復", "總覽頁「一鍵修復」按鈕") {
+            self.repair_lines = vec!["引擎正在進行其他操作 (重新啟動或結束中), 請等它完成後再按一次一鍵修復".to_string()];
+            return;
+        }
         self.busy.insert("repair".into(), true);
         self.repair_lines = vec!["修復中… 正在檢查服務狀態".to_string()];
         let slot = self.repair_slot.clone();
         let engine = self.engine.clone();
+        let gate = self.engine_gate.clone();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
             let mut lines: Vec<String> = Vec::new();
             let mut restarted = false;
-            let state0 = engine.lock().unwrap().state.clone();
+            let mut state0 = engine.lock().unwrap().state.clone();
+            // 引擎還在啟動中就先等它定案再判斷 (最多 30 秒): 舊版一讀到 Starting 就回
+            // 「等它完成」, 但引擎可能隨即被停掉/失敗, 結論與實況脫節 (2026-10-22 實機:
+            // 修復說等啟動完成, 引擎 1 秒後就被結束序列停掉, 使用者以為修復沒用)。
+            if matches!(state0, EngineState::Starting) {
+                for _ in 0..15 {
+                    std::thread::sleep(Duration::from_secs(2));
+                    state0 = engine.lock().unwrap().state.clone();
+                    if !matches!(state0, EngineState::Starting) {
+                        break;
+                    }
+                }
+                if matches!(state0, EngineState::Starting) {
+                    lines.push("檢查發現: 引擎啟動超過 30 秒還沒完成, 重新啟動它".to_string());
+                }
+            }
             let helper_ok = helper_api::ping_helper();
             let need_restart = match state0 {
                 EngineState::Running | EngineState::ExternalRunning => {
@@ -908,8 +993,8 @@ impl App {
                     }
                 }
                 EngineState::Starting => {
-                    lines.push("檢查發現: 引擎還在啟動中, 先等它完成".to_string());
-                    false
+                    // 走到這裡代表已等了 30 秒仍未就緒 (等待迴圈已記下卡住的那行), 直接重啟。
+                    true
                 }
                 EngineState::Failed(_) => {
                     lines.push("檢查發現: 引擎處於異常停止狀態".to_string());
@@ -962,6 +1047,7 @@ impl App {
                     lines.push("服務還是沒有回應: 請把 AI寶 完全關閉後重新開啟一次; 若還是不行, 請到「紀錄」頁匯出診斷包給維護人員".to_string());
                 }
             } else if matches!(state0, EngineState::Starting) {
+                // 已在修復開頭等過 30 秒; 走到這裡是等待期間狀態離開又回到啟動中的罕見情形。
                 lines.push("引擎還在啟動, 請等左下角變成「引擎: 執行中」再到群組測試".to_string());
             }
             // 訊息解密檢查 (2026-10-21 第二段): 引擎與連線都正常, 不代表讀得到訊息 —
@@ -991,6 +1077,7 @@ impl App {
             }
             shell::log_line(&format!("一鍵修復完成: {}", lines.join(" / ")));
             *slot.lock().unwrap() = Some(lines);
+            gate.end("一鍵修復");
             ctx2.request_repaint();
         });
     }
@@ -1613,11 +1700,15 @@ impl eframe::App for App {
         // 第二實例/系統匣喚醒與結束訊號
         while let Ok(sig) = self.signals.try_recv() {
             match sig {
-                AppSignal::ShowWindow => self.show_window(ctx),
+                AppSignal::ShowWindow => {
+                    shell::log_line("收到第二實例通知: 顯示主視窗");
+                    self.show_window(ctx);
+                }
                 AppSignal::QuitApp => {
                     // --quit 是明確指令 (自動化/支援用), 直接進結束序列, 不再跳確認框;
                     // 介面上的結束按鈕 (視窗/系統匣) 仍一律先跳確認框 (規格書 v3 第 7 節)。
-                    self.begin_quit(ctx);
+                    shell::log_line("收到第二實例通知: 結束指令 (--quit)");
+                    self.begin_quit(ctx, "第二實例 --quit 指令");
                 }
             }
         }
@@ -1782,7 +1873,7 @@ impl eframe::App for App {
                             .button(egui::RichText::new("結束服務並關閉程式").color(self.palette.bad).strong())
                             .clicked()
                         {
-                            self.begin_quit(ctx);
+                            self.begin_quit(ctx, "結束確認框按鈕");
                         }
                     });
                 });
@@ -1874,12 +1965,20 @@ impl App {
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
                 if let Some(tray) = &self.tray {
                     if ev.id == tray.open_id {
+                        shell::log_line("系統匣選單事件: 開啟主視窗");
                         self.show_window(ctx);
                     } else if ev.id == tray.restart_id {
-                        self.restart_engine();
+                        shell::log_line("系統匣選單事件: 重新啟動引擎");
+                        self.restart_engine("系統匣選單「重新啟動引擎」");
                     } else if ev.id == tray.quit_id {
+                        shell::log_line("系統匣選單事件: 結束服務並關閉程式 (跳確認框)");
                         self.show_window(ctx);
                         self.confirm_quit = true;
+                    } else {
+                        // 未匹配的選單事件也要留紀錄: 2026-10-22 循環事故時無法分辨
+                        // 觸發源是按鈕、系統匣還是事件重複投遞, 就是因為全程沒有這行。
+                        let unmatched_id = ev.id.clone();
+                        shell::log_line(&format!("系統匣選單事件: 未匹配的項目 (id={unmatched_id:?})"));
                     }
                 }
             }
@@ -2325,10 +2424,16 @@ impl App {
             let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("完成").to_string();
             self.page_msg.insert("reindex".into(), msg);
         }
-        // Log
+        // Log: 讀不到內容時顯示白話說明, 絕不靜默空白 (2026-10-22 事故修復:
+        // 舊版失敗時 slot 是 {}, 這裡就把 logs_text 設成空字串, 畫面一片空白)。
         if let Some(v) = self.logs_slot.lock().unwrap().take() {
             self.busy.insert("logs".into(), false);
-            self.logs_text = v.get("tail").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let tail = v.get("tail").and_then(|t| t.as_str()).unwrap_or("");
+            self.logs_text = if tail.trim().is_empty() {
+                "這次沒有讀到紀錄內容。請按「重新讀取」再試一次; 如果一直讀不到, 請按「匯出診斷包」把檔案給維護人員看。".to_string()
+            } else {
+                tail.to_string()
+            };
             if let Some(dir) = v.get("dir").and_then(|d| d.as_str()) {
                 self.page_msg.insert("logdir".into(), dir.to_string());
             }
@@ -2599,10 +2704,10 @@ impl App {
             ui.horizontal(|ui| {
                 if matches!(self.engine_snap.state, EngineState::NotStarted) {
                     if primary_btn(ui, self.palette, "登入並啟用").clicked() {
-                        self.start_engine();
+                        self.start_engine("總覽頁「登入並啟用」按鈕");
                     }
                 } else if ui.button("重新啟動引擎").clicked() {
-                    self.restart_engine();
+                    self.restart_engine("總覽頁「重新啟動引擎」按鈕");
                 }
                 let repairing = self.busy.get("repair").copied().unwrap_or(false);
                 if primary_btn(ui, self.palette, if repairing { "修復中…" } else { "一鍵修復" }).clicked() && !repairing {
@@ -2646,7 +2751,7 @@ impl App {
                 ui.label("按下面的按鈕就會開始登入 (之前登入過的話會用保存的登入狀態自動恢復, 不用再掃一次 QR 碼)。");
                 ui.add_space(6.0);
                 if ui.button("登入並啟用").clicked() {
-                    self.start_engine();
+                    self.start_engine("登入頁「登入並啟用」按鈕");
                 }
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("想讓它每次打開程式就自動登入, 到「程式設定」打開『開啟程式時自動登入並啟用服務』。").weak());
@@ -2658,7 +2763,7 @@ impl App {
                 ui.label(format!("目前引擎狀態: {}", self.engine_snap.label));
                 ui.label("引擎還沒啟動完成, 登入功能要等引擎就緒才能使用。");
                 if ui.button("重新啟動引擎").clicked() {
-                    self.restart_engine();
+                    self.restart_engine("登入頁「重新啟動引擎」按鈕");
                 }
             });
             return;
@@ -2896,7 +3001,7 @@ impl App {
                 ui.label(format!("目前引擎狀態: {}", self.engine_snap.label));
                 ui.label("引擎還沒啟動完成, 聊天畫面要等引擎就緒才能使用。");
                 if ui.button("重新啟動引擎").clicked() {
-                    self.restart_engine();
+                    self.restart_engine("聊天室頁「重新啟動引擎」按鈕");
                 }
             });
             return;
@@ -4217,30 +4322,40 @@ impl App {
         });
     }
 
+    /// 紀錄頁讀取 (2026-10-22 事故修復): 直接讀本機紀錄檔, 不經服務 API —
+    /// 舊版引擎沒開時 get_logs 必然失敗, slot 回 {} 被消費成空字串, 畫面就是
+    /// 「讀取中」之後一片空白, 使用者最需要紀錄的時候反而看不到。
+    fn load_logs(&mut self, ctx: &egui::Context) {
+        if self.busy.get("logs").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("logs".into(), true);
+        self.logs_attempted = true;
+        let slot = self.logs_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let text = shell::read_logs_tail(500);
+            *slot.lock().unwrap() = Some(serde_json::json!({
+                "tail": text,
+                "dir": shell::logs_dir().to_string_lossy(),
+            }));
+            ctx2.request_repaint();
+        });
+    }
+
     fn page_logs(&mut self, ui: &mut egui::Ui) {
         ui.heading("紀錄");
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
+        // 進頁自動讀一次 (舊版要先按「重新讀取」才有動作, 沒按就永遠空白)。
+        if !self.logs_attempted {
+            self.load_logs(&ctx);
+        }
         card(ui, self.palette, "今日紀錄", |ui| {
             ui.horizontal(|ui| {
                 let busy = self.busy.get("logs").copied().unwrap_or(false);
                 if ui.button(if busy { "讀取中…" } else { "重新讀取" }).clicked() && !busy {
-                    self.busy.insert("logs".into(), true);
-                    let slot = self.logs_slot.clone();
-                    let ctx2 = ctx.clone();
-                    std::thread::spawn(move || {
-                        let mut merged = serde_json::json!({});
-                        if let Ok(v) = helper_api::get_logs() {
-                            merged = v;
-                        }
-                        if let Ok(d) = helper_api::get_log_dir() {
-                            if let Some(dir) = d.get("dir").cloned() {
-                                merged["dir"] = dir;
-                            }
-                        }
-                        *slot.lock().unwrap() = Some(merged);
-                        ctx2.request_repaint();
-                    });
+                    self.load_logs(&ctx);
                 }
                 if ui.button("開啟紀錄資料夾").clicked() {
                     let dir = shell::logs_dir();
@@ -4280,9 +4395,19 @@ impl App {
             ui.label(egui::RichText::new("紀錄不會包含 API Key、Token 或訊息全文 (機密會被遮罩)。出問題時按「匯出診斷包」把檔案給維護人員看即可。").weak());
             ui.add_space(6.0);
             egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                // 讀取中就明說讀取中, 不要讓使用者對著空白猜 (2026-10-22 事故修復)。
+                let shown = if self.logs_text.is_empty() {
+                    if self.busy.get("logs").copied().unwrap_or(false) {
+                        "讀取中…".to_string()
+                    } else {
+                        "尚無紀錄內容。".to_string()
+                    }
+                } else {
+                    self.logs_text.clone()
+                };
                 // 可選取複製: 用可選字 Label (舊作法是不可選的唯讀文字框, 使用者反應沒辦法複製 — 2026-10-20 實機)
                 ui.add(
-                    egui::Label::new(egui::RichText::new(self.logs_text.clone()).monospace())
+                    egui::Label::new(egui::RichText::new(shown).monospace())
                         .selectable(true),
                 );
             });
@@ -4342,7 +4467,7 @@ impl App {
                 self.shell_settings.auto_login = auto_login;
                 self.shell_settings.save();
                 if auto_login && matches!(self.engine_snap.state, EngineState::NotStarted) {
-                    self.start_engine();
+                    self.start_engine("程式設定頁「自動登入」開關");
                 }
             }
             ui.label("不勾選 (出廠預設): 每次打開 AI寶, 它會先停在未登入的狀態, 要你按「登入並啟用」才會開始服務。勾選: 打開就自動登入、直接上工。跟上面「隨 Windows 開機自動啟動」是兩個獨立開關: 可以只開機自啟動、不自動登入 (開機後在系統匣待命, 等你按登入), 也可以兩個都開或都關。");
@@ -4400,7 +4525,7 @@ impl App {
                     open_folder(&shell::data_dir());
                 }
                 if ui.button("重新啟動引擎").clicked() {
-                    self.restart_engine();
+                    self.restart_engine("程式設定頁「重新啟動引擎」按鈕");
                 }
             });
             ui.add_space(6.0);
@@ -4452,8 +4577,23 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_image_rgba, icon_rgba};
+    use super::{decode_image_rgba, icon_rgba, EngineOpGate};
     use std::io::Cursor;
+
+    #[test]
+    fn engine_op_gate_blocks_reentry_until_end() {
+        // 2026-10-22 循環事故的修法核心: 第一個操作進行中, 第二個要求必須被擋下
+        // (不排隊); 第一個結束後才准下一個進來。
+        let gate = EngineOpGate::new();
+        assert!(gate.try_begin("重新啟動引擎", "測試來源 A"));
+        assert!(!gate.try_begin("重新啟動引擎", "測試來源 B"), "進行中應擋下重入");
+        assert!(!gate.try_begin("一鍵修復", "測試來源 C"), "不同操作也共用同一把鎖");
+        assert!(gate.is_busy());
+        gate.end("重新啟動引擎");
+        assert!(!gate.is_busy());
+        assert!(gate.try_begin("一鍵修復", "測試來源 D"), "釋放後應可再取得");
+        gate.end("一鍵修復");
+    }
 
     #[test]
     fn brand_icon_decodes_for_taskbar_and_tray() {
