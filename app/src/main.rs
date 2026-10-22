@@ -253,6 +253,9 @@ struct App {
     activity: Option<serde_json::Value>,
     activity_fetched_at: Option<std::time::Instant>,
     activity_msg: Option<String>,
+    // 群組篩選 (2026-10-23 老吳裁示): Some((chatId, 顯示名)) = 只看該群; None = 全部群組。
+    // 純顯示層狀態, 連同名稱一起存, 讓該群暫時不在最近紀錄裡時選單仍顯示得出來。
+    activity_chat_filter: Option<(String, String)>,
     // 發送群組訊息頁 (2026-10-22 第一階段): 表單狀態 + 待發清單/紀錄的載入 slot
     send_chat_id: String,
     send_chat_name: String,
@@ -785,6 +788,7 @@ impl App {
             activity: None,
             activity_fetched_at: None,
             activity_msg: None,
+            activity_chat_filter: None,
             send_chat_id: String::new(),
             send_chat_name: String::new(),
             send_text: String::new(),
@@ -1307,6 +1311,20 @@ fn primary_btn(ui: &mut egui::Ui, pal: theme::Palette, label: &str) -> egui::Res
 // 讀取清單與白名單清單共用同一種列: 左側主行 = 群組名稱、副行小字 = 類型・人數;
 // 右側固定欄位 (固定寬度、靠右) 放動作按鈕或狀態標籤, 讓每列按鈕水平成一直線;
 // 列與列之間以分隔線區隔。畫面上不顯示原始 chat ID (ID 只留在 log/診斷資料)。
+
+/// 聊天情況群組篩選的選單標籤: 有群名用群名; 沒群名 (核心尚未回報名稱) 不顯示
+/// 完整編號 (畫面不露原始 ID 的產品規格), 以末 4 碼區分不同的未命名聊天室。
+fn activity_chat_label(id: &str, name: &str) -> String {
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    let tail: String = id.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    if tail.is_empty() {
+        "未命名聊天室".to_string()
+    } else {
+        format!("未命名聊天室 (末 4 碼 {tail})")
+    }
+}
 
 fn chat_kind_label(kind: &str) -> &str {
     match kind {
@@ -2881,8 +2899,9 @@ impl App {
                 self.activity_fetched_at = Some(std::time::Instant::now());
                 let slot = self.activity_slot.clone();
                 let ctx2 = ctx.clone();
+                let chat_filter = self.activity_chat_filter.as_ref().map(|(id, _)| id.clone());
                 std::thread::spawn(move || {
-                    let r = helper_api::bot_activity();
+                    let r = helper_api::bot_activity(chat_filter.as_deref());
                     *slot.lock().unwrap() = Some(match r {
                         Ok(v) => v,
                         Err(e) => serde_json::json!({ "ok": false, "message": e }),
@@ -2919,10 +2938,76 @@ impl App {
             if let Some(m) = &self.activity_msg {
                 ui.label(egui::RichText::new(m.clone()).color(self.palette.warn_text));
             }
-            ui.add_space(4.0);
+            // 群組篩選 (2026-10-23 老吳裁示): 純顯示層 — 篩選在 helper 端完成
+            // (activityfilter.mjs), 這裡只給選單與標明計數口徑。選單清單取端點的
+            // chats (未篩選的不重複群組); 舊版 helper 沒有 chats 時退回用手邊的
+            // events 萃取 (篩選啟用時可能不完整, 僅相容兜底)。
             let events = act.as_ref().and_then(|a| a.get("events")).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let total = act.as_ref().and_then(|a| a.get("total")).and_then(|v| v.as_u64());
+            let mut chat_options: Vec<(String, String)> = Vec::new();
+            if let Some(chats) = act.as_ref().and_then(|a| a.get("chats")).and_then(|v| v.as_array()) {
+                for c in chats {
+                    let id = c.get("chatId").and_then(|v| v.as_str()).unwrap_or("");
+                    if id.is_empty() || chat_options.iter().any(|(x, _)| x == id) { continue; }
+                    chat_options.push((id.to_string(), c.get("chatName").and_then(|v| v.as_str()).unwrap_or("").to_string()));
+                }
+            } else {
+                for ev in &events {
+                    let id = ev.get("chatId").and_then(|v| v.as_str()).unwrap_or("");
+                    if id.is_empty() || chat_options.iter().any(|(x, _)| x == id) { continue; }
+                    chat_options.push((id.to_string(), ev.get("chatName").and_then(|v| v.as_str()).unwrap_or("").to_string()));
+                }
+            }
+            if !chat_options.is_empty() || self.activity_chat_filter.is_some() {
+                let selected_text = match &self.activity_chat_filter {
+                    Some((id, name)) => activity_chat_label(id, name),
+                    None => "全部群組".to_string(),
+                };
+                let mut picked: Option<Option<(String, String)>> = None;
+                ui.horizontal(|ui| {
+                    ui.label("顯示群組:");
+                    egui::ComboBox::from_id_salt("activity-chat-filter")
+                        .selected_text(selected_text)
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(self.activity_chat_filter.is_none(), "全部群組").clicked() {
+                                picked = Some(None);
+                            }
+                            for (id, name) in &chat_options {
+                                let label = activity_chat_label(id, name);
+                                let is_sel = self.activity_chat_filter.as_ref().map(|(x, _)| x == id).unwrap_or(false);
+                                if ui.selectable_label(is_sel, label.clone()).clicked() {
+                                    picked = Some(Some((id.clone(), name.clone())));
+                                }
+                            }
+                        });
+                });
+                if let Some(p) = picked {
+                    if p != self.activity_chat_filter {
+                        self.activity_chat_filter = p;
+                        // 換群組就丟掉舊清單重新抓, 不讓上一個群組的紀錄在新篩選下殘留一幀以上
+                        self.activity = None;
+                        self.activity_fetched_at = None;
+                    }
+                }
+                if let Some((fid, name)) = &self.activity_chat_filter {
+                    let shown = events.len();
+                    let label = activity_chat_label(fid, name);
+                    let count_txt = match total {
+                        Some(t) => format!("只看「{label}」: 顯示 {shown} 筆 (全部共 {t} 筆)。"),
+                        None => format!("只看「{label}」: 顯示 {shown} 筆。"),
+                    };
+                    ui.label(egui::RichText::new(count_txt).weak().small());
+                    ui.label(egui::RichText::new("上面那排今日數字是全部群組的統計; 下面清單只顯示這個群組。").weak().small());
+                }
+            }
+            ui.add_space(4.0);
             if events.is_empty() {
-                ui.label(egui::RichText::new("目前還沒有紀錄: 有人在群組跟機器人說話後, 這裡會逐筆出現。").weak());
+                if let Some((fid, name)) = &self.activity_chat_filter {
+                    ui.label(egui::RichText::new(format!("「{}」目前還沒有紀錄: 紀錄只保留最近 50 筆, 較早的會被新的蓋掉; 也可以改選「全部群組」看其他群的情況。", activity_chat_label(fid, name))).weak());
+                } else {
+                    ui.label(egui::RichText::new("目前還沒有紀錄: 有人在群組跟機器人說話後, 這裡會逐筆出現。").weak());
+                }
             } else {
                 let max_h = ui.available_height().max(80.0);
                 egui::ScrollArea::vertical().id_salt("activity-scroll").max_height(max_h).show(ui, |ui| {

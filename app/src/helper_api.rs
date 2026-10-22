@@ -116,9 +116,15 @@ pub fn get_status() -> Result<serde_json::Value, String> {
     get_json("/api/status")
 }
 
-/// 機器人聊天情況 (第 12 項): 狀態摘要 + 最近動態 (helper 記憶體環形緩衝)
-pub fn bot_activity() -> Result<serde_json::Value, String> {
-    get_json("/api/bot/activity")
+/// 機器人聊天情況 (第 12 項): 狀態摘要 + 最近動態 (helper 記憶體環形緩衝)。
+/// 群組篩選 (2026-10-23): chat 給了就帶 ?chat=<chatId>, 由 helper 端做純顯示層
+/// 篩選 (邏輯在 helper/src/activityfilter.mjs, 附單元測試); chatId 只含英數字
+/// 與連字號, 直接拼進 query 即可。
+pub fn bot_activity(chat: Option<&str>) -> Result<serde_json::Value, String> {
+    match chat {
+        Some(id) if !id.is_empty() => get_json(&format!("/api/bot/activity?chat={id}")),
+        _ => get_json("/api/bot/activity"),
+    }
 }
 
 pub fn get_settings() -> Result<serde_json::Value, String> {
