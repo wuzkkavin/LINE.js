@@ -294,6 +294,89 @@ jobs:
           }
           Get-ChildItem themes | ForEach-Object { "shot: $($_.Name) $($_.Length) bytes" }
 
+      - name: GUI 回歸 — 閒置 3 分鐘無自發 stop/start 循環 + 單次重啟只准一對
+        shell: pwsh
+        run: |
+          # 2026-10-22 實機事故回歸檢查: 舊版在真機出現 19 次 stop→start 機械循環
+          # (QR 每次出現 1 秒就被結束序列砍掉, 永遠登入不了), 雲端探針全綠卻沒抓到 —
+          # 因為探針只驗「有操作時的行為」, 沒驗「沒人碰它時會不會自己亂停」。
+          # 本步: 自動登入開啟讓 App 自己啟動引擎, 然後完全不碰它觀察 3 分鐘,
+          # shell.log 不得出現結束序列/被略過的要求, 監督者只准啟動 1 次;
+          # 接著以 UI Automation 點「重新啟動引擎」一次, 只准出現一對 stop/start。
+          $ErrorActionPreference = 'Stop'
+          $idleHome = Join-Path $env:RUNNER_TEMP 'aibao-gui-idle'
+          if (Test-Path $idleHome) { Remove-Item $idleHome -Recurse -Force }
+          New-Item -ItemType Directory -Force $idleHome | Out-Null
+          $env:HWLINEHELPER_HOME = $idleHome
+          @{ schema = 1; theme = 'forest'; auto_login = $true; show_window_on_start = $true; tray_hint_shown = $true } |
+            ConvertTo-Json | Set-Content (Join-Path $idleHome 'shell-settings.json') -Encoding utf8
+          $shellLog = Join-Path $idleHome 'logs\shell.log'
+          $result = @()
+          function LogText {
+            if (Test-Path $shellLog) { try { return (Get-Content $shellLog -Raw) } catch { return '' } }
+            return ''
+          }
+          $p = Start-Process 'out\AI寶.exe' -PassThru
+          try {
+            $deadline = (Get-Date).AddSeconds(240)
+            $ready = $false
+            while ((Get-Date) -lt $deadline) {
+              if ((LogText) -match '引擎監督者已啟動') { $ready = $true; break }
+              Start-Sleep -Seconds 3
+            }
+            if (-not $ready) { throw '引擎未在 240 秒內啟動 (自動登入路徑)' }
+            Start-Sleep -Seconds 180
+            $idle = LogText
+            $starts = ([regex]::Matches($idle, '引擎監督者已啟動')).Count
+            if ($starts -ne 1) { throw "閒置觀察失敗: 監督者啟動次數應為 1, 實際 $starts" }
+            if ($idle -match '結束序列階段') { throw '閒置觀察失敗: 無人操作卻出現結束序列 (stop/start 循環回歸)' }
+            if ($idle -match '要求被略過') { throw '閒置觀察失敗: 有不明來源反覆觸發引擎操作 (出現被略過的要求)' }
+            $result += 'idle-3min: PASS (監督者啟動 1 次, 無結束序列, 無被略過的要求)'
+            Write-Host $result[-1]
+            $clicked = $false
+            try {
+              Add-Type -AssemblyName UIAutomationClient
+              Add-Type -AssemblyName UIAutomationTypes
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $pidCond = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $p.Id)
+              $win = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $pidCond)
+              if ($win) {
+                $btnCond = New-Object System.Windows.Automation.PropertyCondition(
+                  [System.Windows.Automation.AutomationElement]::NameProperty, '重新啟動引擎')
+                $btn = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
+                if ($btn) {
+                  $btn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+                  $clicked = $true
+                }
+              }
+            } catch {
+              $result += "single-restart: UIA 例外: $($_.Exception.Message)"
+            }
+            if ($clicked) {
+              Start-Sleep -Seconds 45
+              $after = LogText
+              $begins = ([regex]::Matches($after, '重新啟動引擎開始')).Count
+              $stops = ([regex]::Matches($after, '結束序列階段 1')).Count
+              if ($begins -ne 1) { throw "單次重啟失敗: 「重新啟動引擎開始」應為 1 次, 實際 $begins" }
+              if ($stops -ne 1) { throw "單次重啟失敗: 結束序列應為 1 次, 實際 $stops (單次操作被放大成多次)" }
+              $result += 'single-restart: PASS (恰好一對 stop/start)'
+              Write-Host $result[-1]
+            } else {
+              $result += 'single-restart: SKIPPED (UI Automation 找不到「重新啟動引擎」按鈕; 此部分未驗證)'
+              Write-Host $result[-1]
+            }
+          } finally {
+            if (-not $p.HasExited) {
+              Start-Process 'out\AI寶.exe' -ArgumentList '--quit' | Out-Null
+              $deadline = (Get-Date).AddSeconds(150)
+              while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+              if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; throw 'App 未能在 --quit 後 150 秒內結束' }
+            }
+            if (Test-Path $shellLog) { Copy-Item $shellLog 'gui-idle-shell.log' -Force }
+            $result | Set-Content 'gui-idle-result.txt' -Encoding utf8
+          }
+
       - name: 上傳成品、探針結果、截圖與 log
         if: always()
         uses: actions/upload-artifact@v4
@@ -306,6 +389,8 @@ jobs:
             probe-stderr.txt
             app-main.png
             gui-after-quit.txt
+            gui-idle-result.txt
+            gui-idle-shell.log
             foreign-shell.log
             themes/theme-*.png
           if-no-files-found: warn
