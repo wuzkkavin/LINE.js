@@ -117,6 +117,16 @@
 - **交付**：build-app run 39559669033 四 job 全 success（build-engine/build-app/build-legacy/legacy-scenarios；探針全 ok：engine 105,057,792 bytes、login_roundtrip=ok、shutdown_path=signal_file、ports_freed=true、residual=none）。成品 AI寶-App.exe 128,007,168 bytes、MD5 ac74b6e6d4e82fb666db9608de744bdf，Drive 同 id 1BWJiznBeMoeQbIaS7jxbKagiNBcnrmfX 原地換新（回讀大小＋MD5 一致、trashed=false）、Release aibao-app-v1 資產 AI-Bao-App.exe 同步（sha256 700a2f989600484b359835ddd4c6e5352f34351bbd694bc55c44bb718e4ba0e8 回讀一致），run artifacts 4 件已刪。Ubuntu：helper 同步 commit 31e05b7，tar 重打 48,907,602 bytes、MD5 b29cd06c215925fdde3b3147dbfd4bd1，Drive live id 1IvByfNnuZmZQ_yCvDekwOCFHEGxnQ1pT 原地換新（回讀一致）；隔離 HOME 冒煙通過：雙埠 200、/api/status 的 bot.decrypt 形狀正確（未登入時 state=unknown、不冒充正常）、SIGTERM 後雙埠釋放、session.json.aes 靜置加密存在、logs 含 launcher-core.log。
 - **未驗證（待老吳實機）**：真機自然發生的解密失敗/漏接無法預約重現，偵測邏輯以 stub 驗證、待老吳機器長跑觀察（下次成員變動事故時總覽應正確點燈）；退群重邀在本案有效（n=1），是否每次成員變動事故都需要走到第二步尚無第二例；老吳 15:01 真人訊息複驗結果待主代理結案通報。
 
+## 6.8 每日上游同步 v1.8.1（2026-10-22，main＝28fe1d7、ai-bao＝4383983）
+
+- 上游 4 筆（a0683c3→5da4c6f）：5c3d7a6 新增聊天室一次性管理員權杖（chat:admin-token，WEB 查看／API 推送與兌換輪替）、1a2c914 fix(line) 不自行註冊 E2EE 群組金鑰、即時解密失敗改顯示佔位（#2）、68ee382 合併 PR #3、5da4c6f release v1.8.1。
+- 合併：main merge upstream 無衝突；ai-bao merge main 有 4 檔衝突，皆以「兩邊內容合併」解決（非固定衝突點）：AGENTS.md／SECURITY.md／src/ws/protocol.ts 同時保留本版 .txt 檔案承載擴充與上游 admin-token 新條目（protocol.ts 的 message:send 同時含 file 欄位與 admin-token 兩種影格）；.github/workflows/build-app.yml 取 ai-bao 側（內容＝pack 正本＋凍結情境與聊天室畫面頁截圖兩段 .github 專屬斷言，main 側無新增）。build-windows.yml 與 pack 正本一致、無衝突。
+- 測試（本機，數字實跑）：typecheck 通過；上游 367 項（自 356 增 11）366 過、helper 76 項 75 過、pack 48/48。兩筆失敗皆為計時型測試（update 週期檢查退避、KB 大掃描事件迴圈延遲），失敗當下 VM 負載 14–16（2 核、其他平行編譯中）；已對照證明與本次同步無關：兩筆相關檔案合併前後零差異、合併前程式碼（a00ae84）在同一環境同樣失敗、其後 update 計時測試單獨重跑通過、Ubuntu 側同套上游測試 367/367 全過。KB 延遲測試在本機負載降下前未取得綠燈，列為環境未驗證（2026-10-21 正常負載時曾 76/76）。
+- 雲端：build-windows run 39710030754 conclusion＝success，artifact 含 exe 與核心／控制台兩張截圖（控制台截圖親自檢視正常）；exe 105,067,520 bytes、MD5 6258befb2672f390c6f9ab20b4ddab16、FileVersion 1.8.1.0；artifact 已刪除。
+- Drive：新 AI寶.exe id 1QGcCeJAvhH6hnPwZanTOOR-xw_TKDupL（大小＋MD5 回讀一致），舊版 17YntO3DfH8FrU7hRjLpbBObhJjFTLExB 已移入垃圾桶。
+- 注意：本地工作副本同步前落後 origin 46 筆且 app/ 有 3 檔未提交舊稿（2026-10-20 03:02 的 engine/platform 早期稿，origin 已有更新的已提交版本），已存入 git stash（pre-sync-2026-10-22）與 goals/cadcraft/hidden_files/win-dirty-pre-sync-2026-10-22.patch 保全，未丟棄。
+- 本次未做：原生 App（AI寶-App.exe）未重打包（本次每日同步只跑 build-windows 引擎版），其內嵌引擎仍為 v1.8.0 世代；是否補跑 build-app 待主代理裁示。未驗證：真帳號下 admin-token 推送／兌換與 E2EE 修正的實際行為（待老吳實機）。
+
 ## 7. 操作手冊（常用指令）
 
 - 上游測試：Repo 根目錄 npm ci --include=dev；npm run typecheck；npm test（207 項，約 1 分鐘）。
