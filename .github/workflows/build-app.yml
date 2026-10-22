@@ -128,8 +128,26 @@ jobs:
       - name: GUI 冒煙 — 啟動、截圖、結束序列
         shell: pwsh
         run: |
-          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-gui-data'
           $exe = (Resolve-Path 'out/AI寶.exe').Path
+          # 階段 A (2026-10-22 問題 6 修復的出廠預設驗證): 全新資料目錄、不預寫任何設定 —
+          # 「開啟程式時自動登入」出廠預設關閉, App 開啟後應停在未啟用狀態: 行程活著、
+          # 引擎雙埠都不起來; --quit 要能乾淨結束 (沒有引擎也要能關)。
+          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-gui-default-data'
+          $procA = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 12
+          if ($procA.HasExited) { throw '階段A: 出廠預設下 App 啟動後自行結束 (應停在未啟用狀態等使用者按登入)' }
+          $helperUpA = $false
+          try { Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3 | Out-Null; $helperUpA = $true } catch { }
+          if ($helperUpA) { throw '階段A: 出廠預設 (自動登入關閉) 下引擎不應自行啟動, 但 3790 已有回應' }
+          Write-Host '階段A: 出廠預設不自動登入 — App 待命、引擎未啟動 (符合問題 6 新規格)'
+          Start-Process -FilePath $exe -ArgumentList '--quit' -Wait
+          if (-not $procA.WaitForExit(60000)) { throw '階段A: 未啟用狀態下 --quit 後 60 秒內未結束' }
+          Write-Host '階段A: 未啟用狀態 --quit 乾淨結束'
+          # 階段 B: 預寫 shell-settings.json 開啟 auto_login, 走原本的自動登入全流程驗證。
+          $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-gui-data'
+          New-Item -ItemType Directory -Force -Path $env:HWLINEHELPER_HOME | Out-Null
+          @{ auto_login = $true } | ConvertTo-Json |
+            Set-Content (Join-Path $env:HWLINEHELPER_HOME 'shell-settings.json') -Encoding UTF8
           $proc = Start-Process -FilePath $exe -PassThru
           Write-Host "app pid: $($proc.Id)"
           $ok = $false
@@ -218,6 +236,11 @@ jobs:
             if ($s.Content -match 'aibao-helper') { throw 'stub 不應帶身分標記, 情境設定錯誤' }
             Write-Host "stub 就緒: $($s.StatusCode) $($s.Content)"
             $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-foreign-data'
+            # 本情境要驗「App 嘗試啟動引擎時撞到外來佔用」: 2026-10-22 起出廠預設不自動
+            # 登入 (引擎不會自己啟動), 先預寫設定開啟 auto_login 才走得到這條路徑。
+            New-Item -ItemType Directory -Force -Path $env:HWLINEHELPER_HOME | Out-Null
+            @{ auto_login = $true } | ConvertTo-Json |
+              Set-Content (Join-Path $env:HWLINEHELPER_HOME 'shell-settings.json') -Encoding UTF8
             $exe = (Resolve-Path 'out/AI寶.exe').Path
             $proc = Start-Process -FilePath $exe -PassThru
             $logPath = Join-Path $env:HWLINEHELPER_HOME 'logs\shell.log'
@@ -270,7 +293,7 @@ jobs:
           foreach ($t in @('forest','ocean','sakura','violet','mono')) {
             $home2 = Join-Path $env:RUNNER_TEMP "aibao-theme-$t"
             New-Item -ItemType Directory -Force -Path $home2 | Out-Null
-            @{ show_window_on_start = $true; tray_hint_shown = $true; theme = $t } |
+            @{ show_window_on_start = $true; tray_hint_shown = $true; theme = $t; auto_login = $true } |
               ConvertTo-Json | Set-Content (Join-Path $home2 'shell-settings.json') -Encoding UTF8
             $env:HWLINEHELPER_HOME = $home2
             $proc = Start-Process 'out\AI寶.exe' -PassThru
@@ -323,7 +346,7 @@ jobs:
           '@
           $home3 = Join-Path $env:RUNNER_TEMP "aibao-chatpage"
           New-Item -ItemType Directory -Force -Path $home3 | Out-Null
-          @{ show_window_on_start = $true; tray_hint_shown = $true; theme = 'forest' } |
+          @{ show_window_on_start = $true; tray_hint_shown = $true; theme = 'forest'; auto_login = $true } |
             ConvertTo-Json | Set-Content (Join-Path $home3 'shell-settings.json') -Encoding UTF8
           $env:HWLINEHELPER_HOME = $home3
           $env:AIBAO_START_PAGE = 'chat'
@@ -544,6 +567,15 @@ jobs:
           function Kill-Image([string]$path) {
             Get-ImagePids $path | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
           }
+          function Seed-AutoLogin([string]$dataHome) {
+            # 2026-10-22 問題 6 修復後, 新殼出廠預設「開啟程式不自動登入」 (引擎不啟動);
+            # 本 job 用新殼的情境 (b/c/d-green/e-green) 都預期殼一啟動就接手管理引擎,
+            # 先在該情境的資料目錄預寫 shell-settings.json 開啟 auto_login。
+            # 舊殼情境 (a/d-red/e-red) 不呼叫此函式, 維持原始前提。
+            New-Item -ItemType Directory -Force -Path $dataHome | Out-Null
+            @{ auto_login = $true } | ConvertTo-Json |
+              Set-Content (Join-Path $dataHome 'shell-settings.json') -Encoding UTF8
+          }
           function Get-NewEnginePids([string]$dataHome) {
             # 新殼自己啟動的引擎會解在 $dataHome\engine\<戳記>\engine.exe; prev 等外來路徑不算。
             # (參數不可用 $home: 那是 PowerShell 唯讀自動變數, 會直接 WriteError — CI 首跑實證。)
@@ -575,6 +607,7 @@ jobs:
           # ---------- 情境 (b): gen-0 殘留 × 新殼 ----------
           Write-Host '=== 情境 (b): gen-0 殘留 × 新殼 — 預期收編清除 + 結束後清乾淨 ==='
           $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'scenB-data'
+          Seed-AutoLogin $env:HWLINEHELPER_HOME
           $supB = Start-Process $gen0 -PassThru
           if (-not (Wait-ServicesUp 150)) { throw '情境B: gen-0 引擎 150 秒未就緒' }
           $appB = Start-Process $newApp -PassThru
@@ -592,6 +625,7 @@ jobs:
           # ---------- 情境 (c): gen-1 殘留 × 新殼 ----------
           Write-Host '=== 情境 (c): gen-1 殘留 × 新殼 — 預期收編清除 + 結束後清乾淨 ==='
           $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'scenC-data'
+          Seed-AutoLogin $env:HWLINEHELPER_HOME
           $supC = Start-Process $gen1 -PassThru
           if (-not (Wait-ServicesUp 150)) { throw '情境C: gen-1 引擎 150 秒未就緒' }
           $appC = Start-Process $newApp -PassThru
@@ -677,9 +711,11 @@ jobs:
 
           Write-Host '=== 情境 (d-green): 探測跨界 × 新殼 (--autostart 冷開機路徑) — 預期身分未定重試後接手, 不得判 Foreign ==='
           # 用 --autostart 啟動: 開機自啟動是老吳追加的正式驗收項; --autostart 與雙擊共用同一套
-          # 引擎啟動/探測邏輯 (main.rs App::new 無條件呼叫 mgr.start(), --autostart 只改視窗隱藏),
-          # 在此以自啟動路徑覆蓋「開機時系統忙碌、helper 回應慢」的冷開機時序。
+          # 引擎啟動/探測邏輯, --autostart 只改視窗隱藏; 2026-10-22 問題 6 修復後引擎啟動
+          # 改由 auto_login 設定決定 (出廠預設關閉), 本情境已預寫 auto_login=true (見下
+          # Seed-AutoLogin), 在此以自啟動路徑覆蓋「開機時系統忙碌、helper 回應慢」的冷開機時序。
           $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'scenD-data'
+          Seed-AutoLogin $env:HWLINEHELPER_HOME
           $stubProcD2 = Start-Process pwsh -ArgumentList '-File', $stubD -PassThru
           Start-Sleep -Seconds 2
           $appD = Start-Process $newApp -ArgumentList '--autostart' -PassThru
@@ -742,6 +778,7 @@ jobs:
 
           Write-Host '=== 情境 (e-green): 上一建置 stack × 新殼 — 預期戳記不符 → 清除舊建置、啟動自家引擎 ==='
           $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'scenE-data'
+          Seed-AutoLogin $env:HWLINEHELPER_HOME
           $supE = Start-Process $prev -PassThru
           if (-not (Wait-ServicesUp 150)) { throw '情境E-green: prev 引擎 150 秒未就緒' }
           $appE = Start-Process $newApp -PassThru
