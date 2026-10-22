@@ -685,7 +685,9 @@ export class HelperBot {
     return new Promise((resolve, reject) => {
       const requestId = `h${++this.reqSeq}-${Date.now()}`;
       const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error("send timeout")); }, 10000);
-      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject });
+      // chatId 一併記在 pending 上: sent 影格本身不帶聊天室, onFrame 靠這筆把自己送出的
+      // 訊息以「正確的聊天室」登記進登記簿 (分群隔離, 2026-10-23 稽核修復)。
+      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject, chatId });
       this.sendFrame({ type: "message:send", requestId, chatId, text, ...(replyTo ? { replyTo } : {}) });
     });
   }
@@ -697,7 +699,7 @@ export class HelperBot {
     return new Promise((resolve, reject) => {
       const requestId = `h${++this.reqSeq}-${Date.now()}`;
       const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error("send file timeout")); }, 30000);
-      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
+      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); }, chatId });
       this.sendFrame({ type: "message:send", requestId, chatId, file: { filename, dataBase64: Buffer.from(bytes).toString("base64") } });
     });
   }
@@ -994,7 +996,9 @@ export class HelperBot {
   // 查無此訊息時在登記簿留空字串記號, 避免每次引用都重查。
   async isQuotedSelf(m) {
     if (!m.replyTo || !this.selfId) return false;
-    const known = this.registry.lookup(m.replyTo);
+    // 分群隔離 (2026-10-23 稽核修復): 認定只限「本聊天室」登記過的紀錄;
+    // 被引用的訊息若是在別的群登記的, 視同沒登記過, 之後也只查本聊天室的歷史。
+    const known = this.registry.lookup(m.replyTo, m.channelId ?? "");
     if (known !== undefined) return known === this.selfId;
     if (!this.connected) return false;
     try {
@@ -1010,7 +1014,9 @@ export class HelperBot {
         if (!frame.hasMore || !frame.cursor) break;
         cursor = frame.cursor;
       }
-      this.registry.register(m.replyTo, "", m.channelId ?? "");
+      // 本聊天室歷史也查無此訊息才留負記號; 登記簿裡若已有紀錄 (例如別群的正式紀錄,
+      // 跨群引用情境), 不可用負記號把人家覆寫掉 (分群隔離, 2026-10-23 稽核修復)。
+      if (this.registry.lookup(m.replyTo) === undefined) this.registry.register(m.replyTo, "", m.channelId ?? "");
       return false;
     } catch (e) {
       this.logger?.warn("觸發判斷", "引用訊息寄件者補查失敗, 本次不以引用觸發", { id: m.messageId, error: String(e?.message ?? e) });
@@ -1049,8 +1055,11 @@ export class HelperBot {
     }
     // 自己送出的訊息: 核心在 sent 影格回新訊息的 messageId, 立刻登記為機器人本人,
     // 之後有人引用這則回答, 登記簿就認得出來 (引用續答觸發的認定主路徑)。
+    // sent 影格不帶聊天室: 改用送出時記在 pending 上的 chatId 登記 (分群隔離,
+    // 2026-10-23 稽核修復) — 登記成空白的話, 這則回答會被別的群「借用」來跨群認定。
     if (frame.type === "sent" && frame.messageId && this.selfId) {
-      this.registry.register(frame.messageId, this.selfId, "");
+      const sentChatId = frame.requestId ? (this.pending.get(frame.requestId)?.chatId ?? "") : "";
+      this.registry.register(frame.messageId, this.selfId, sentChatId);
     }
     if (frame.requestId && this.pending.has(frame.requestId)) {
       const p = this.pending.get(frame.requestId);
