@@ -178,6 +178,99 @@ pub fn kb_reindex() -> Result<serde_json::Value, String> {
     post_json("/api/kb/reindex", serde_json::json!({}), 30)
 }
 
+/// 待發清單 + 發送紀錄 (發送群組訊息頁): helper 只做本機存放與規則, 實際送出由殼負責
+pub fn get_outbox() -> Result<serde_json::Value, String> {
+    get_json("/api/outbox")
+}
+
+pub fn create_outbox(body: serde_json::Value) -> Result<serde_json::Value, String> {
+    post_json("/api/outbox", body, 15)
+}
+
+pub fn cancel_outbox(id: &str) -> Result<serde_json::Value, String> {
+    post_json("/api/outbox/cancel", serde_json::json!({ "id": id }), 15)
+}
+
+// --- 第三/四階段: 排程護欄動作、管理員通知、教材庫 ---
+
+/// 送出結果寫回 (逐項成敗, 與 helper flattenItems 同序)
+pub fn record_outbox_result(id: &str, results: serde_json::Value, note: &str) -> Result<serde_json::Value, String> {
+    post_json("/api/outbox/result", serde_json::json!({ "id": id, "results": results, "note": note }), 15)
+}
+
+/// 失敗項目重送後的合併結果寫回 (不算新的一次發送, 不推進系列/次數)
+pub fn record_outbox_retry_result(id: &str, results: serde_json::Value, note: &str) -> Result<serde_json::Value, String> {
+    post_json("/api/outbox/retry-result", serde_json::json!({ "id": id, "results": results, "note": note }), 15)
+}
+
+/// 暫停/恢復一筆待發 (群組鑰匙不正常時用暫停; 修好後使用者按恢復)
+pub fn pause_outbox(id: &str, paused: bool, note: &str) -> Result<serde_json::Value, String> {
+    post_json("/api/outbox/pause", serde_json::json!({ "id": id, "paused": paused, "note": note }), 15)
+}
+
+/// 順延一筆待發到指定時間 (有人剛進群的鑰匙交接護欄)
+pub fn defer_outbox(id: &str, next_run_at_ms: i64, note: &str) -> Result<serde_json::Value, String> {
+    post_json("/api/outbox/defer", serde_json::json!({ "id": id, "nextRunAt": next_run_at_ms, "note": note }), 15)
+}
+
+/// 跳過程式沒開時錯過的那一次 (只有重複發)
+pub fn skip_outbox(id: &str, note: &str) -> Result<serde_json::Value, String> {
+    post_json("/api/outbox/skip", serde_json::json!({ "id": id, "note": note }), 15)
+}
+
+/// 管理員通知事件紀錄 + 待送清單 (pending)
+pub fn get_admin_events() -> Result<serde_json::Value, String> {
+    get_json("/api/admin-events")
+}
+
+/// 管理員通知實際送出後寫回結果
+pub fn mark_admin_event_sent(id: &str, ok: bool, note: &str) -> Result<serde_json::Value, String> {
+    post_json("/api/admin-events/sent", serde_json::json!({ "id": id, "ok": ok, "note": note }), 15)
+}
+
+/// 管理員候選名單 (白名單群組近期發言者 + OpenChat 管理員)
+pub fn get_admin_candidates() -> Result<serde_json::Value, String> {
+    with_retry("/api/admin-candidates", || once_get("/api/admin-candidates", 30))
+}
+
+/// 教材庫清單
+pub fn get_materials() -> Result<serde_json::Value, String> {
+    get_json("/api/materials")
+}
+
+/// 把一份檔案存進教材庫 (內容以 base64 傳, 上限 10MB)
+pub fn add_material(name: &str, data_base64: &str) -> Result<serde_json::Value, String> {
+    post_json("/api/materials", serde_json::json!({ "name": name, "dataBase64": data_base64 }), 30)
+}
+
+/// 取教材庫一份檔案的位元組 (送出圖片時用; 不是 JSON, 單獨走原始回應)
+pub fn get_material_bytes(name: &str) -> Result<Vec<u8>, String> {
+    let encoded = percent_encode(name);
+    match agent(20).get(&url(&format!("/api/materials/file?name={encoded}"))).call() {
+        Ok(resp) => {
+            let mut buf = Vec::new();
+            use std::io::Read as _;
+            resp.into_reader().read_to_end(&mut buf).map_err(|e| format!("讀取教材庫檔案失敗: {e}"))?;
+            Ok(buf)
+        }
+        Err(ureq::Error::Status(404, _)) => Err(format!("教材庫裡找不到「{name}」")),
+        Err(e) => Err(format!("讀取教材庫失敗: {e}")),
+    }
+}
+
+/// URI 百分號編碼 (只保留 RFC 3986 unreserved 字元); pagesend 的 /file/upload
+/// 以它編 X-Filename, 核心端以 decodeURIComponent 解回原始檔名, 兩邊必須同一套規則。
+pub(crate) fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 pub fn get_logs() -> Result<serde_json::Value, String> {
     get_json("/api/logs")
 }

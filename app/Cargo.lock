@@ -154,6 +154,7 @@ dependencies = [
 name = "aibao-app"
 version = "1.0.0"
 dependencies = [
+ "arboard",
  "eframe",
  "egui",
  "image",

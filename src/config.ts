@@ -21,6 +21,7 @@ export interface Config {
     textMaxLength: number;
     sendsPerSecond: number;
     uploadMaxBytes: number;
+    uploadFileMaxBytes: number;
     uploadVideoMaxBytes: number;
     uploadsPerMinute: number;
     downloadMaxBytes: number;
@@ -32,6 +33,7 @@ const DEFAULT_API_SENDS_PER_MINUTE = 20;
 // A hostname, an IPv4 address or an IPv6 address (no brackets, no port).
 const SERVER_HOST = /^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|[0-9A-Fa-f:]{2,45})$/;
 const DEFAULT_UPLOAD_VIDEO_MAX_BYTES = 50 * 1024 * 1024;
+export const MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_JEV_MODEL = "jev-1.13.0";
 // Printable ASCII without spaces: the token goes into an HTTP header as is.
 const JEV_TOKEN = /^[\x21-\x7e]{1,512}$/;
@@ -117,6 +119,8 @@ export async function loadConfig(root = process.cwd()): Promise<Config> {
       textMaxLength: integer(limits.textMaxLength, 8000),
       sendsPerSecond: integer(limits.sendsPerSecond, 5),
       uploadMaxBytes: integer(limits.uploadMaxBytes, 10 * 1024 * 1024),
+      // Browser-channel teaching files have their own first-release ceiling; older configs omit it.
+      uploadFileMaxBytes: limits.uploadFileMaxBytes === undefined ? MAX_UPLOAD_FILE_BYTES : integer(limits.uploadFileMaxBytes, MAX_UPLOAD_FILE_BYTES),
       uploadsPerMinute: integer(limits.uploadsPerMinute, 5),
       // Added after the first release: configs written before it must keep working.
       downloadMaxBytes: limits.downloadMaxBytes === undefined ? DEFAULT_DOWNLOAD_MAX_BYTES : integer(limits.downloadMaxBytes, 100 * 1024 * 1024),

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { MediaService, avatarMediaId, isMediaId, mp4DurationMs, sniffMedia, sniffUpload, sniffVideo } from "../dist/media/service.js";
+import { MediaService, avatarMediaId, isMediaId, isSafeUploadFilename, mp4DurationMs, sniffMedia, sniffUpload, sniffVideo } from "../dist/media/service.js";
 
 const png = (size) => ({ mime: "image/png", bytes: Buffer.alloc(size, 1) });
 
@@ -417,6 +417,23 @@ test("MP4 duration respects extended headers, EOF-sized boxes and parent boundar
   const escapedHeader = mvhd(1000, 1234);
   const parent = box("moov", escapedHeader.subarray(0, 8));
   assert.equal(mp4DurationMs(Buffer.concat([parent, escapedHeader.subarray(8)])), undefined, "mvhd cannot borrow bytes beyond moov");
+});
+
+test("browser file names are single safe basenames, and a pending file keeps its name", () => {
+  for (const filename of ["Excel 樞紐分析入門.pdf", "教材-第 1 課.docx", "a".repeat(251) + ".pdf", "no-extension"]) {
+    assert.equal(isSafeUploadFilename(filename), true, filename);
+  }
+  for (const filename of ["", ".", "..", "../evil.pdf", "a/b.pdf", "a\\b.pdf", "C:evil.pdf", "bad:name.pdf", "bad?.pdf", "line\nbreak.pdf", "trailing.pdf ", "trailing.pdf.", "x".repeat(256), 5, null]) {
+    assert.equal(isSafeUploadFilename(filename), false, String(filename));
+  }
+  const media = new MediaService(1024, {});
+  const bytes = Buffer.from("teaching file bytes");
+  const id = media.putFileUpload({ mime: "application/octet-stream", bytes, filename: "Excel 樞紐分析入門.pdf" }, 0);
+  assert.deepEqual(media.getFileUpload(id, 0), { mime: "application/octet-stream", bytes, filename: "Excel 樞紐分析入門.pdf" });
+  assert.equal(media.getMediaUpload(id, 0), undefined, "a general-file id cannot be spent as media");
+  const image = media.putUpload(png(10), 0);
+  assert.equal(media.getFileUpload(image, 0), undefined, "a media id cannot be spent as a general file");
+  assert.ok(media.getMediaUpload(image, 0));
 });
 
 test("pending uploads are bounded by size as well as count, oldest dropped first", () => {

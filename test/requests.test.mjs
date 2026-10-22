@@ -32,8 +32,9 @@ test("a send carries exactly one payload", () => {
   const send = (extra) => parseSend({ requestId: "r1", chatId: CHAT, ...extra }, 8);
   assert.deepEqual(send({ text: "hello" }).value, { requestId: "r1", chatId: CHAT, kind: "text", text: "hello", mentions: [] });
   assert.deepEqual(send({ mediaId: UPLOAD }).value, { requestId: "r1", chatId: CHAT, kind: "media", uploadId: UPLOAD });
+  assert.deepEqual(send({ fileId: UPLOAD }).value, { requestId: "r1", chatId: CHAT, kind: "uploaded-file", uploadId: UPLOAD });
   assert.deepEqual(send({ sticker: { packageId: 1, stickerId: 2 } }).value, { requestId: "r1", chatId: CHAT, kind: "sticker", packageId: 1, stickerId: 2 });
-  for (const mixed of [{ text: "a", mediaId: UPLOAD }, { text: "a", sticker: { packageId: 1, stickerId: 1 } }, { mediaId: UPLOAD, sticker: { packageId: 1, stickerId: 1 } }, {}]) {
+  for (const mixed of [{ text: "a", mediaId: UPLOAD }, { text: "a", fileId: UPLOAD }, { mediaId: UPLOAD, fileId: UPLOAD }, { text: "a", sticker: { packageId: 1, stickerId: 1 } }, { mediaId: UPLOAD, sticker: { packageId: 1, stickerId: 1 } }, {}]) {
     assert.equal(send(mixed).ok, false, JSON.stringify(mixed));
   }
 });
@@ -93,6 +94,16 @@ test("a bot answer file needs a plain .txt basename and bounded strict base64", 
   assert.equal(send({ filename: "x.txt", dataBase64: Buffer.alloc(128 * 1024).toString("base64") }).ok, true);
   assert.equal(parseSend({ requestId: "r1", chatId: CHAT, text: "hi", file: { filename: "x.txt", dataBase64: "QQ==" } }, 100).ok, false, "text+file mixed");
   assert.equal(parseSend({ requestId: "r1", chatId: CHAT, file: { filename: "x.txt", dataBase64: "QQ==" }, replyTo: "5" }, 100).ok, false, "replies only decorate text");
+});
+
+test("an uploaded general file needs a server-issued file id and cannot carry text decorations", () => {
+  const send = (extra) => parseSend({ requestId: "r1", chatId: CHAT, ...extra }, 100);
+  assert.deepEqual(send({ fileId: UPLOAD }).value, { requestId: "r1", chatId: CHAT, kind: "uploaded-file", uploadId: UPLOAD });
+  for (const fileId of ["sticker-1", "upload-xyz", `upload-${"A".repeat(32)}`, `${UPLOAD}0`, "../../session.json", 1]) {
+    assert.equal(send({ fileId }).ok, false, String(fileId));
+  }
+  assert.equal(send({ fileId: UPLOAD, mentions: [] }).ok, false, "mentions only decorate text");
+  assert.equal(send({ fileId: UPLOAD, replyTo: "5" }).ok, false, "replies only decorate text");
 });
 
 test("text is length-capped before trimming and may not be blank; the original text is preserved", () => {

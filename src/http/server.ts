@@ -4,7 +4,7 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import type { Config } from "../config.js";
 import { SlidingWindowLimiter } from "../limit.js";
-import { isMediaId, sniffUpload, type MediaService } from "../media/service.js";
+import { isMediaId, isSafeUploadFilename, sniffUpload, type MediaService } from "../media/service.js";
 import type { ApiTokenStore } from "./apiToken.js";
 
 export interface WebServer {
@@ -64,7 +64,42 @@ export function createWebServer(config: Config, webRoot: string, media: MediaSer
   }
 
   // Uploads are rare and single-user: one budget for the whole (single-browser) server.
+  // Media and general-file uploads share it, so splitting a burst across routes cannot multiply the budget.
   const uploadLimiter = new SlidingWindowLimiter(config.limits.uploadsPerMinute, 60_000);
+
+  function tooLarge(request: IncomingMessage, response: ServerResponse): void {
+    response.writeHead(413, { "Content-Type": "application/json; charset=utf-8", Connection: "close" });
+    response.end(JSON.stringify({ code: "TOO_LARGE" }), () => request.destroy());
+  }
+
+  /** Reads a declared upload body; returns undefined after this function has already answered an error. */
+  async function readUploadBody(request: IncomingMessage, response: ServerResponse, maxBytes: number): Promise<Buffer | undefined> {
+    const declared = Number(request.headers["content-length"]);
+    if (!Number.isSafeInteger(declared) || declared <= 0) {
+      json(response, 400, { code: "INVALID_REQUEST" });
+      return undefined;
+    }
+    if (declared > maxBytes) {
+      tooLarge(request, response);
+      return undefined;
+    }
+    if (!uploadLimiter.allow()) {
+      json(response, 429, { code: "RATE_LIMITED" });
+      return undefined;
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of request as AsyncIterable<Buffer>) {
+      total += chunk.length;
+      // Content-Length can lie; the byte count we actually receive is what is capped.
+      if (total > maxBytes) {
+        tooLarge(request, response);
+        return undefined;
+      }
+      chunks.push(chunk);
+    }
+    return chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
+  }
 
   async function handleUpload(request: IncomingMessage, response: ServerResponse): Promise<void> {
     // Same-origin and cookie-bound: another website must not be able to queue media for sending.
@@ -80,35 +115,8 @@ export function createWebServer(config: Config, webRoot: string, media: MediaSer
       return;
     }
     const maxBytes = isVideo ? config.limits.uploadVideoMaxBytes : config.limits.uploadMaxBytes;
-    const declared = Number(request.headers["content-length"]);
-    if (!Number.isSafeInteger(declared) || declared <= 0) {
-      json(response, 400, { code: "INVALID_REQUEST" });
-      return;
-    }
-    const tooLarge = (): void => {
-      response.writeHead(413, { "Content-Type": "application/json; charset=utf-8", Connection: "close" });
-      response.end(JSON.stringify({ code: "TOO_LARGE" }), () => request.destroy());
-    };
-    if (declared > maxBytes) {
-      tooLarge();
-      return;
-    }
-    if (!uploadLimiter.allow()) {
-      json(response, 429, { code: "RATE_LIMITED" });
-      return;
-    }
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of request as AsyncIterable<Buffer>) {
-      total += chunk.length;
-      // Content-Length can lie; the byte count we actually receive is what is capped.
-      if (total > maxBytes) {
-        tooLarge();
-        return;
-      }
-      chunks.push(chunk);
-    }
-    const bytes = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
+    const bytes = await readUploadBody(request, response, maxBytes);
+    if (!bytes) return;
     const detected = sniffUpload(bytes);
     if (!detected) {
       json(response, 400, { code: "INVALID_MEDIA" });
@@ -116,10 +124,44 @@ export function createWebServer(config: Config, webRoot: string, media: MediaSer
     }
     // A big video must not pass as a picture just because it was declared as a video.
     if (detected.startsWith("image/") && bytes.length > config.limits.uploadMaxBytes) {
-      tooLarge();
+      tooLarge(request, response);
       return;
     }
     json(response, 200, { mediaId: media.putUpload({ mime: detected, bytes }) });
+  }
+
+  async function handleFileUpload(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    // Browser channel only: same-origin plus the per-process browser cookie. The bot API has
+    // no HTTP route and cannot exchange its bearer token for an upload id here.
+    if (!sameOrigin(request) || !hasBrowserCookie(request)) {
+      json(response, 403, { code: "FORBIDDEN" });
+      return;
+    }
+    if (!(request.headers["content-type"] ?? "").startsWith("application/octet-stream")) {
+      json(response, 415, { code: "UNSUPPORTED_MEDIA_TYPE" });
+      return;
+    }
+    // The name travels URI-encoded so non-ASCII teaching-file names survive HTTP headers intact.
+    const encodedFilename = request.headers["x-filename"];
+    let filename: string;
+    try {
+      if (typeof encodedFilename !== "string") throw new Error("filename");
+      filename = decodeURIComponent(encodedFilename);
+    } catch {
+      json(response, 400, { code: "INVALID_FILENAME" });
+      return;
+    }
+    if (!isSafeUploadFilename(filename)) {
+      json(response, 400, { code: "INVALID_FILENAME" });
+      return;
+    }
+    const maxBytes = config.limits.uploadFileMaxBytes ?? 10 * 1024 * 1024;
+    const bytes = await readUploadBody(request, response, maxBytes);
+    if (!bytes) return;
+    // File bytes are deliberately not sniffed or rendered by this server. They stay in memory
+    // under the returned id until a browser WS `message:send` references that id as `fileId`;
+    // the hub then applies the whitelist check and calls LineProvider.sendFile.
+    json(response, 200, { fileId: media.putFileUpload({ mime: "application/octet-stream", bytes, filename }) });
   }
 
   let webRootPath: Promise<string> | undefined;
@@ -137,6 +179,10 @@ export function createWebServer(config: Config, webRoot: string, media: MediaSer
     const url = new URL(request.url ?? "/", `http://${host}`);
     if (request.method === "POST" && url.pathname === "/media/upload") {
       await handleUpload(request, response);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/file/upload") {
+      await handleFileUpload(request, response);
       return;
     }
     if (request.method !== "GET" && request.method !== "HEAD") {

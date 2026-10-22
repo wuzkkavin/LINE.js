@@ -472,4 +472,97 @@ mod win_impl {
         }
         out
     }
+
+    /// 框選截圖 (發送群組訊息頁的「截圖」鈕): 等使用者用滑鼠在畫面上拖出一個範圍,
+    /// 用 GDI 把那塊畫面抓下來存成 PNG (暫存檔), 回傳路徑。按 Esc 或範圍太小 = 取消。
+    /// 前提是呼叫端已把主視窗縮小, 不然會截到程式自己 — 流程由 UI 端負責安排。
+    /// 阻塞式 (輪詢滑鼠狀態), 呼叫端要在背景執行緒呼叫。
+    pub fn capture_screen_region() -> Result<PathBuf, String> {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{
+            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+            ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
+        };
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON};
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+        fn key_down(vk: i32) -> bool {
+            unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
+        }
+        fn cursor() -> (i32, i32) {
+            let mut p = POINT::default();
+            unsafe {
+                let _ = GetCursorPos(&mut p);
+            }
+            (p.x, p.y)
+        }
+        // 先等滑鼠放開 (避免按鈕本身的點擊被當成起點), 再等按下 = 起點, 放開 = 終點
+        while key_down(VK_LBUTTON.0 as i32) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (x0, y0) = loop {
+            if key_down(VK_ESCAPE.0 as i32) {
+                return Err("已取消截圖".into());
+            }
+            if key_down(VK_LBUTTON.0 as i32) {
+                break cursor();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let (x1, y1) = loop {
+            if !key_down(VK_LBUTTON.0 as i32) {
+                break cursor();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let (left, top) = (x0.min(x1), y0.min(y1));
+        let (w, h) = ((x0 - x1).abs(), (y0 - y1).abs());
+        if w < 8 || h < 8 {
+            return Err("選取的範圍太小, 已取消截圖 (請拖出一個明顯的範圍)".into());
+        }
+        unsafe {
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                return Err("抓不到螢幕畫面".into());
+            }
+            let mem = CreateCompatibleDC(screen);
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(mem, HGDIOBJ(bmp.0));
+            let blit = BitBlt(mem, 0, 0, w, h, screen, left, top, SRCCOPY);
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h, // 負值 = 由上往下, 省掉上下翻轉
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bgra = vec![0u8; (w * h * 4) as usize];
+            let got = GetDIBits(mem, bmp, 0, h as u32, Some(bgra.as_mut_ptr() as *mut core::ffi::c_void), &mut info, DIB_RGB_COLORS);
+            let _ = SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem);
+            let _ = ReleaseDC(None, screen);
+            if blit.is_err() || got == 0 {
+                return Err("抓取畫面失敗".into());
+            }
+            // BGRA -> RGBA
+            for px in bgra.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            let img = image::RgbaImage::from_raw(w as u32, h as u32, bgra).ok_or("截圖尺寸不正確")?;
+            let path = std::env::temp_dir().join(format!("aibao-shot-{}.png", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)));
+            img.save(&path).map_err(|e| format!("截圖存檔失敗: {e}"))?;
+            Ok(path)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn capture_screen_region() -> Result<std::path::PathBuf, String> {
+    Err("「截圖」功能在 Windows 版提供".into())
 }

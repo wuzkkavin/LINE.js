@@ -7,6 +7,7 @@ import { evaluateTrigger, markAnswered, markTriggered, createTriggerState, local
 import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, scamVerdictText, scamWarningText, PerMinuteLimiter } from "./scam.mjs";
 import { SECRET_NAMES, DEFAULT_CREATOR_REPLY, DEFAULT_ROLE_PROMPT } from "./config.mjs";
+import { matchNotifyRules, planTargets, NOTIFY_EVENT_KINDS } from "./adminnotify.mjs";
 import { isValidJevToken } from "./jev.mjs";
 
 const COMPANY_HINTS = ["公司", "華葳", "內部", "規定", "請假", "加班", "影印", "列印", "印表機", "分機", "會議室", "系統", "帳號申請", "福利", "薪資", "考勤", "打卡", "公文", "簽呈", "部門", "同仁", "總公司", "工務所"];
@@ -227,7 +228,7 @@ export const DECRYPT_MISSED_MIN_COUNT = 2;
 export const DECRYPT_SEEN_IDS_CAP = 300;
 
 export class HelperBot {
-  constructor({ settings, secrets, ai, kb, logger, registry, reconnectDelaysMs, dailyStatePath = "", decryptMissedOptions } = {}) {
+  constructor({ settings, secrets, ai, kb, logger, registry, reconnectDelaysMs, dailyStatePath = "", decryptMissedOptions, adminEvents = null } = {}) {
     this.settings = settings; // SettingsStore
     this.secrets = secrets;
     this.ai = ai;
@@ -235,6 +236,12 @@ export class HelperBot {
     this.logger = logger;
     // 訊息寄件者登記簿: 認定被引用的訊息是不是機器人自己發的 (引用續答觸發用)
     this.registry = registry ?? new MessageSenderRegistry({ logger });
+    // 管理員通知的事件紀錄 (第四階段): bot 只負責「發生事件 -> 決策/記錄」, 實際送出由 App 殼走瀏覽器通道。
+    // adminEvents 未注入時 (單元測試/舊進入點) 通知功能自動停用, 不影響問答主線。
+    this.adminEvents = adminEvents;
+    // 各聊天室近期發言者 (管理員候選名單 + @ 可行性判斷): chatId -> Map<senderId, { name, lastAt }>
+    // 只存記憶體 (重啟清空); 名稱取訊息自帶的 senderName, 不另外查核心。
+    this.chatSpeakers = new Map();
     this.triggerState = createTriggerState();
     this.scamLimiter = new PerMinuteLimiter(10);
     this.memory = new Map(); // chatId -> [{role, content}]
@@ -359,6 +366,116 @@ export class HelperBot {
 
   activitySnapshot() {
     return [...this.activity];
+  }
+
+  // 記下「誰在這個聊天室說過話」: 管理員候選名單與「@ 不 @ 得到」的判斷都靠這份資料。
+  noteSpeaker(m) {
+    if (!m?.channelId || !m?.senderId) return;
+    let chat = this.chatSpeakers.get(m.channelId);
+    if (!chat) { chat = new Map(); this.chatSpeakers.set(m.channelId, chat); }
+    const prev = chat.get(m.senderId);
+    chat.set(m.senderId, { name: (typeof m.senderName === "string" && m.senderName) || prev?.name || "", lastAt: Date.now() });
+    if (chat.size > 200) { // 只留近期發言者, 避免長跑無限長大 (候選名單本來就只需要近期的人)
+      const oldest = [...chat.entries()].sort((a, b) => a[1].lastAt - b[1].lastAt)[0];
+      if (oldest) chat.delete(oldest[0]);
+    }
+  }
+
+  // 管理員通知: 事件發生 -> 在這裡組白話本文、決定通知誰與用 @ 還是寫名字、寫進事件紀錄。
+  // 真正把訊息送進群組的是 App 殼 (瀏覽器通道, 每隔一段時間來領「還沒送出的待通知」);
+  // 這裡不直接送, 是因為 @ 的可行性與送出都在殼端那條通道上驗證 (規格分工定案)。
+  raiseAdminEvent(kind, { chatId = "", chatName = "", detail = "", text = "", keyword = "" } = {}) {
+    if (!this.adminEvents) return;
+    try {
+      const s = this.cfg();
+      const notify = s.notify ?? { admins: [], rules: [] };
+      const rules = matchNotifyRules(notify, kind, { text });
+      if (!rules.length) return;
+      // 多筆規則命中時合併對象: 任一筆沒勾人 = 通知全部管理員 (planTargets 的既有語意)
+      const union = new Set();
+      let notifyAll = false;
+      for (const r of rules) {
+        const ids = Array.isArray(r.notifyAdminIds) ? r.notifyAdminIds : [];
+        if (!ids.length) notifyAll = true;
+        for (const id of ids) union.add(id);
+      }
+      const mergedRule = { notifyAdminIds: notifyAll ? [] : [...union] };
+      // @ 可行性: 有在這個聊天室發言紀錄 = hasSpoken true; 完全查不到這個聊天室的發言紀錄時
+      // 不給 presence (planTargets 預設可 @, 送出端真的被核心擋下時殼端會改用寫名字並註明)。
+      const speakers = this.chatSpeakers.get(chatId);
+      const presence = {};
+      if (speakers) {
+        for (const a of notify.admins ?? []) presence[a.id] = { hasSpoken: speakers.has(a.id) };
+      }
+      const targets = planTargets({ rule: mergedRule, admins: notify.admins ?? [], presence });
+      const now = new Date();
+      const p2 = (n) => String(n).padStart(2, "0");
+      const timeText = `${p2(now.getHours())}:${p2(now.getMinutes())}`;
+      const label = NOTIFY_EVENT_KINDS[kind]?.label ?? "通知";
+      const where = chatName ? `『${chatName}』` : "群組";
+      const message = `${label}：${where}${detail}（${timeText}）`;
+      const r = this.adminEvents.record({ kind, chatId, chatName, detail: keyword ? `關鍵字「${keyword}」` : detail, targets, message });
+      if (r.action === "notify") {
+        this.logger?.info("管理員通知", "已記錄待通知事件, 等 App 送出", { kind, chat: chatId, targets: targets.length });
+      } else {
+        this.logger?.debugLog("管理員通知", "事件只寫進紀錄, 不另行通知", { kind, chat: chatId, reason: r.reason });
+      }
+    } catch (e) {
+      // 通知是旁路功能: 任何錯誤都不能影響問答主線, 只留 log
+      this.logger?.warn("管理員通知", "記錄事件時發生錯誤, 已略過", { kind, error: String(e?.message ?? e) });
+    }
+  }
+
+  // 關鍵字規則掃描: 每則真人訊息都比對 (規則沒設定時 matchNotifyRules 直接回空, 成本可忽略)。
+  checkKeywordRules(m) {
+    if (!this.adminEvents || !m?.text) return;
+    const notify = this.cfg().notify ?? { admins: [], rules: [] };
+    const matched = matchNotifyRules(notify, "keyword", { text: m.text });
+    if (!matched.length) return;
+    const kw = typeof matched[0].keyword === "string" ? matched[0].keyword.trim() : "";
+    this.raiseAdminEvent("keyword", {
+      chatId: m.channelId, chatName: this.chatNames.get(m.channelId) ?? "",
+      detail: `有人提到「${kw}」, 請管理員留意。`, text: m.text, keyword: kw,
+    });
+  }
+
+  // 向核心查 OpenChat 的管理員 (只有社群聊天室有; 一般群組核心會回錯誤, 呼叫端忽略即可)。
+  async queryChatAdmins(chatId) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error("NOT_CONNECTED");
+    return new Promise((resolve, reject) => {
+      const requestId = `h${++this.reqSeq}-${Date.now()}`;
+      const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error("TIMEOUT")); }, 8000);
+      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
+      this.sendFrame({ type: "chat:admins:get", requestId, chatId });
+    });
+  }
+
+  // 管理員候選名單: ① 白名單群組近期發言者 (noteSpeaker 累積) ② OpenChat 管理員查詢。
+  // 回 [{ id, name, chats: [聊天室名], source }] — 殼端「管理員名單」勾選清單的來源, 不用手打代號。
+  async adminCandidates() {
+    const byId = new Map();
+    const add = (id, name, chatName, source) => {
+      if (!id) return;
+      const cur = byId.get(id) ?? { id, name: "", chats: [], source };
+      if (name) cur.name = name;
+      if (chatName && !cur.chats.includes(chatName)) cur.chats.push(chatName);
+      if (source === "openchat-admin") cur.source = "openchat-admin";
+      byId.set(id, cur);
+    };
+    for (const [chatId, speakers] of this.chatSpeakers) {
+      const chatName = this.chatNames.get(chatId) ?? "";
+      for (const [id, info] of speakers) add(id, info.name, chatName, "speaker");
+    }
+    if (this.connected) {
+      for (const chatId of [...this.botChats]) {
+        try {
+          const frame = await this.queryChatAdmins(chatId);
+          const chatName = this.chatNames.get(chatId) ?? "";
+          for (const a of frame?.admins ?? []) add(a.userId, a.displayName ?? "", chatName, "openchat-admin");
+        } catch { /* 不是 OpenChat 或查不到: 略過, 發言者來源已涵蓋 */ }
+      }
+    }
+    return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
   cfg() { return this.settings.get(); }
   rollStats() {
@@ -724,6 +841,11 @@ export class HelperBot {
           continue;
         }
         const messages = Array.isArray(frame.messages) ? frame.messages : [];
+        // 順帶補登發言者: 歷史裡出現過的人, 管理員候選名單與 @ 可行性判斷都算得進來
+        // (只記 id/顯示名, 與即時訊息的 noteSpeaker 同一隱私規格)。
+        for (const hm of messages) {
+          if (hm?.senderId) this.noteSpeaker({ channelId: chatId, senderId: hm.senderId, senderName: hm.senderName });
+        }
         let failed = 0;
         let lastFailAtMs = 0;
         const senders = new Set();
@@ -754,6 +876,11 @@ export class HelperBot {
           this.logger?.warn("訊息解密偵測", "偵測到無法解密的訊息 (核心讀不到內容, 機器人不會回覆這些訊息)", {
             chat: chatId, name: this.chatNames.get(chatId) ?? "", failed, scanned: messages.length,
             lastFailAt: rec.lastFailAt, senders: rec.senders,
+          });
+          // 管理員通知 (自己出狀況): 鑰匙對不上是事故級訊號, 只在轉移的那一輪發 (節流在事件紀錄端也有)
+          this.raiseAdminEvent("selfError", {
+            chatId, chatName: this.chatNames.get(chatId) ?? "",
+            detail: `這個群組有 ${failed} 則訊息我讀不到（鑰匙對不上），那些訊息我不會回覆，請管理員處理。`,
           });
         } else if (failed === 0 && prev && prev.failed > 0) {
           this.logger?.info("訊息解密偵測", "先前無法解密的訊息已不在近期範圍內 (可能已重新登入或已超出掃描範圍)", {
@@ -797,6 +924,11 @@ export class HelperBot {
         if (isMissAlert && !wasMissAlert) {
           this.logger?.warn("訊息解密偵測", "偵測到訊息漏接 (訊息已在聊天室歷史裡, 卻沒有送到機器人這裡; 該聊天室可能已完全收不到)", {
             chat: chatId, name: this.chatNames.get(chatId) ?? "", missed, newestMissedAt: missedRec.newestMissedAt,
+          });
+          // 管理員通知 (自己出狀況): 整個群組收不到比單則讀不到更嚴重, 同樣要在轉移時通知
+          this.raiseAdminEvent("selfError", {
+            chatId, chatName: this.chatNames.get(chatId) ?? "",
+            detail: `這個群組有 ${missed} 則訊息根本沒有送到我這裡，這個群組的訊息我現在可能整個收不到，請管理員處理。`,
           });
         } else if (!isMissAlert && wasMissAlert) {
           this.logger?.info("訊息解密偵測", "先前的訊息漏接已解除", {
@@ -933,6 +1065,8 @@ export class HelperBot {
     this.logger?.logText("訊息接收", "訊息", m.text);
     // 每則看到的訊息都登記寄件者 (含機器人自己的): 之後被引用時才認得出來源
     if (m.messageId && m.senderId) this.registry.register(m.messageId, m.senderId, m.channelId ?? "");
+    // 發言者登記 (管理員候選名單/@ 可行性): 只記 id 與顯示名, 不記內容
+    this.noteSpeaker(m);
     if (m.senderId === this.selfId) { this.logger?.debugLog("觸發判斷", "忽略自己發的訊息", { id: m.messageId }); return; }
     // 系統事件不觸發 (2026-10-21 第二段追加): 成員加入/離開等系統通知在核心是
     // contentType CHATEVENT (或原始碼 "18"), 內文是核心組好的顯示字串 (例如
@@ -941,6 +1075,8 @@ export class HelperBot {
     // 自己的入群通知)。系統事件不是提問, 一律不觸發問答、也不送防詐騙判讀;
     // 寄件者登記已在上方完成, 不影響引用認定。
     if (m.contentType === "CHATEVENT" || m.contentType === "18") { this.logger?.debugLog("觸發判斷", "系統事件訊息, 不觸發", { id: m.messageId }); return; }
+    // 管理員通知的關鍵字掃描: 與觸發/防詐騙獨立, 命中只記錄事件 (送出由 App 殼負責), 不影響問答
+    this.checkKeywordRules(m);
     // 兩件事並行評估: 防詐騙自動掃描 + 名字觸發; 先處理觸發問答, 詐騙警告獨立進行
     const triggerPromise = this.handleTrigger(m, s);
     const scamPromise = this.handleAutoScam(m, s);
@@ -962,6 +1098,11 @@ export class HelperBot {
       this.persistDaily();
       await this.sendText(m.channelId, scamWarningText({ ...verdict, botName: s.botName }), m.messageId).catch((e) => this.logger?.error("防詐騙", "警告送出失敗", { error: String(e?.message ?? e) }));
       this.recordActivity({ kind: "scam_warned", m, detail: verdict.tactic ?? "" });
+      // 管理員通知 (詐騙警報): 警告發出後同步通知管理員, 讓人可以進群看狀況
+      this.raiseAdminEvent("scam", {
+        chatId: m.channelId, chatName: this.chatNames.get(m.channelId) ?? "",
+        detail: `有人貼了一則疑似詐騙的訊息（手法：${verdict.tactic ?? "其他"}，判讀機率 ${Math.round((verdict.probability ?? 0) * 100)}%），我已經在群組裡發出警告，請管理員留意。`,
+      });
     }
   }
 
@@ -1141,6 +1282,11 @@ export class HelperBot {
       this.stats.answered++;
       this.persistDaily();
       this.recordActivity({ kind: "answered", m, answerChars: missText.length, answerText: missText });
+      // 管理員通知 (答不出來): 公司問題但知識庫查不到 — 管理員才知道要補文件進知識庫
+      this.raiseAdminEvent("unanswered", {
+        chatId: m.channelId, chatName: this.chatNames.get(m.channelId) ?? "",
+        detail: "有同事問了公司相關的問題，但我在知識庫裡查不到，已經回覆他先問資訊部。這一題我沒有回答出來，如果有相關文件，請管理員放進知識庫資料夾。",
+      });
       return;
     }
     const mem = this.memory.get(m.channelId) ?? [];
@@ -1204,6 +1350,24 @@ export class HelperBot {
     this.stats.answered++;
     this.persistDaily();
     this.recordActivity({ kind: aiFailedKind || "answered", m, answerChars: answer.length, ms: aiMs, answerText: aiFailedKind ? null : answer });
+    // 管理員通知 (答不出來 / 自己出狀況): AI 連不上或忙碌要讓管理員知道; 回答根本送不出去是另一種
+    if (aiFailedKind === "ai_failed") {
+      this.raiseAdminEvent("unanswered", {
+        chatId: m.channelId, chatName: this.chatNames.get(m.channelId) ?? "",
+        detail: "我連不上 AI 服務，有一題沒有回答出來。請管理員有空到設定頁按「測試連線」確認。",
+      });
+    } else if (aiFailedKind === "ai_busy") {
+      this.raiseAdminEvent("unanswered", {
+        chatId: m.channelId, chatName: this.chatNames.get(m.channelId) ?? "",
+        detail: "AI 服務忙碌中，有一題暫時沒有回答出來。",
+      });
+    }
+    if (delivery === "failed") {
+      this.raiseAdminEvent("selfError", {
+        chatId: m.channelId, chatName: this.chatNames.get(m.channelId) ?? "",
+        detail: "我剛剛有一則回答送不出去，請管理員留意我的連線狀態。",
+      });
+    }
     const turns = [...mem, { role: "user", content: question }, { role: "assistant", content: answer }].slice(-(s.ai.memoryTurns ?? 6) * 2);
     this.memory.set(m.channelId, turns);
     this.logger?.info("機器人回覆", "已回覆", { id: m.messageId, chars: answer.length, today: count, kbHits: hits.length, delivery });

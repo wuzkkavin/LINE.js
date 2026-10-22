@@ -60,7 +60,38 @@ pub type SharedLogin = Arc<Mutex<LoginUi>>;
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
 
-fn fetch_cookie() -> Result<String, String> {
+/// 最近一次「有人進群」的系統事件時間 (chatId -> epoch 毫秒)。
+/// 用途: 發送排程的鑰匙交接護欄 — 群組有人進來時 LINE 會換讀訊息的鑰匙, 交接的一兩分鐘內
+/// 不要排發送 (2026-10-21 事故定版的暫時避險)。資料來自核心推播的 CHATEVENT 訊息
+/// (這一條登入連線本來就收得到全部聊天室的訊息事件), 只記時間、不記內容。
+static RECENT_JOINS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, i64>>> = std::sync::OnceLock::new();
+
+pub fn recent_joins_snapshot() -> std::collections::HashMap<String, i64> {
+    RECENT_JOINS.get_or_init(|| Mutex::new(std::collections::HashMap::new())).lock().unwrap().clone()
+}
+
+fn note_join_if_system_event(frame: &serde_json::Value) {
+    let m = match frame.get("message") {
+        Some(m) => m,
+        None => return,
+    };
+    let ct = m.get("contentType").and_then(|v| v.as_str()).unwrap_or("");
+    if ct != "CHATEVENT" && ct != "18" {
+        return;
+    }
+    let text = m.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    // 核心組好的系統事件字串 (例如「某人 新增 某人 至群組」); 只認「加人」類, 退群/改名不算
+    if !(text.contains("新增") || text.contains("加入") || text.contains("invited")) {
+        return;
+    }
+    if let Some(chat) = m.get("channelId").and_then(|v| v.as_str()) {
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        RECENT_JOINS.get_or_init(|| Mutex::new(std::collections::HashMap::new())).lock().unwrap().insert(chat.to_string(), now_ms);
+        shell::log_line(&format!("偵測到有人進群 (排程護欄): {chat}"));
+    }
+}
+
+pub(crate) fn fetch_cookie() -> Result<String, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(2))
         .timeout_read(Duration::from_secs(3))
@@ -333,6 +364,10 @@ fn run_connection(
                     drop(g);
                     poke(state);
                 }
+            }
+            "message" => {
+                // 只用來記「有人進群」的時間 (排程鑰匙交接護欄); 內容不進 log、不落盤
+                note_join_if_system_event(&frame);
             }
             "error" => {
                 let code = frame.get("code").and_then(|v| v.as_str()).unwrap_or("");

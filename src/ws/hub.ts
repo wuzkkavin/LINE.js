@@ -435,9 +435,12 @@ export function createHub(options: HubOptions): Hub {
     const channel = store.channelOf(request.chatId);
     if (login.state !== "ready" || !channel || (scope && !scope.has(request.chatId))) return fail(socket, "UNKNOWN_CHAT", request.requestId);
     const account = generation;
-    // Bots send text and small answer files: media goes through the browser upload, and
-    // stickers are outside their scope.
+    // Bots send text and small answer files: media and browser-uploaded general files go
+    // through the browser channel, and stickers are outside their scope.
     if (scope && request.kind !== "text" && request.kind !== "file") return fail(socket, "INVALID_REQUEST", request.requestId);
+    // A general file uploaded over the browser HTTP route is narrower than ordinary page
+    // media: even on a page connection it may only be sent into the configured whitelist.
+    if (!scope && request.kind === "uploaded-file" && !botScope.has(request.chatId)) return fail(socket, "UNKNOWN_CHAT", request.requestId);
     const target = { channelId: request.chatId, kind: channel.kind };
     if (request.kind === "text") {
       // Cached speakers remain taggable; a bot may also tag admins it just queried in this chat.
@@ -462,9 +465,16 @@ export function createHub(options: HubOptions): Hub {
     try {
       let message: Message;
       if (request.kind === "media") {
-        const upload = media.getUpload(request.uploadId);
+        const upload = media.getMediaUpload(request.uploadId);
         if (!upload) return fail(socket, "UPLOAD_EXPIRED", request.requestId);
         message = await provider.sendMedia(target, upload);
+        media.dropUpload(request.uploadId);
+      } else if (request.kind === "uploaded-file") {
+        const upload = media.getFileUpload(request.uploadId);
+        // Upload ids are not interchangeable in either direction: pending uploads remember
+        // whether the browser supplied an image/video or a general file (which also has a name).
+        if (!upload?.filename) return fail(socket, "UPLOAD_EXPIRED", request.requestId);
+        message = await provider.sendFile(target, upload.filename, upload.bytes);
         media.dropUpload(request.uploadId);
       } else if (request.kind === "text") {
         message = await provider.sendText(target, request.text, { mentions: request.mentions, ...(request.replyTo ? { replyTo: request.replyTo } : {}) });

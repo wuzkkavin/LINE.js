@@ -142,7 +142,7 @@ async function start(t, { restore = true, readReceipts = true, api = {}, scam } 
     history: { defaultLimit: 50 },
     chat: { sendReadReceipts: readReceipts },
     api: { enabled: false, chats: [], sendsPerMinute: 20, ...api },
-    limits: { frameMaxBytes: 1024, textMaxLength: 20, sendsPerSecond: 5, uploadMaxBytes: 2048, uploadVideoMaxBytes: 8192, uploadsPerMinute: 3 },
+    limits: { frameMaxBytes: 1024, textMaxLength: 20, sendsPerSecond: 5, uploadMaxBytes: 2048, uploadFileMaxBytes: 2048, uploadVideoMaxBytes: 8192, uploadsPerMinute: 3 },
   };
   const provider = new FakeProvider();
   provider.restoreResult = restore;
@@ -582,6 +582,20 @@ async function upload(env, body, headers = {}) {
   return fetch(`http://127.0.0.1:${env.port}/media/upload`, {
     method: "POST",
     headers: { Cookie: env.cookie, Origin: `http://127.0.0.1:${env.port}`, "Content-Type": "image/png", ...headers },
+    body,
+  });
+}
+
+async function uploadFile(env, body, filename = "Excel 樞紐分析入門.pdf", headers = {}) {
+  return fetch(`http://127.0.0.1:${env.port}/file/upload`, {
+    method: "POST",
+    headers: {
+      Cookie: env.cookie,
+      Origin: `http://127.0.0.1:${env.port}`,
+      "Content-Type": "application/octet-stream",
+      "X-Filename": encodeURIComponent(filename),
+      ...headers,
+    },
     body,
   });
 }
@@ -1829,6 +1843,79 @@ test("a bot can send a small .txt answer file in an allowed chat only; bad file 
   }
   assert.equal((await ask({ type: "message:send", requestId: "fx9", chatId: CHAT, text: "混搭", file: { filename: "ok.txt", dataBase64: content.toString("base64") } }, (f) => f.type === "error")).code, "INVALID_REQUEST", "mixed text+file refused");
   assert.equal(env.provider.fileSends.length, 1, "被拒的檔案一律不送達 LINE");
+});
+
+test("a browser-uploaded general file is sent by fileId only into a whitelisted chat, through sendFile", async (t) => {
+  const env = await botEnv(t);
+  const bytes = Buffer.from("%PDF-1.7\n教材內容不是圖片，也不需要被核心嗅探顯示。", "utf8");
+
+  // The HTTP route is browser-only and validates the raw-file contract before any upload budget is spent.
+  assert.equal((await uploadFile(env, bytes, "教材.pdf", { Cookie: "" })).status, 403, "no browser cookie");
+  assert.equal((await uploadFile(env, bytes, "教材.pdf", { Origin: "http://evil.example" })).status, 403, "foreign origin");
+  assert.equal((await uploadFile(env, bytes, "教材.pdf", { "Content-Type": "text/plain" })).status, 415);
+  const badName = await uploadFile(env, bytes, "../evil.pdf");
+  assert.equal(badName.status, 400);
+  assert.deepEqual(await badName.json(), { code: "INVALID_FILENAME" });
+  assert.equal((await uploadFile(env, Buffer.alloc(2049), "教材.pdf")).status, 413, "over the configured 2048-byte file limit");
+
+  const uploaded = await uploadFile(env, bytes);
+  assert.equal(uploaded.status, 200);
+  const { fileId } = await uploaded.json();
+  assert.match(fileId, /^upload-[a-f0-9]{32}$/);
+
+  const pageAsk = async (frame) => {
+    env.page.socket.send(JSON.stringify(frame));
+    return env.page.until((reply) => reply.requestId === frame.requestId && (reply.type === "sent" || reply.type === "error"));
+  };
+
+  // A failed LINE send keeps the pending upload, matching the media path; success consumes it exactly once.
+  env.provider.sendError = new Error("down");
+  assert.equal((await pageAsk({ type: "message:send", requestId: "gf1", chatId: CHAT, fileId })).code, "SEND_FAILED");
+  env.provider.sendError = undefined;
+  const sent = await pageAsk({ type: "message:send", requestId: "gf2", chatId: CHAT, fileId });
+  assert.equal(sent.type, "sent");
+  assert.equal(sent.messageId, "9101");
+  const delivered = env.provider.fileSends.at(-1);
+  assert.equal(delivered.filename, "Excel 樞紐分析入門.pdf");
+  assert.deepEqual(delivered.bytes, bytes, "一般檔案位元組必須原樣到達 provider.sendFile");
+  assert.equal((await pageAsk({ type: "message:send", requestId: "gf3", chatId: CHAT, fileId })).code, "UPLOAD_EXPIRED", "a consumed fileId cannot be reused");
+
+  // A bot may hold the same opaque id, but its connection can never spend it.
+  const botFile = await uploadFile(env, Buffer.from("Word 教材內容", "utf8"), "補充教材.docx");
+  const { fileId: botFileId } = await botFile.json();
+  const bot = await env.open();
+  bot.socket.send(JSON.stringify({ type: "message:send", requestId: "gf4", chatId: CHAT, fileId: botFileId }));
+  assert.equal((await bot.until((frame) => frame.requestId === "gf4")).code, "INVALID_REQUEST");
+  assert.equal(env.provider.fileSends.filter(({ filename }) => filename === "補充教材.docx").length, 0);
+
+  // Even the browser channel is narrower for general files: known but non-whitelisted chats are refused.
+  env.hub.handleMessage({ messageId: "42", channelId: OTHER, channelKind: "group", senderId: "u1", senderName: "小明", text: "別群", contentType: "NONE", createdAt: 4 }, "new");
+  const otherFile = await uploadFile(env, Buffer.from("另一份教材", "utf8"), "別群教材.pdf");
+  const { fileId: otherFileId } = await otherFile.json();
+  assert.equal((await pageAsk({ type: "message:send", requestId: "gf5", chatId: OTHER, fileId: otherFileId })).code, "UNKNOWN_CHAT");
+  assert.equal(env.provider.fileSends.filter(({ filename }) => filename === "別群教材.pdf").length, 0);
+
+  // Three accepted uploads in this environment exhaust the shared 3-per-minute upload budget.
+  assert.equal((await uploadFile(env, Buffer.from("第四份", "utf8"), "第四份.pdf")).status, 429);
+});
+
+test("media and general-file upload ids cannot be spent as each other", async (t) => {
+  const env = await botEnv(t);
+  const response = await upload(env, PNG);
+  assert.equal(response.status, 200);
+  const { mediaId } = await response.json();
+  env.page.socket.send(JSON.stringify({ type: "message:send", requestId: "gf-media", chatId: CHAT, fileId: mediaId }));
+  const refused = await env.page.until((frame) => frame.requestId === "gf-media");
+  assert.equal(refused.code, "UPLOAD_EXPIRED");
+  assert.equal(env.provider.fileSends.length, 0);
+
+  const fileResponse = await uploadFile(env, Buffer.from("教材檔案", "utf8"), "教材.pdf");
+  assert.equal(fileResponse.status, 200);
+  const { fileId } = await fileResponse.json();
+  env.page.socket.send(JSON.stringify({ type: "message:send", requestId: "gf-as-media", chatId: CHAT, mediaId: fileId }));
+  const refusedAsMedia = await env.page.until((frame) => frame.requestId === "gf-as-media");
+  assert.equal(refusedAsMedia.code, "UPLOAD_EXPIRED");
+  assert.equal(env.provider.calls.filter(([kind]) => kind === "media").length, 0);
 });
 
 test("a bot can ask for this account's own id at any time, only while signed in", async (t) => {

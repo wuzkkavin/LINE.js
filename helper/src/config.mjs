@@ -71,6 +71,9 @@ export function defaultSettings() {
       jev: { enabled: false, model: "jev-1.13.0" },
     },
     kb: { folder: "" },
+    // 管理員通知 (非機密, publicView 明文回傳): admins=[{id,name}] 由畫面勾選產生、不手打代號;
+    // rules=[{id,kind,keyword,notifyAdminIds,enabled}], kind 見 adminnotify.mjs 的 NOTIFY_EVENT_KINDS
+    notify: { admins: [], rules: [] },
     log: { debug: false, retentionDays: 14 },
   };
 }

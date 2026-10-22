@@ -24,6 +24,7 @@ export interface HistoryRequest {
 export type SendRequest = { requestId: string; chatId: string } & (
   | { kind: "text"; text: string; mentions: Mention[]; replyTo?: string }
   | { kind: "media"; uploadId: string }
+  | { kind: "uploaded-file"; uploadId: string }
   | { kind: "sticker"; packageId: number; stickerId: number }
   | { kind: "file"; filename: string; bytes: Buffer }
 );
@@ -90,9 +91,9 @@ export function parseSend(frame: Record<string, unknown>, textMaxLength: number)
   const base = header(frame);
   if (!base) return { ok: false, ...(requestIdOf(frame) ? { requestId: requestIdOf(frame)! } : {}) };
   const refuse: Parsed<SendRequest> = { ok: false, requestId: base.requestId };
-  const { text, mediaId, sticker, file, mentions, replyTo } = frame;
+  const { text, mediaId, fileId, sticker, file, mentions, replyTo } = frame;
   // Exactly one payload: a frame that mixes kinds is ambiguous, so nothing is sent.
-  if ([text, mediaId, sticker, file].filter((part) => part !== undefined).length !== 1) return refuse;
+  if ([text, mediaId, fileId, sticker, file].filter((part) => part !== undefined).length !== 1) return refuse;
   // Mentions and replies decorate a text message; on anything else they make the frame ambiguous.
   if (text === undefined && (mentions !== undefined || replyTo !== undefined)) return refuse;
   if (file !== undefined) {
@@ -116,6 +117,10 @@ export function parseSend(frame: Record<string, unknown>, textMaxLength: number)
   if (mediaId !== undefined) {
     if (typeof mediaId !== "string" || !isUploadId(mediaId)) return refuse;
     return { ok: true, value: { ...base, kind: "media", uploadId: mediaId } };
+  }
+  if (fileId !== undefined) {
+    if (typeof fileId !== "string" || !isUploadId(fileId)) return refuse;
+    return { ok: true, value: { ...base, kind: "uploaded-file", uploadId: fileId } };
   }
   if (!sticker || typeof sticker !== "object" || Array.isArray(sticker)) return refuse;
   const { packageId, stickerId } = sticker as Record<string, unknown>;

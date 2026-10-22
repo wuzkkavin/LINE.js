@@ -7,6 +7,7 @@ mod chatview;
 mod core_ws;
 mod engine;
 mod helper_api;
+mod pagesend;
 mod platform;
 mod probe;
 mod shell;
@@ -48,6 +49,7 @@ enum Page {
     Overview,
     LineLogin,
     ChatRoom,
+    SendMessages,
     AiSettings,
     BotSettings,
     KbSettings,
@@ -58,10 +60,11 @@ enum Page {
 }
 
 /// 側欄導覽順序與標籤 (圖示與頁面一一對應, 順序即 nav_icons 的索引)。
-const NAV_PAGES: [(Page, &str); 10] = [
+const NAV_PAGES: [(Page, &str); 11] = [
     (Page::Overview, "總覽"),
     (Page::LineLogin, "LINE 登入"),
     (Page::ChatRoom, "聊天室畫面"),
+    (Page::SendMessages, "發送群組訊息"),
     (Page::AiSettings, "AI 設定"),
     (Page::BotSettings, "機器人與觸發"),
     (Page::KbSettings, "知識庫"),
@@ -79,6 +82,8 @@ fn nav_icon_bytes(page: Page) -> &'static [u8] {
         Page::Overview => include_bytes!("../assets/icons/nav-overview-256.png"),
         Page::LineLogin => include_bytes!("../assets/icons/nav-line-login-256.png"),
         Page::ChatRoom => include_bytes!("../assets/icons/nav-chat-256.png"),
+        // 發送群組訊息頁暫用聊天圖示占位: 依設計通則側欄圖示須自繪, 正式圖示待設計批補畫 (施工紀錄第一階段註明)
+        Page::SendMessages => include_bytes!("../assets/icons/nav-chat-256.png"),
         Page::AiSettings => include_bytes!("../assets/icons/nav-ai-settings-256.png"),
         Page::BotSettings => include_bytes!("../assets/icons/nav-bot-256.png"),
         Page::KbSettings => include_bytes!("../assets/icons/nav-kb-256.png"),
@@ -100,6 +105,23 @@ struct ProviderForm {
     models: Vec<String>,
     models_msg: Option<String>,
     test_msg: Option<String>,
+}
+
+/// 發送群組訊息頁選好的一個媒體 (圖片/檔案): ref_path 是本機路徑, 或 "materials:<檔名>" (教材庫)
+#[derive(Clone)]
+struct SendMediaSel {
+    name: String,
+    size: u64,
+    ref_path: String,
+}
+
+/// 管理員通知的一筆事件規則 (機器人與觸發頁編輯; 存進 settings.notify.rules, 形狀見 helper/src/adminnotify.mjs)
+#[derive(Clone, Default)]
+struct NotifyRuleForm {
+    kind: String,
+    keyword: String,
+    enabled: bool,
+    admin_ids: Vec<String>,
 }
 
 #[derive(Default)]
@@ -136,6 +158,9 @@ struct SettingsForm {
     line_token_configured: bool,
     line_token_last4: String,
     line_token_input: String,
+    // 管理員通知: admins 是 (帳號, 顯示名); 名單由候選清單勾選產生 (不用手打代號), 候選來自白名單群組發言者+OpenChat 管理員 (第四階段接通)
+    notify_admins: Vec<(String, String)>,
+    notify_rules: Vec<NotifyRuleForm>,
     save_msg: Option<String>,
 }
 
@@ -188,6 +213,39 @@ struct App {
     activity: Option<serde_json::Value>,
     activity_fetched_at: Option<std::time::Instant>,
     activity_msg: Option<String>,
+    // 發送群組訊息頁 (2026-10-22 第一階段): 表單狀態 + 待發清單/紀錄的載入 slot
+    send_chat_id: String,
+    send_chat_name: String,
+    send_text: String,
+    send_mode: String,
+    send_once_at: String,
+    send_repeat_kind: String,
+    send_cycle: String,
+    send_time: String,
+    send_weekdays: [bool; 7],
+    send_month_day: u32,
+    send_msg: Option<String>,
+    outbox_slot: Slot<Value>,
+    outbox_entries: Vec<Value>,
+    outbox_attempted: bool,
+    outbox_action_slot: Slot<Value>,
+    // 發送群組訊息 (第三階段): 選好的圖片/檔案、系列每一份的文字、教材庫與排程計時
+    send_images: Vec<SendMediaSel>,
+    send_files: Vec<SendMediaSel>,
+    send_series: Vec<String>,
+    materials: Vec<Value>,
+    materials_slot: Slot<Value>,
+    materials_attempted: bool,
+    /// 這次程式啟動的時間 (epoch 毫秒): 排程「程式沒開時錯過」的判定基準 (pagesend::plan_entry)
+    send_engine_started_ms: i64,
+    last_send_tick: Option<std::time::Instant>,
+    send_tick_slot: Slot<Value>,
+    // 管理員通知 (第四階段): 事件紀錄與候選名單 (機器人與觸發頁顯示/勾選)
+    admin_events: Vec<Value>,
+    admin_events_slot: Slot<Value>,
+    admin_events_attempted: bool,
+    candidates: Vec<Value>,
+    candidates_slot: Slot<Value>,
     // 嵌入聊天畫面 (2026-10-21 新增「聊天室畫面」頁): WebView 宿主、主視窗代碼、profile 目錄
     chatview: chatview::ChatViewHost,
     parent_hwnd: Option<isize>,
@@ -227,7 +285,7 @@ struct App {
     theme_id: theme::ThemeId,
     palette: theme::Palette,
     /// 側欄圖示紋理, 索引與 NAV_PAGES 對齊; 解碼失敗為 None (側欄退回純文字, 已記 log)。
-    nav_icons: [Option<egui::TextureHandle>; 10],
+    nav_icons: [Option<egui::TextureHandle>; 11],
     #[cfg(windows)]
     tray: Option<Tray>,
 }
@@ -580,7 +638,7 @@ impl App {
         });
 
         // 側欄圖示: 任一顆解碼失敗只退回該顆純文字按鈕並記 log, 不 panic、不擋啟動。
-        let mut nav_icons: [Option<egui::TextureHandle>; 10] = Default::default();
+        let mut nav_icons: [Option<egui::TextureHandle>; 11] = Default::default();
         for (idx, (page, _)) in NAV_PAGES.iter().enumerate() {
             nav_icons[idx] = decode_image_rgba(nav_icon_bytes(*page)).map(|(rgba, w, h)| {
                 let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
@@ -610,6 +668,7 @@ impl App {
             Ok("login") => Page::LineLogin,
             Ok("ai") => Page::AiSettings,
             Ok("bot") => Page::BotSettings,
+            Ok("send") => Page::SendMessages,
             _ => Page::Overview,
         };
         if start_page != Page::Overview {
@@ -644,6 +703,35 @@ impl App {
             activity: None,
             activity_fetched_at: None,
             activity_msg: None,
+            send_chat_id: String::new(),
+            send_chat_name: String::new(),
+            send_text: String::new(),
+            send_mode: "now".to_string(),
+            send_once_at: String::new(),
+            send_repeat_kind: "same".to_string(),
+            send_cycle: "weekly".to_string(),
+            send_time: "09:00".to_string(),
+            send_weekdays: [false, true, false, false, false, false, false],
+            send_month_day: 1,
+            send_msg: None,
+            outbox_slot: Arc::new(Mutex::new(None)),
+            outbox_entries: Vec::new(),
+            outbox_attempted: false,
+            outbox_action_slot: Arc::new(Mutex::new(None)),
+            send_images: Vec::new(),
+            send_files: Vec::new(),
+            send_series: vec![String::new()],
+            materials: Vec::new(),
+            materials_slot: Arc::new(Mutex::new(None)),
+            materials_attempted: false,
+            send_engine_started_ms: pagesend::now_ms(),
+            last_send_tick: None,
+            send_tick_slot: Arc::new(Mutex::new(None)),
+            admin_events: Vec::new(),
+            admin_events_slot: Arc::new(Mutex::new(None)),
+            admin_events_attempted: false,
+            candidates: Vec::new(),
+            candidates_slot: Arc::new(Mutex::new(None)),
             chatview: chatview::ChatViewHost::new(),
             parent_hwnd,
             webview_profile_dir: shell::data_dir().join("webview2-profile"),
@@ -1084,7 +1172,258 @@ fn chat_kind_label(kind: &str) -> &str {
     }
 }
 
+/// 逐項送出一筆待發的內容 (文字走瀏覽器通道、圖片先上傳拿 mediaId 再送、
+/// 檔案先 POST /file/upload 拿 fileId 再送 — 第二階段介面契約, 2026-10-22 接通)。
+/// prev 有值時 = 重送模式: 上次成功的項目原樣保留、不重送, 只送失敗的。
+/// 回傳與 pagesend::flatten_entry 同序的逐項結果 [{ok, note}]。
+fn send_entry_items(ch: &mut pagesend::PageChannel, entry: &Value, prev: Option<&Vec<Value>>) -> Vec<Value> {
+    let chat = entry.get("chatId").and_then(|v| v.as_str()).unwrap_or("");
+    let flat = pagesend::flatten_entry(entry);
+    let mut out = Vec::new();
+    for (i, item) in flat.iter().enumerate() {
+        if let Some(prev) = prev {
+            if prev.get(i).and_then(|r| r.get("ok")).and_then(|b| b.as_bool()).unwrap_or(false) {
+                out.push(prev[i].clone());
+                continue;
+            }
+        }
+        let r = match item.kind.as_str() {
+            "text" => ch.send_text(chat, &item.text, &[]),
+            "image" => match pagesend::load_image_bytes(item, &|name| helper_api::get_material_bytes(name)) {
+                Ok(bytes) => {
+                    let ct = pagesend::image_content_type(&bytes, &item.name);
+                    ch.send_image_bytes(chat, &bytes, ct)
+                }
+                Err(e) => Err(e),
+            },
+            "file" => match pagesend::load_file_bytes(item, &|name| helper_api::get_material_bytes(name)) {
+                Ok(bytes) => ch.send_file_bytes(chat, &bytes, &item.name),
+                Err(e) => Err(e),
+            },
+            _ => Err("不明的內容種類, 沒有送出".to_string()),
+        };
+        out.push(match r {
+            Ok(()) => serde_json::json!({ "ok": true, "note": "" }),
+            Err(e) => serde_json::json!({ "ok": false, "note": e }),
+        });
+        std::thread::sleep(Duration::from_millis(250)); // 逐項間隔, 避免同秒連發被核心限流
+    }
+    out
+}
+
+/// 把待送的管理員通知送掉 (第四階段): @ 送不出去 (核心保留訊息裡沒有這個人) 就改純文字點名重送,
+/// 結果與原因都寫回事件紀錄, 畫面與紀錄只出現白話。
+fn send_admin_events(ch: &mut pagesend::PageChannel) {
+    let Ok(v) = helper_api::get_admin_events() else { return };
+    let pending = v.get("pending").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    for ev in &pending {
+        let id = ev.get("id").and_then(|x| x.as_str()).unwrap_or("");
+        let chat = ev.get("chatId").and_then(|x| x.as_str()).unwrap_or("");
+        let body = ev.get("message").and_then(|x| x.as_str()).unwrap_or("");
+        if id.is_empty() || chat.is_empty() || body.is_empty() {
+            if !id.is_empty() {
+                let _ = helper_api::mark_admin_event_sent(id, false, "通知內容不完整, 只保留在紀錄裡");
+            }
+            continue;
+        }
+        let targets = ev.get("targets").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+        let (text, mentions, any_plain) = pagesend::build_notify_text(body, &targets);
+        let plain_note = "有管理員還沒在這個群說過話或不在群裡, 已改用寫名字的方式點名 (請管理員先在群裡說一句話, 之後就能被 @ 到)";
+        let (ok, note) = match ch.send_text(chat, &text, &mentions) {
+            Ok(()) => (true, if any_plain { plain_note.to_string() } else { String::new() }),
+            Err(e) => {
+                if !mentions.is_empty() {
+                    match ch.send_text(chat, &text, &[]) {
+                        Ok(()) => (true, plain_note.to_string()),
+                        Err(e2) => (false, format!("通知送不出去: {e2}")),
+                    }
+                } else {
+                    (false, format!("通知送不出去: {e}"))
+                }
+            }
+        };
+        let _ = helper_api::mark_admin_event_sent(id, ok, &note);
+        shell::log_line(&format!("管理員通知送出: id={id} ok={ok} note={note}"));
+    }
+}
+
+/// 排程一輪 (背景執行緒呼叫): 讀待發清單與解密狀態, 照 pagesend::plan_entry 逐筆處置;
+/// 要送的與待送的管理員通知共用一條瀏覽器通道連線。回傳 {changed, notes} 給 poll 記 log/重讀清單。
+fn run_send_engine_once(started_ms: i64) -> Value {
+    let mut notes: Vec<String> = Vec::new();
+    let mut changed = false;
+    let entries = match helper_api::get_outbox() {
+        Ok(v) => v.get("entries").and_then(|e| e.as_array()).cloned().unwrap_or_default(),
+        Err(e) => return serde_json::json!({ "changed": false, "notes": [format!("待發清單讀不到: {e}")] }),
+    };
+    // 鑰匙不正常的聊天室: 只認 helper 明確回報 state=failed 的 issues, 未掃描 (unknown) 不亂暫停
+    let mut failed_chats: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(st) = helper_api::get_status() {
+        let dec = st.get("bot").and_then(|b| b.get("decrypt"));
+        if dec.and_then(|d| d.get("state")).and_then(|s| s.as_str()) == Some("failed") {
+            if let Some(issues) = dec.and_then(|d| d.get("issues")).and_then(|i| i.as_array()) {
+                for i in issues {
+                    if let Some(id) = i.get("chatId").and_then(|c| c.as_str()) {
+                        failed_chats.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let joins = core_ws::recent_joins_snapshot();
+    let now = pagesend::now_ms();
+    let mut to_send: Vec<Value> = Vec::new();
+    for e in &entries {
+        let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        match pagesend::plan_entry(e, now, started_ms, &failed_chats, &joins) {
+            pagesend::Plan::PauseDecrypt => {
+                if helper_api::pause_outbox(id, true, "這個群組有訊息讀不到 (鑰匙對不上), 先暫停不發; 修好後請在待發清單按「恢復」").is_ok() {
+                    changed = true;
+                    notes.push(format!("待發 {id} 已暫停 (群組鑰匙不正常)"));
+                }
+            }
+            pagesend::Plan::SkipMissed => {
+                if helper_api::skip_outbox(id, "程式沒開的時候錯過了這一次, 已跳過, 下一次照常").is_ok() {
+                    changed = true;
+                    notes.push(format!("待發 {id} 已跳過錯過的那一次"));
+                }
+            }
+            pagesend::Plan::DeferUntil(until) => {
+                if helper_api::defer_outbox(id, until, "有人剛進群組, 等鑰匙交接完成再發 (已自動順延)").is_ok() {
+                    changed = true;
+                    notes.push(format!("待發 {id} 已順延 (有人剛進群)"));
+                }
+            }
+            pagesend::Plan::Send => to_send.push(e.clone()),
+            pagesend::Plan::AwaitConfirm | pagesend::Plan::NotDue => {}
+        }
+    }
+    // 有沒有待送的管理員通知 (決定要不要開連線)
+    let has_notify = helper_api::get_admin_events().map(|v| v.get("pending").and_then(|p| p.as_array()).map(|a| !a.is_empty()).unwrap_or(false)).unwrap_or(false);
+    if !to_send.is_empty() || has_notify {
+        match pagesend::PageChannel::connect() {
+            Ok(mut ch) => {
+                for e in &to_send {
+                    let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let results = send_entry_items(&mut ch, e, None);
+                    let ok_count = results.iter().filter(|r| r.get("ok").and_then(|b| b.as_bool()).unwrap_or(false)).count();
+                    if helper_api::record_outbox_result(id, serde_json::json!(results), "").is_ok() {
+                        changed = true;
+                        notes.push(format!("待發 {id} 已送出 ({ok_count} 項成功)"));
+                    }
+                }
+                if has_notify {
+                    send_admin_events(&mut ch);
+                    changed = true; // 通知紀錄有更新, 順帶觸發畫面重讀
+                }
+            }
+            Err(e) => {
+                notes.push(format!("這輪送不出: {e}"));
+            }
+        }
+    }
+    serde_json::json!({ "changed": changed, "notes": notes })
+}
+
+/// 本機時區對 UTC 的偏移秒數 (事件時間顯示用; 只在啟動時問一次作業系統)。
+fn local_utc_offset_secs() -> i64 {
+    #[cfg(windows)]
+    {
+        use std::sync::OnceLock;
+        static CACHE: OnceLock<i64> = OnceLock::new();
+        *CACHE.get_or_init(|| unsafe {
+            use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+            let mut tzi = TIME_ZONE_INFORMATION::default();
+            let rc = GetTimeZoneInformation(&mut tzi);
+            let extra = match rc {
+                2 => tzi.DaylightBias,
+                1 => tzi.StandardBias,
+                _ => 0,
+            };
+            -((tzi.Bias as i64) + (extra as i64)) * 60
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+/// epoch 毫秒 -> 「M/D HH:MM」本機時間 (民用日期換算, 不引 chrono)。
+fn fmt_event_time(ms: i64) -> String {
+    if ms <= 0 {
+        return "時間不明".to_string();
+    }
+    let secs = ms / 1000 + local_utc_offset_secs();
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (hh, mm) = (sod / 3600, (sod % 3600) / 60);
+    // civil-from-days (Howard Hinnant 算法)
+    let z = days + 719_468;
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{m}/{d} {hh:02}:{mm:02}")
+}
+
+/// 檔案大小白話 (B/KB/MB)
+fn fmt_size(n: u64) -> String {
+    if n >= 1024 * 1024 {
+        format!("{:.1}MB", n as f64 / 1_048_576.0)
+    } else if n >= 1024 {
+        format!("{:.0}KB", n as f64 / 1024.0)
+    } else {
+        format!("{n}B")
+    }
+}
+
+/// 標準 base64 編碼 (教材庫上傳用; 相依不為這點小事再加一個 crate)
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// 貼上截圖: 從剪貼簿取圖片存成暫存 PNG, 回傳可加入圖片清單的選取。
+fn paste_clipboard_image() -> Result<SendMediaSel, String> {
+    let mut cb = arboard::Clipboard::new().map_err(|_| "打不開剪貼簿, 請再試一次".to_string())?;
+    let img = cb.get_image().map_err(|_| "剪貼簿裡沒有圖片: 先複製一張圖片或截圖, 再按「貼上截圖」".to_string())?;
+    let rgba = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned()).ok_or("剪貼簿裡的圖片尺寸不正確")?;
+    let path = std::env::temp_dir().join(format!("aibao-paste-{}.png", pagesend::now_ms()));
+    rgba.save(&path).map_err(|e| format!("貼上的圖片存不下來: {e}"))?;
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    Ok(SendMediaSel { name: "貼上的截圖.png".to_string(), size, ref_path: path.to_string_lossy().to_string() })
+}
+
 /// 副行文字: 已解析 → 「類型・N 人」; 名稱未解析 → 「名稱與資料待讀取」。
+/// 待發清單/發送紀錄的狀態白話 (畫面不出現英文代號; 原始 status 只在 helper 存檔裡)
+fn outbox_status_label(e: &Value) -> String {
+    if e.get("overdue").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return "已過期, 等你確認要不要補發".to_string();
+    }
+    match e.get("status").and_then(|s| s.as_str()) {
+        Some("pending") => "等待發送".to_string(),
+        Some("paused") => "已暫停".to_string(),
+        Some("sent") => "已送出".to_string(),
+        Some("done") => "已全部發完".to_string(),
+        Some("partial") => "部分送出 (失敗的可以重送)".to_string(),
+        Some("failed") => "送出失敗".to_string(),
+        Some("cancelled") => "已取消".to_string(),
+        _ => "處理中".to_string(),
+    }
+}
+
 fn chat_sub_text(kind: Option<&str>, member_count: Option<i64>, resolved: bool) -> String {
     if !resolved {
         return "名稱與資料待讀取".to_string();
@@ -1151,6 +1490,7 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(400));
         self.engine_tick_and_snap();
+        self.send_engine_tick(ctx);
         self.sync_account_avatar(ctx);
 
         // 第二實例/系統匣喚醒與結束訊號
@@ -1293,6 +1633,7 @@ impl eframe::App for App {
                 Page::Overview => self.page_overview(ui),
                 Page::LineLogin => self.page_login(ui),
                 Page::ChatRoom => self.page_chat(ui),
+                Page::SendMessages => self.page_send(ui),
                 Page::AiSettings => self.page_ai(ui),
                 Page::BotSettings => self.page_bot(ui),
                 Page::KbSettings => self.page_kb(ui),
@@ -1565,6 +1906,39 @@ impl App {
         f.persona_interests = pstr("interests");
         f.persona_marital = pstr("maritalStatus");
         f.persona_intro = pstr("intro");
+        let notify = v.get("notify").cloned().unwrap_or(Value::Null);
+        f.notify_admins = notify
+            .get("admins")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| {
+                        Some((
+                            a.get("id")?.as_str()?.to_string(),
+                            a.get("name")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        f.notify_rules = notify
+            .get("rules")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|r| NotifyRuleForm {
+                        kind: r.get("kind").and_then(|x| x.as_str()).unwrap_or("scam").to_string(),
+                        keyword: r.get("keyword").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        enabled: r.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
+                        admin_ids: r
+                            .get("notifyAdminIds")
+                            .and_then(|x| x.as_array())
+                            .map(|a| a.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let line = v.get("line").cloned().unwrap_or(Value::Null);
         f.line_token_configured = line.get("set").and_then(|x| x.as_bool()).unwrap_or(false);
         f.line_token_last4 = line.get("last4").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -1609,6 +1983,12 @@ impl App {
                 "jev": jev_body
             },
             "kb": { "folder": f.kb_folder },
+            "notify": {
+                "admins": f.notify_admins.iter().map(|(id, name)| serde_json::json!({ "id": id, "name": name })).collect::<Vec<_>>(),
+                "rules": f.notify_rules.iter().map(|r| serde_json::json!({
+                    "kind": r.kind, "keyword": r.keyword, "enabled": r.enabled, "notifyAdminIds": r.admin_ids
+                })).collect::<Vec<_>>()
+            },
             "showSources": f.show_sources,
             "creatorReply": f.creator_reply,
             "persona": {
@@ -1642,6 +2022,68 @@ impl App {
     }
 
     fn poll_async_results(&mut self, ctx: &egui::Context) {
+        // 待發清單載入結果
+        if let Some(v) = self.outbox_slot.lock().unwrap().take() {
+            self.busy.insert("outbox".into(), false);
+            if let Some(arr) = v.get("entries").and_then(|x| x.as_array()) {
+                self.outbox_entries = arr.clone();
+            } else if let Some(m) = v.get("message").and_then(|m| m.as_str()) {
+                self.send_msg = Some(format!("待發清單讀不到: {m}"));
+            }
+        }
+        // 待發建立/取消結果: 成功就重讀清單 (截圖結果是例外: 把截好的圖加入圖片清單)
+        if let Some(v) = self.outbox_action_slot.lock().unwrap().take() {
+            self.busy.insert("outbox_action".into(), false);
+            if let Some(shot) = v.get("screenshot").and_then(|s| s.as_str()) {
+                let size = std::fs::metadata(shot).map(|m| m.len()).unwrap_or(0);
+                self.send_images.push(SendMediaSel { name: "截圖.png".to_string(), size, ref_path: shot.to_string() });
+                self.send_msg = Some("截圖完成, 已加入圖片清單".to_string());
+            } else if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                self.send_msg = Some("已存進待發清單".to_string());
+                self.outbox_attempted = false;
+            } else {
+                let m = v.get("message").and_then(|m| m.as_str()).unwrap_or("建立失敗");
+                self.send_msg = Some(m.to_string());
+            }
+        }
+        // 排程一輪的結果: 只記 log; 有異動就讓待發清單與通知紀錄在下一幀重讀
+        if let Some(v) = self.send_tick_slot.lock().unwrap().take() {
+            self.busy.insert("send_tick".into(), false);
+            if let Some(notes) = v.get("notes").and_then(|n| n.as_array()) {
+                for n in notes {
+                    if let Some(s) = n.as_str() {
+                        shell::log_line(&format!("發送排程: {s}"));
+                    }
+                }
+            }
+            if v.get("changed").and_then(|c| c.as_bool()).unwrap_or(false) {
+                self.outbox_attempted = false;
+                self.admin_events_attempted = false;
+            }
+        }
+        // 教材庫載入結果
+        if let Some(v) = self.materials_slot.lock().unwrap().take() {
+            self.busy.insert("materials".into(), false);
+            if let Some(arr) = v.get("materials").and_then(|x| x.as_array()) {
+                self.materials = arr.clone();
+            }
+        }
+        // 管理員候選名單結果
+        if let Some(v) = self.candidates_slot.lock().unwrap().take() {
+            self.busy.insert("candidates".into(), false);
+            if let Some(arr) = v.get("candidates").and_then(|x| x.as_array()) {
+                self.candidates = arr.clone();
+            } else if let Some(m) = v.get("message").and_then(|m| m.as_str()) {
+                self.page_msg.insert("candidates".into(), format!("候選名單讀不到: {m}"));
+            }
+        }
+        // 管理員通知事件紀錄結果
+        if let Some(v) = self.admin_events_slot.lock().unwrap().take() {
+            self.busy.insert("admin_events".into(), false);
+            if let Some(arr) = v.get("events").and_then(|x| x.as_array()) {
+                self.admin_events = arr.clone();
+            }
+        }
         // 設定載入
         if self.form_needs_load {
             let settings = self.snap.lock().unwrap().settings.clone();
@@ -2500,6 +2942,10 @@ impl App {
         ui.heading("機器人與觸發");
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
+        if !self.admin_events_attempted {
+            self.admin_events_attempted = true;
+            self.spawn_admin_events_load(&ctx);
+        }
         card(ui, self.palette, "機器人名字與觸發規則", |ui| {
             ui.horizontal(|ui| {
                 ui.label("機器人主名 (在群組裡叫這個名字, 我就會回應):");
@@ -2702,6 +3148,717 @@ impl App {
                 ui.label(m.clone());
             }
             ui.label(egui::RichText::new("注意: 白名單生效需要把 AI寶 完全結束再重新開啟一次 (用系統匣的「結束服務並關閉程式」)。").weak());
+        });
+        ui.add_space(10.0);
+        card(ui, self.palette, "管理員名單 (出事時要 @ 誰)", |ui| {
+            ui.label(egui::RichText::new("被 @ 的對象就是這份名單裡的人; 實務上大部份會是你本人。從下面「有在白名單群組裡發言過的人」裡面用勾的選, 不用打任何代號; 勾完按下面通知事件清單裡的「儲存通知設定」才算數。").weak());
+            ui.label(egui::RichText::new("小提醒: 被通知的人最好有在那個群裡說過話。從來沒在群裡說過話的人可能 @ 不到, 到時候 AI寶 會改用寫名字的方式通知, 並在紀錄裡註明。").weak());
+            if self.form.notify_admins.is_empty() {
+                ui.label("目前還沒有設定管理員。");
+            }
+            let admins = self.form.notify_admins.clone();
+            for (_, name) in &admins {
+                ui.label(format!("・{name}"));
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let busy_c = self.busy.get("candidates").copied().unwrap_or(false);
+                if ui.button(if busy_c { "讀取中…" } else { "讀取可選名單" }).clicked() && !busy_c {
+                    self.spawn_candidates_load(&ctx);
+                }
+                if let Some(m) = self.page_msg.get("candidates") {
+                    ui.label(m.clone());
+                }
+            });
+            if !self.candidates.is_empty() {
+                ui.label(egui::RichText::new("有在白名單群組發言過的人 (勾選 = 加入管理員名單):").weak());
+            }
+            let cands = self.candidates.clone();
+            for c in &cands {
+                let cid = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let cname = c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if cid.is_empty() || cname.is_empty() {
+                    continue;
+                }
+                let chats = c.get("chats").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("、")).unwrap_or_default();
+                let source = if c.get("source").and_then(|v| v.as_str()) == Some("openchat-admin") { " (社群管理員)" } else { "" };
+                let mut on = self.form.notify_admins.iter().any(|(id, _)| *id == cid);
+                let label = if chats.is_empty() { format!("{cname}{source}") } else { format!("{cname}{source} — 在『{chats}』發言過") };
+                if ui.checkbox(&mut on, label).changed() {
+                    if on {
+                        self.form.notify_admins.push((cid.clone(), cname.clone()));
+                    } else {
+                        self.form.notify_admins.retain(|(id, _)| *id != cid);
+                    }
+                }
+            }
+        });
+        ui.add_space(10.0);
+        card(ui, self.palette, "通知事件清單 (發生什麼事要通知管理員)", |ui| {
+            ui.label(egui::RichText::new("一筆一筆設定: 發生哪種事、要通知哪幾位管理員。這裡的開關和關鍵字改完按下面「儲存通知設定」才算數。同一種事 10 分鐘內只通知一次, 一天最多 20 次, 超過的會合併寫進紀錄, 不會一直 @ 人。").weak());
+            let admins = self.form.notify_admins.clone();
+            let mut remove_idx: Option<usize> = None;
+            for (idx, rule) in self.form.notify_rules.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut rule.enabled, "啟用");
+                    for (val, label) in [("scam", "詐騙警報"), ("unanswered", "AI寶 答不出來"), ("keyword", "有人提到關鍵字"), ("selfError", "AI寶 自己出狀況")] {
+                        ui.selectable_value(&mut rule.kind, val.to_string(), label);
+                    }
+                    if ui.button("刪除這一筆").clicked() {
+                        remove_idx = Some(idx);
+                    }
+                });
+                if rule.kind == "keyword" {
+                    ui.horizontal(|ui| {
+                        ui.label("關鍵字:");
+                        ui.add(egui::TextEdit::singleline(&mut rule.keyword).desired_width(200.0).hint_text("例: 報價, 客訴"));
+                    });
+                }
+                if admins.is_empty() {
+                    ui.label(egui::RichText::new("尚無管理員名單, 這一筆先存著, 名單設定好後在這裡勾要通知誰。").weak());
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("通知誰:");
+                        for (aid, aname) in &admins {
+                            let mut on = rule.admin_ids.contains(aid);
+                            if ui.checkbox(&mut on, aname.clone()).changed() {
+                                if on {
+                                    rule.admin_ids.push(aid.clone());
+                                } else {
+                                    rule.admin_ids.retain(|x| x != aid);
+                                }
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+            }
+            if let Some(idx) = remove_idx {
+                self.form.notify_rules.remove(idx);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("新增一筆通知事件").clicked() {
+                    self.form.notify_rules.push(NotifyRuleForm { kind: "scam".to_string(), enabled: true, ..Default::default() });
+                }
+                let saving = self.busy.get("save").copied().unwrap_or(false);
+                if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存通知設定" }).clicked() {
+                    self.save_settings(&ctx);
+                }
+                if let Some(m) = &self.form.save_msg {
+                    ui.label(m.clone());
+                }
+            });
+        });
+        ui.add_space(10.0);
+        card(ui, self.palette, "最近的管理員通知紀錄", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("重新讀取").clicked() {
+                    self.admin_events_attempted = true;
+                    self.spawn_admin_events_load(&ctx);
+                }
+            });
+            if self.admin_events.is_empty() {
+                ui.label(egui::RichText::new("還沒有通知紀錄。有設定通知事件、而且真的發生事情時, 會記在這裡 (有沒有真的送出去、為什麼改用寫名字, 都會註明)。").weak());
+            }
+            for ev in self.admin_events.iter().take(15) {
+                let label = ev.get("kindLabel").and_then(|v| v.as_str()).unwrap_or("通知");
+                let chat = ev.get("chatName").and_then(|v| v.as_str()).unwrap_or("");
+                let ts = ev.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+                let when = fmt_event_time(ts);
+                let merged = ev.get("mergedCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                let sent_ok = ev.get("sentOk");
+                let sent_state = match sent_ok.and_then(|v| v.as_bool()) {
+                    Some(true) => "已通知管理員".to_string(),
+                    Some(false) => "通知沒有送出去".to_string(),
+                    None => {
+                        if ev.get("notified").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            "等程式送出中".to_string()
+                        } else {
+                            "只寫進紀錄 (沒有另外通知)".to_string()
+                        }
+                    }
+                };
+                let merged_note = if merged > 0 { format!(" (同類事件另合併了 {merged} 次)") } else { String::new() };
+                ui.label(format!("{when}・{label}・『{chat}』— {sent_state}{merged_note}"));
+                let note = ev.get("note").and_then(|v| v.as_str()).unwrap_or("");
+                if !note.is_empty() {
+                    ui.label(egui::RichText::new(format!("　{note}")).weak());
+                }
+            }
+        });
+    }
+
+    /// 背景讀取待發清單/發送紀錄 (helper /api/outbox), 結果進 outbox_slot 由 poll 收。
+    fn spawn_outbox_load(&mut self, ctx: &egui::Context) {
+        if self.busy.get("outbox").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("outbox".into(), true);
+        let slot = self.outbox_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = helper_api::get_outbox();
+            *slot.lock().unwrap() = Some(match r {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    fn spawn_materials_load(&mut self, ctx: &egui::Context) {
+        if self.busy.get("materials").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("materials".into(), true);
+        let slot = self.materials_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = helper_api::get_materials();
+            *slot.lock().unwrap() = Some(match r {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    fn spawn_candidates_load(&mut self, ctx: &egui::Context) {
+        if self.busy.get("candidates").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("candidates".into(), true);
+        let slot = self.candidates_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = helper_api::get_admin_candidates();
+            *slot.lock().unwrap() = Some(match r {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    fn spawn_admin_events_load(&mut self, ctx: &egui::Context) {
+        if self.busy.get("admin_events").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("admin_events".into(), true);
+        let slot = self.admin_events_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = helper_api::get_admin_events();
+            *slot.lock().unwrap() = Some(match r {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// 待發清單的暫停/恢復 (鑰匙不正常被排程自動暫停的, 修好後使用者按恢復)
+    fn start_outbox_pause(&mut self, ctx: &egui::Context, id: String, paused: bool) {
+        if self.busy.get("outbox_action").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("outbox_action".into(), true);
+        let slot = self.outbox_action_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = helper_api::pause_outbox(&id, paused, if paused { "已暫停" } else { "已恢復, 照排程繼續" });
+            *slot.lock().unwrap() = Some(match r {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    fn start_outbox_create(&mut self, ctx: &egui::Context, body: Value) {
+        if self.busy.get("outbox_action").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("outbox_action".into(), true);
+        let slot = self.outbox_action_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = helper_api::create_outbox(body);
+            *slot.lock().unwrap() = Some(match r {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    fn start_outbox_cancel(&mut self, ctx: &egui::Context, id: String) {
+        if self.busy.get("outbox_action").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("outbox_action".into(), true);
+        let slot = self.outbox_action_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = helper_api::cancel_outbox(&id);
+            *slot.lock().unwrap() = Some(match r {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// 排程計時 (第三階段): 每 20 秒一輪。到期判斷 (含三項護欄) 與送出都在背景執行緒做,
+    /// 結果進 send_tick_slot; 同一輪順帶把待送的管理員通知送掉 (第四階段)。
+    fn send_engine_tick(&mut self, ctx: &egui::Context) {
+        let due = self.last_send_tick.map(|t| t.elapsed() > Duration::from_secs(20)).unwrap_or(true);
+        if !due || self.busy.get("send_tick").copied().unwrap_or(false) {
+            return;
+        }
+        if !matches!(self.engine_snap.state, EngineState::Running) {
+            return;
+        }
+        self.last_send_tick = Some(std::time::Instant::now());
+        self.busy.insert("send_tick".into(), true);
+        let slot = self.send_tick_slot.clone();
+        let started = self.send_engine_started_ms;
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let summary = run_send_engine_once(started);
+            *slot.lock().unwrap() = Some(summary);
+            ctx2.request_repaint();
+        });
+    }
+
+    /// 立即送出一筆待發 (過期清單的「補發」): 整筆照逐項送出, 結果寫回發送紀錄。
+    /// retry_only=true 時只重送上次失敗的項目 (發送紀錄的「重送失敗的項目」), 成功的原樣保留。
+    fn start_outbox_send_now(&mut self, ctx: &egui::Context, entry: Value, retry_only: bool) {
+        if self.busy.get("outbox_action").copied().unwrap_or(false) {
+            return;
+        }
+        self.busy.insert("outbox_action".into(), true);
+        let slot = self.outbox_action_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let result = (|| -> Result<Value, String> {
+                let mut ch = pagesend::PageChannel::connect()?;
+                if retry_only {
+                    let prev: Vec<Value> = entry.get("itemResults").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    let merged = send_entry_items(&mut ch, &entry, Some(&prev));
+                    helper_api::record_outbox_retry_result(&id, serde_json::json!(merged), "已重送失敗的項目")
+                } else {
+                    let results = send_entry_items(&mut ch, &entry, None);
+                    helper_api::record_outbox_result(&id, serde_json::json!(results), "")
+                }
+            })();
+            *slot.lock().unwrap() = Some(match result {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    // 發送群組訊息: 選群組/內容 (文字/圖片/檔案)/時間/預覽/建立待發 + 待發清單與發送紀錄。
+    // 送出與排程在第三階段接通 (send_engine_tick + pagesend 瀏覽器通道); 檔案逐項送出 2026-10-22 接上第二階段核心通道 (/file/upload + fileId)。
+    fn page_send(&mut self, ui: &mut egui::Ui) {
+        ui.heading("發送群組訊息");
+        ui.add_space(8.0);
+        let ctx = ui.ctx().clone();
+        if !self.outbox_attempted {
+            self.outbox_attempted = true;
+            self.spawn_outbox_load(&ctx);
+        }
+        if !self.materials_attempted {
+            self.materials_attempted = true;
+            self.spawn_materials_load(&ctx);
+        }
+        // 拖放: 把檔案拖進這一頁就直接加入 (圖片進圖片、其他進檔案), 不用先學任何快捷鍵
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        for f in dropped {
+            {
+                let path = f.path();
+                let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                let lower = name.to_ascii_lowercase();
+                let sel = SendMediaSel { name: name.clone(), size, ref_path: path.to_string_lossy().to_string() };
+                if [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].iter().any(|e| lower.ends_with(e)) {
+                    self.send_images.push(sel);
+                } else {
+                    self.send_files.push(sel);
+                }
+                self.send_msg = Some(format!("已加入「{name}」"));
+            }
+        }
+        card(ui, self.palette, "選群組 (只能從白名單選)", |ui| {
+            let busy_chats = self.busy.get("chats").copied().unwrap_or(false);
+            if ui.button(if busy_chats { "讀取中…" } else { "讀取我的群組清單" }).clicked() && !busy_chats {
+                self.spawn_chats_load(&ctx);
+            }
+            if self.chats_loaded {
+                let chats = self.group_chats.clone();
+                for c in &chats {
+                    let name = chat_display_name(c.get("name").and_then(|v| v.as_str()), true);
+                    let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let whitelisted = c.get("whitelisted").and_then(|v| v.as_bool()).unwrap_or(false);
+                    ui.horizontal(|ui| {
+                        if whitelisted {
+                            if ui.selectable_label(self.send_chat_id == id, name.clone()).clicked() {
+                                self.send_chat_id = id.clone();
+                                self.send_chat_name = name.clone();
+                            }
+                        } else {
+                            ui.label(egui::RichText::new(format!("{name} (尚未加入白名單, 不能選)")).weak());
+                        }
+                    });
+                }
+            }
+            if !self.send_chat_name.is_empty() {
+                ui.label(format!("已選: {}", self.send_chat_name));
+            }
+        });
+        ui.add_space(10.0);
+        card(ui, self.palette, "選內容 (文字、圖片、檔案可以一起選)", |ui| {
+            ui.label("文字 (最多 8000 字):");
+            ui.add(egui::TextEdit::multiline(&mut self.send_text).desired_rows(4).desired_width(560.0).hint_text("例如: 這是本週的教材, 請先看完"));
+            ui.label(egui::RichText::new(format!("目前 {} 字", self.send_text.chars().count())).weak());
+            ui.add_space(6.0);
+            ui.label("圖片 (每一張最多 10MB, 原圖送出不壓縮):");
+            ui.horizontal(|ui| {
+                if ui.button("選圖片 (可多選)").clicked() {
+                    if let Some(paths) = rfd::FileDialog::new().add_filter("圖片", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]).pick_files() {
+                        for p in paths {
+                            let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                            self.send_images.push(SendMediaSel { name: p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), size, ref_path: p.to_string_lossy().to_string() });
+                        }
+                    }
+                }
+                if ui.button("貼上截圖").clicked() {
+                    match paste_clipboard_image() {
+                        Ok(sel) => { self.send_msg = Some("已貼上剪貼簿裡的圖片".to_string()); self.send_images.push(sel); }
+                        Err(e) => { self.send_msg = Some(e); }
+                    }
+                }
+                if ui.button("截圖").clicked() {
+                    // 框選截圖: 先把主視窗縮到最小, 使用者在畫面上拖出範圍, 截好後視窗自己回來
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    let slot = self.outbox_action_slot.clone();
+                    let ctx2 = ctx.clone();
+                    self.busy.insert("outbox_action".into(), true);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(600));
+                        let r = platform::capture_screen_region();
+                        ctx2.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx2.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        *slot.lock().unwrap() = Some(match r {
+                            Ok(path) => serde_json::json!({ "ok": true, "screenshot": path.to_string_lossy() }),
+                            Err(e) => serde_json::json!({ "ok": false, "message": e }),
+                        });
+                        ctx2.request_repaint();
+                    });
+                }
+            });
+            ui.label(egui::RichText::new("「截圖」: 按下後視窗會先縮小, 直接用滑鼠在畫面上拖出要截的範圍, 放開就截好; 按 Esc 取消。也可以把圖片檔案直接拖進這一頁。").weak());
+            let mut rm_img: Option<usize> = None;
+            for (i, im) in self.send_images.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("・{} ({})", im.name, fmt_size(im.size)));
+                    if im.size > 10 * 1024 * 1024 {
+                        ui.label(egui::RichText::new("超過 10MB, 送不出去").color(self.palette.bad));
+                    }
+                    if ui.button("移除").clicked() {
+                        rm_img = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = rm_img {
+                self.send_images.remove(i);
+            }
+            ui.add_space(6.0);
+            ui.label("檔案 (可多選, 會依序一個一個送出; 單檔上限 10MB):");
+            ui.horizontal(|ui| {
+                if ui.button("選檔案 (可多選)").clicked() {
+                    if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                        for p in paths {
+                            let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                            self.send_files.push(SendMediaSel { name: p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), size, ref_path: p.to_string_lossy().to_string() });
+                        }
+                    }
+                }
+            });
+            let mut rm_file: Option<usize> = None;
+            for (i, f) in self.send_files.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("・{} ({})", f.name, fmt_size(f.size)));
+                    if ui.button("移除").clicked() {
+                        rm_file = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = rm_file {
+                self.send_files.remove(i);
+            }
+        });
+        ui.add_space(10.0);
+        card(ui, self.palette, "教材庫 (常用的圖片先存起來, 之後點一下就能用)", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("重新讀取").clicked() {
+                    self.materials_attempted = true;
+                    self.spawn_materials_load(&ctx);
+                }
+                if ui.button("把圖片存進教材庫").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("圖片", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]).pick_file() {
+                        match std::fs::read(&p) {
+                            Ok(bytes) => {
+                                let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                                let slot = self.materials_slot.clone();
+                                let ctx2 = ctx.clone();
+                                self.busy.insert("materials".into(), true);
+                                let b64 = b64_encode(&bytes);
+                                std::thread::spawn(move || {
+                                    let r = helper_api::add_material(&name, &b64).and_then(|_| helper_api::get_materials());
+                                    *slot.lock().unwrap() = Some(match r {
+                                        Ok(v) => v,
+                                        Err(e) => serde_json::json!({ "ok": false, "message": e }),
+                                    });
+                                    ctx2.request_repaint();
+                                });
+                            }
+                            Err(e) => {
+                                self.send_msg = Some(format!("讀不到這個檔案: {e}"));
+                            }
+                        }
+                    }
+                }
+            });
+            if self.materials.is_empty() {
+                ui.label(egui::RichText::new("教材庫還沒有東西。常用的操作步驟圖、公告圖可以先存進來。").weak());
+            }
+            let mats = self.materials.clone();
+            for m in &mats {
+                let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let size = m.get("sizeBytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                ui.horizontal(|ui| {
+                    ui.label(format!("・{name} ({})", fmt_size(size)));
+                    if ui.button("用這張").clicked() {
+                        self.send_images.push(SendMediaSel { name: name.clone(), size, ref_path: format!("materials:{name}") });
+                    }
+                });
+            }
+        });
+        ui.add_space(10.0);
+        card(ui, self.palette, "選時間", |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.send_mode, "now".to_string(), "立即");
+                ui.selectable_value(&mut self.send_mode, "once".to_string(), "排程 (只發一次)");
+                ui.selectable_value(&mut self.send_mode, "repeat".to_string(), "頻率 (重複發)");
+            });
+            if self.send_mode == "once" {
+                ui.horizontal(|ui| {
+                    ui.label("發送時間:");
+                    ui.add(egui::TextEdit::singleline(&mut self.send_once_at).desired_width(200.0).hint_text("例: 2026-10-23 09:00"));
+                });
+            }
+            if self.send_mode == "repeat" {
+                ui.horizontal(|ui| {
+                    ui.label("方式:");
+                    ui.selectable_value(&mut self.send_repeat_kind, "same".to_string(), "重複發同一份");
+                    ui.selectable_value(&mut self.send_repeat_kind, "series".to_string(), "依序發下一份 (整套教材)");
+                });
+                if self.send_repeat_kind == "series" {
+                    ui.label(egui::RichText::new("整套教材一份一份排好: 每次到期就發下一份, 發完最後一份自動停。每一份先放文字; 要附圖的那一份, 發送前也可以在待發清單建立後用「同一份」方式另排。").weak());
+                    let mut rm_part: Option<usize> = None;
+                    let part_count = self.send_series.len();
+                    for (i, part) in self.send_series.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("第 {} 份:", i + 1));
+                            ui.add(egui::TextEdit::multiline(part).desired_rows(2).desired_width(480.0).hint_text("這一課的文字內容"));
+                            if part_count > 1 && ui.button("刪除").clicked() {
+                                rm_part = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = rm_part {
+                        self.send_series.remove(i);
+                    }
+                    if ui.button("再加一份").clicked() {
+                        self.send_series.push(String::new());
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("週期:");
+                    ui.selectable_value(&mut self.send_cycle, "daily".to_string(), "每日");
+                    ui.selectable_value(&mut self.send_cycle, "weekly".to_string(), "每週");
+                    ui.selectable_value(&mut self.send_cycle, "monthly".to_string(), "每月");
+                    ui.label("時間:");
+                    ui.add(egui::TextEdit::singleline(&mut self.send_time).desired_width(70.0).hint_text("09:00"));
+                });
+                if self.send_cycle == "weekly" {
+                    ui.horizontal(|ui| {
+                        ui.label("星期:");
+                        for (d, label) in [(0usize, "日"), (1, "一"), (2, "二"), (3, "三"), (4, "四"), (5, "五"), (6, "六")] {
+                            ui.checkbox(&mut self.send_weekdays[d], label);
+                        }
+                    });
+                }
+                if self.send_cycle == "monthly" {
+                    ui.horizontal(|ui| {
+                        ui.label("每月幾號:");
+                        ui.add(egui::DragValue::new(&mut self.send_month_day).range(1..=31));
+                    });
+                }
+            }
+        });
+        ui.add_space(10.0);
+        card(ui, self.palette, "預覽確認", |ui| {
+            let when = match self.send_mode.as_str() {
+                "once" => format!("排程一次: {}", if self.send_once_at.is_empty() { "(尚未填時間)" } else { &self.send_once_at }),
+                "repeat" => format!("重複發: {} / {} {}", if self.send_repeat_kind == "series" { "依序發下一份" } else { "同一份" }, self.send_cycle, self.send_time),
+                _ => "立即發送".to_string(),
+            };
+            ui.label(format!("發到: {}", if self.send_chat_name.is_empty() { "(尚未選群組)" } else { &self.send_chat_name }));
+            ui.label(format!("時間: {when}"));
+            let is_series = self.send_mode == "repeat" && self.send_repeat_kind == "series";
+            if is_series {
+                ui.label(format!("內容: 整套 {} 份, 第一份: {}", self.send_series.len(), self.send_series.first().map(|s| s.chars().take(40).collect::<String>()).unwrap_or_default()));
+            } else {
+                let preview: String = self.send_text.chars().take(80).collect();
+                let media_note = if self.send_images.is_empty() && self.send_files.is_empty() { String::new() } else { format!(" (另附圖片 {} 張、檔案 {} 個)", self.send_images.len(), self.send_files.len()) };
+                ui.label(format!("內容: {preview}{media_note}"));
+            }
+            ui.horizontal(|ui| {
+                let acting = self.busy.get("outbox_action").copied().unwrap_or(false);
+                if primary_btn(ui, self.palette, if acting { "建立中…" } else { "確認, 存進待發清單" }).clicked() && !acting {
+                    if self.send_chat_id.is_empty() {
+                        self.send_msg = Some("請先選群組".to_string());
+                    } else if is_series && self.send_series.iter().any(|p| p.trim().is_empty()) {
+                        self.send_msg = Some("整套教材每一份都要先填文字 (空白的那份請填好或刪掉)".to_string());
+                    } else if !is_series && self.send_text.trim().is_empty() && self.send_images.is_empty() && self.send_files.is_empty() {
+                        self.send_msg = Some("請先選內容: 填文字、選圖片或選檔案, 至少一樣".to_string());
+                    } else if self.send_images.iter().any(|im| im.size > 10 * 1024 * 1024) || self.send_files.iter().any(|f| f.size > 10 * 1024 * 1024) {
+                        self.send_msg = Some("有圖片或檔案超過 10MB, 請先移除再建立".to_string());
+                    } else {
+                        let schedule = if self.send_mode == "once" {
+                            let at = format!("{}:00+08:00", self.send_once_at.trim().replace(' ', "T"));
+                            serde_json::json!({ "mode": "once", "at": at })
+                        } else if self.send_mode == "repeat" {
+                            let weekdays: Vec<u64> = self.send_weekdays.iter().enumerate().filter(|(_, on)| **on).map(|(d, _)| d as u64).collect();
+                            serde_json::json!({ "mode": "repeat", "repeat": { "kind": self.send_repeat_kind, "cycle": self.send_cycle, "time": self.send_time, "weekdays": weekdays, "monthDay": self.send_month_day } })
+                        } else {
+                            serde_json::json!({ "mode": "now" })
+                        };
+                        let images: Vec<Value> = self.send_images.iter().map(|im| serde_json::json!({ "name": im.name, "sizeBytes": im.size, "ref": im.ref_path })).collect();
+                        let files: Vec<Value> = self.send_files.iter().map(|f| serde_json::json!({ "name": f.name, "sizeBytes": f.size, "ref": f.ref_path })).collect();
+                        let mut items = serde_json::json!({});
+                        if !self.send_text.trim().is_empty() {
+                            items["text"] = serde_json::json!(self.send_text);
+                        }
+                        if !images.is_empty() {
+                            items["images"] = serde_json::json!(images);
+                        }
+                        if !files.is_empty() {
+                            items["files"] = serde_json::json!(files);
+                        }
+                        let mut body = serde_json::json!({
+                            "chatId": self.send_chat_id,
+                            "chatName": self.send_chat_name,
+                            "items": items,
+                            "schedule": schedule
+                        });
+                        if is_series {
+                            // 系列的每一份是獨立內容; entry.items 只放第一份當預覽 (helper 驗證規則)
+                            let parts: Vec<Value> = self.send_series.iter().map(|p| serde_json::json!({ "text": p })).collect();
+                            body["seriesItems"] = serde_json::json!(parts);
+                            body["items"] = serde_json::json!({ "text": self.send_series.first().cloned().unwrap_or_default() });
+                        }
+                        self.start_outbox_create(&ctx, body);
+                    }
+                }
+                if let Some(m) = &self.send_msg {
+                    ui.label(m.clone());
+                }
+            });
+        });
+        ui.add_space(10.0);
+        card(ui, self.palette, "待發清單", |ui| {
+            if ui.button("重新讀取").clicked() {
+                self.outbox_attempted = true;
+                self.spawn_outbox_load(&ctx);
+            }
+            let pending: Vec<Value> = self.outbox_entries.iter().filter(|e| {
+                matches!(e.get("status").and_then(|s| s.as_str()), Some("pending") | Some("paused"))
+            }).cloned().collect();
+            if pending.is_empty() {
+                ui.label(egui::RichText::new("目前沒有待發的訊息。").weak());
+            }
+            for e in &pending {
+                let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = e.get("chatName").and_then(|v| v.as_str()).unwrap_or("(未命名群組)");
+                let status = outbox_status_label(e);
+                let overdue = e.get("overdue").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_paused = e.get("status").and_then(|s| s.as_str()) == Some("paused");
+                let last_note = e.get("history").and_then(|h| h.as_array()).and_then(|a| a.last())
+                    .and_then(|h| h.get("note")).and_then(|n| n.as_str()).unwrap_or("");
+                let has_failed_item = e.get("itemResults").and_then(|r| r.as_array())
+                    .map(|arr| arr.iter().any(|x| x.get("ok").and_then(|b| b.as_bool()) == Some(false)))
+                    .unwrap_or(false);
+                ui.horizontal(|ui| {
+                    ui.label(format!("{name} — {status}"));
+                    if has_failed_item && ui.button("重送失敗的項目").clicked() {
+                        self.start_outbox_send_now(&ctx, e.clone(), true);
+                    }
+                    if overdue && ui.button("補發").clicked() {
+                        self.start_outbox_send_now(&ctx, e.clone(), false);
+                    }
+                    if is_paused && ui.button("恢復").clicked() {
+                        self.start_outbox_pause(&ctx, id.clone(), false);
+                    }
+                    if !is_paused && ui.button("暫停").clicked() {
+                        self.start_outbox_pause(&ctx, id.clone(), true);
+                    }
+                    if ui.button("取消").clicked() {
+                        self.start_outbox_cancel(&ctx, id.clone());
+                    }
+                });
+                if !last_note.is_empty() {
+                    ui.label(egui::RichText::new(format!("　{last_note}")).weak());
+                }
+            }
+        });
+        ui.add_space(10.0);
+        card(ui, self.palette, "發送紀錄", |ui| {
+            let done: Vec<Value> = self.outbox_entries.iter().filter(|e| {
+                !matches!(e.get("status").and_then(|s| s.as_str()), Some("pending") | Some("paused"))
+            }).cloned().collect();
+            if done.is_empty() {
+                ui.label(egui::RichText::new("還沒有發送紀錄。").weak());
+            }
+            for e in done.iter().take(20) {
+                let name = e.get("chatName").and_then(|v| v.as_str()).unwrap_or("(未命名群組)");
+                let status = outbox_status_label(e);
+                let last_note = e.get("history").and_then(|h| h.as_array()).and_then(|a| a.last())
+                    .and_then(|h| h.get("note")).and_then(|n| n.as_str()).unwrap_or("");
+                ui.label(format!("{name} — {status} ({last_note})"));
+                // 逐項成敗: 哪一項送出、哪一項失敗與原因, 一項一行寫清楚
+                let flat = pagesend::flatten_entry(e);
+                let results = e.get("itemResults").and_then(|r| r.as_array());
+                for (i, item) in flat.iter().enumerate() {
+                    let r = results.and_then(|arr| arr.get(i));
+                    let ok = r.and_then(|x| x.get("ok")).and_then(|b| b.as_bool()).unwrap_or(false);
+                    let note = r.and_then(|x| x.get("note")).and_then(|n| n.as_str()).unwrap_or("");
+                    if ok {
+                        ui.label(format!("　・{}: 已送出", item.label));
+                    } else if r.is_some() {
+                        ui.label(egui::RichText::new(format!("　・{}: 失敗 — {note}", item.label)).color(self.palette.bad));
+                    }
+                }
+                let st = e.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                if (st == "partial" || st == "failed") && ui.button("重送失敗的項目").clicked() {
+                    self.start_outbox_send_now(&ctx, e.clone(), true);
+                }
+            }
         });
     }
 

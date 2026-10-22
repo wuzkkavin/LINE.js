@@ -13,13 +13,13 @@
 
 ## 結構對應
 
-以下為定案結構；目前已建立設定、session、LineProvider、同埠 HTTP（靜態頁、`/media`、圖片與影片上傳）、WS hub（登入、登出、頻道、即時與歷史訊息、發送、已讀、詐騙機率分析）、訊息快取與聊天網頁（大頭照、貼圖、LINE 表情貼（收到的，經 `/media/emoji-*` 代取靜態圖）、收到的圖片／GIF／影片／語音內嵌顯示、輸入框、自製確認對話框）。
+以下為定案結構；目前已建立設定、session、LineProvider、同埠 HTTP（靜態頁、`/media`、圖片與影片上傳、瀏覽器通道專用的一般檔案上傳）、WS hub（登入、登出、頻道、即時與歷史訊息、發送、已讀、詐騙機率分析）、訊息快取與聊天網頁（大頭照、貼圖、LINE 表情貼（收到的，經 `/media/emoji-*` 代取靜態圖）、收到的圖片／GIF／影片／語音內嵌顯示、輸入框、自製確認對話框）。
 
 | 路徑 | 職責 |
 |---|---|
 | `src/line/` | LineProvider、QR 登入、session、LINE 事件、歷史、發送、媒體下載 |
 | `src/ws/` | WS 協定、snapshot、增量、單序廣播佇列、限流 |
-| `src/http/` | 同埠 HTTP、靜態網頁、媒體上傳（圖片／影片）與媒體位元組 |
+| `src/http/` | 同埠 HTTP、靜態網頁、媒體上傳（圖片／影片）、瀏覽器通道一般檔案上傳與媒體位元組 |
 | `src/model/` | Channel／Message／Media DTO、正規化、去重與記憶體快取 |
 | `src/update/` | 版本比較與 GitHub Release 檢查器（只通知） |
 | `src/jev/` | 詐騙機率分析的 TypeSafe Jev 用戶端（`jev.token` 設定時才啟用；非 LINE API，不經 LineProvider） |
@@ -64,13 +64,13 @@ Gate 依 [PLAN.md](PLAN.md) 逐關驗收，不跳關；Gate 0 遠端需存在四
 2. QR URL 與 PIN **一次性顯示、不入日誌、不落盤**。
 3. `session.json` 含憑證與 E2EE key material：chmod **600**、列入 `.gitignore`、不入日誌、不分享。
 4. 網頁 WS 升級須 `Origin`（`http`／`https`，後者供 TLS 反向代理／自訂網域）的主機部分等於 `Host` 標頭並帶瀏覽器 cookie；其餘來源拒絕升級。
-5. 每連線頻率限制：`message:send` ≤ 5/秒（收回 `message:unsend` 共用此額度，且只接受伺服器已顯示、本帳號所發的訊息，機器人不可用；回應 `message:react` 也共用此額度，只接受伺服器已顯示、未收回的訊息，機器人不可用）；`POST /media/upload` 圖片 ≤ 10MB/檔、影片 ≤ 50MB/檔（`limits.uploadVideoMaxBytes`）、≤ 5 次/分鐘；frame ≤ 256KB。
+5. 每連線頻率限制：`message:send` ≤ 5/秒（收回 `message:unsend` 共用此額度，且只接受伺服器已顯示、本帳號所發的訊息，機器人不可用；回應 `message:react` 也共用此額度，只接受伺服器已顯示、未收回的訊息，機器人不可用）；`POST /media/upload` 圖片 ≤ 10MB/檔、影片 ≤ 50MB/檔（`limits.uploadVideoMaxBytes`）、≤ 5 次/分鐘；`POST /file/upload` 一般檔案 ≤ 10MB/檔（`limits.uploadFileMaxBytes`，預設與上限皆 10MB），與媒體上傳共用同一組 ≤ 5 次/分鐘預算；frame ≤ 256KB。一般檔案先經 HTTP 上傳取得編號，WS frame 只帶編號，不得把檔案位元組或 base64 塞進 frame。
 6. 媒體快取上限預設 200MB（LRU）；收到的媒體只能請求已見過的訊息（`msg-<id>`），單檔上限 `limits.downloadMaxBytes`（預設 50MB），類型一律以位元組內容判斷且不供應 SVG／HTML；訊息媒體不得被瀏覽器快取。
-7. 輸入驗證：`chatId` 格式（`u／c／r／s／m` 開頭；OpenChat 為 `m`）、`text` ≤ 8000 字、`limit` ≤ 100、`packageId`／`stickerId` 限正整數、上傳媒體以內容判斷（圖片 PNG／JPEG／GIF；影片 MP4／MOV，以 `ftyp` 品牌辨識，聲稱的 Content-Type 只用來選擇大小上限；影片長度取自 `moov/mvhd`，不採用瀏覽器給的值）。
+7. 輸入驗證：`chatId` 格式（`u／c／r／s／m` 開頭；OpenChat 為 `m`）、`text` ≤ 8000 字、`limit` ≤ 100、`packageId`／`stickerId` 限正整數、上傳媒體以內容判斷（圖片 PNG／JPEG／GIF；影片 MP4／MOV，以 `ftyp` 品牌辨識，聲稱的 Content-Type 只用來選擇大小上限；影片長度取自 `moov/mvhd`，不採用瀏覽器給的值）。一般檔案上傳只接受原始 `application/octet-stream`，檔名以 URI 編碼放在 `X-Filename`，解碼後必須是單一安全 basename（無路徑分隔字元或控制字元、≤255 字元）；檔案內容不由本服務嗅探顯示或內嵌呈現。
 8. 對外一律 generic 錯誤；內部錯誤只入本地日誌。
 9. 依賴釘選版本；`npm audit` 無 high 以上（Gate 4 驗收）。
 10. 解密／解析失敗 **fail-closed**：顯示佔位，不降級猜測內容。
-11. 機器人 API（`/api/ws`，預設關閉，`api.enabled`）：Bearer Token 認證（只存雜湊、比對用 `timingSafeEqual`、產生後只顯示一次、不入日誌）；升級**不得帶 `Origin`**（網頁不可用此入口），`Host` 不檢查；只開放 `message:send`（文字；2026-10-20 裁示擴充一項：可改送單一小型 `.txt` 檔案承載，供機器人把過長答覆以文字檔交付——檔名限無路徑字元的 `.txt`、base64 解碼後 ≤128KB、不得與文字／mention／replyTo 混搭，同樣只限 `api.chats` 且共用相同限流與影格上限）、`history:fetch`、`scam:check`（見第 12 條）、`profile:get`（只回本帳號自己的 profile，不呼叫 LINE）、`chat:admins:get`（僅 API；完整分頁取得指定社群聊天室的現任管理員與共同管理員，回 `chat:admins { requestId, chatId, ownMemberId, admins }`；`ownMemberId` 來自 `getSquareChat.squareChatMember`，自身與管理員 ID 皆須符合 `/^p[A-Za-z0-9]{10,64}$/`；與歷史共用每連線每秒 10 次，非社群回 `CHAT_ADMINS_UNSUPPORTED`，失敗回 `CHAT_ADMINS_FAILED`，不回部分結果）、`ping`，其餘一律 `UNKNOWN_TYPE`；`hello` 保留數字 `protocol: 2` 與版本，僅 API 以 `capabilities: ["chat:admins"]` 宣告。管理員查詢成功可授予同連線、同聊天室標記未發言管理員的額外 mention 權限；重新查詢開始即撤銷（限流／失敗亦同）、只採最新結果，斷線／登出／換帳號清除，不能污染共享快取或授權其他連線。只能存取 `api.chats` 清單內的聊天室（空清單視為設定錯誤，未列出者一律 `UNKNOWN_CHAT`）；不給 `chat:read`、登入／登出、`channels:refresh`、媒體與貼圖發送；連線不重播舊訊息、不收 `read`；所有機器人合計 `api.sendsPerMinute`（≤120/分鐘）加每連線 `limits.sendsPerSecond`；同時最多 4 個連線；重新產生／撤銷 Token 立即中斷所有機器人連線。Token 的產生與撤銷只接受一般 `/ws` 連線（實務上只有取得瀏覽器 cookie 的本機 CLI 會送；網頁不提供此 UI），機器人連線無此權限。
+11. 機器人 API（`/api/ws`，預設關閉，`api.enabled`）：Bearer Token 認證（只存雜湊、比對用 `timingSafeEqual`、產生後只顯示一次、不入日誌）；升級**不得帶 `Origin`**（網頁不可用此入口），`Host` 不檢查；只開放 `message:send`（文字；2026-10-20 裁示擴充一項：可改送單一小型 `.txt` 檔案承載，供機器人把過長答覆以文字檔交付——檔名限無路徑字元的 `.txt`、base64 解碼後 ≤128KB、不得與文字／mention／replyTo 混搭，同樣只限 `api.chats` 且共用相同限流與影格上限）、`history:fetch`、`scam:check`（見第 12 條）、`profile:get`（只回本帳號自己的 profile，不呼叫 LINE）、`chat:admins:get`（僅 API；完整分頁取得指定社群聊天室的現任管理員與共同管理員，回 `chat:admins { requestId, chatId, ownMemberId, admins }`；`ownMemberId` 來自 `getSquareChat.squareChatMember`，自身與管理員 ID 皆須符合 `/^p[A-Za-z0-9]{10,64}$/`；與歷史共用每連線每秒 10 次，非社群回 `CHAT_ADMINS_UNSUPPORTED`，失敗回 `CHAT_ADMINS_FAILED`，不回部分結果）、`ping`，其餘一律 `UNKNOWN_TYPE`；2026-10-22 核准的一般檔案通道不擴張機器人權限：機器人不得呼叫 `POST /file/upload`，也不得在 `message:send` 使用瀏覽器上傳編號 `fileId`，其 `.txt`／128KB 規則維持不變。一般檔案只可由瀏覽器 cookie 通道上傳，再由一般 `/ws` 連線以 `fileId` 送進 `api.chats` 白名單聊天室，核心最終經 LineProvider 的 `sendFile` 送出；`hello` 保留數字 `protocol: 2` 與版本，僅 API 以 `capabilities: ["chat:admins"]` 宣告。管理員查詢成功可授予同連線、同聊天室標記未發言管理員的額外 mention 權限；重新查詢開始即撤銷（限流／失敗亦同）、只採最新結果，斷線／登出／換帳號清除，不能污染共享快取或授權其他連線。只能存取 `api.chats` 清單內的聊天室（空清單視為設定錯誤，未列出者一律 `UNKNOWN_CHAT`）；不給 `chat:read`、登入／登出、`channels:refresh`、媒體與貼圖發送；連線不重播舊訊息、不收 `read`；所有機器人合計 `api.sendsPerMinute`（≤120/分鐘）加每連線 `limits.sendsPerSecond`；同時最多 4 個連線；重新產生／撤銷 Token 立即中斷所有機器人連線。Token 的產生與撤銷只接受一般 `/ws` 連線（實務上只有取得瀏覽器 cookie 的本機 CLI 會送；網頁不提供此 UI），機器人連線無此權限。
 12. 詐騙機率分析（2026-10 小語裁示，`jev.token` 有值才啟用）：金鑰只用於送往 `https://api.typesafe.ai/v1/systemone` 的 Bearer 標頭（拒絕重新導向），不送網頁（網頁只收 `scam:state { enabled }`）、不入日誌與錯誤；`scam:check` 網頁每連線每分鐘 10 次；機器人（2026-10 裁示開放）只限 `api.chats` 內的訊息，所有機器人連線合計每分鐘 10 次，不收 `scam:state`；只送指定的那一則、伺服器已顯示、非本帳號、未收回、非系統訊息的**伺服器快取文字**，不採用用戶端傳來的文字，不送寄件者或聊天室；回應 fail-closed（無 0–1 機率即失敗），失敗對外只回 generic `SCAM_CHECK_FAILED`；結果只送給要求的連線，網頁標示為模型估計、僅供參考。
     加速不得略過上述驗證或限流：同一登入期間，網頁與 API 對完全相同文字可共用進行中分析及完成後 5 分鐘有效的結果；以 UTF-16 原文的 SHA-256 索引、記憶體 LRU 最多 256 筆（含進行中）、不另存原文、不落盤。失敗不快取，登出／換帳號／關閉服務清除；舊請求不得污染新帳號快取。回覆前再確認文字未變、未收回且仍在訊息快取；失效回 `INVALID_REQUEST`。模型、題目與完整文字維持不變，不能以本機啟發式假冒模型判斷；分析失敗日誌只記固定 `SCAM_CHECK_FAILED`。
 

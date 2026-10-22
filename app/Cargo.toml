@@ -17,6 +17,8 @@ ureq = { version = "2", default-features = false, features = ["json"] }
 qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.15"
+# 貼上截圖: 讀剪貼簿裡的圖片 (eframe 本來就相依它, 這裡直接用來取圖, 不經文字貼上路徑)
+arboard = "3.7"
 
 # 本機 (Linux) cargo check 用: winit 需要 x11 後端才編得過; Windows 建置不套用本節
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -35,6 +37,11 @@ windows = { version = "0.58", features = [
   "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinSock",
   "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Time",
+  # 內建「截圖」鈕 (發送群組訊息頁): GDI 抓畫面 + 滑鼠框選偵測
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 # 嵌入核心聊天畫面 (LINE 登入頁的 WebView2) 只在 Windows MSVC 建置啟用:

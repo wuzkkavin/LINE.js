@@ -29,13 +29,26 @@ test("limits above security ceilings and malformed hosts are rejected", async (t
   const { root, config } = await fixture(t);
   for (const [section, key, value] of [
     ["server", "host", ""], ["server", "host", "evil host"], ["server", "host", "http://127.0.0.1"], ["server", "host", 3],
-    ["limits", "frameMaxBytes", 262145], ["limits", "textMaxLength", 8001], ["server", "port", 65536],
+    ["limits", "frameMaxBytes", 262145], ["limits", "textMaxLength", 8001], ["limits", "uploadFileMaxBytes", 10485761], ["server", "port", 65536],
   ]) {
     const invalid = structuredClone(config);
     invalid[section][key] = value;
     await writeFile(join(root, "config.yaml"), stringify(invalid));
     await assert.rejects(loadConfig(root), /CONFIG_INVALID/);
   }
+});
+
+test("the browser file-upload limit defaults to 10 MiB and may only be lowered", async (t) => {
+  const { root, config } = await fixture(t);
+  assert.equal((await loadConfig(root)).limits.uploadFileMaxBytes, 10485760);
+  const smaller = structuredClone(config);
+  smaller.limits.uploadFileMaxBytes = 123456;
+  await writeFile(join(root, "config.yaml"), stringify(smaller));
+  assert.equal((await loadConfig(root)).limits.uploadFileMaxBytes, 123456);
+  const omitted = structuredClone(config);
+  delete omitted.limits.uploadFileMaxBytes;
+  await writeFile(join(root, "config.yaml"), stringify(omitted));
+  assert.equal((await loadConfig(root)).limits.uploadFileMaxBytes, 10485760, "configs written before the field existed keep working");
 });
 
 test("the listen address is whatever config.yaml says; the shipped default stays loopback", async (t) => {

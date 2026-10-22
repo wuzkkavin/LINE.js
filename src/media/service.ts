@@ -64,7 +64,7 @@ export class MediaService {
   private inflight = new Map<string, Download>();
   private queue: Download[] = [];
   private active = 0;
-  private uploads = new Map<string, { media: MediaBytes; expires: number }>();
+  private uploads = new Map<string, { media: MediaBytes; expires: number; kind: "media" | "file" }>();
   private size = 0;
 
   constructor(private readonly maxBytes: number, private readonly source: MediaSource) {}
@@ -143,6 +143,15 @@ export class MediaService {
 
   /** Holds an uploaded image or video until the browser references it from `message:send`. */
   putUpload(media: MediaBytes, now = Date.now()): string {
+    return this.putPendingUpload(media, "media", now);
+  }
+
+  /** Holds a browser-supplied general file separately from media: its id cannot be spent as `mediaId`. */
+  putFileUpload(media: MediaBytes, now = Date.now()): string {
+    return this.putPendingUpload(media, "file", now);
+  }
+
+  private putPendingUpload(media: MediaBytes, kind: "media" | "file", now: number): string {
     this.pruneUploads(now);
     // Make room for one more: oldest first (Map iterates in insertion order). Videos are held whole,
     // so the count alone would not bound memory.
@@ -154,13 +163,27 @@ export class MediaService {
       held -= entry.media.bytes.length;
     }
     const id = `upload-${randomBytes(16).toString("hex")}`;
-    this.uploads.set(id, { media, expires: now + UPLOAD_TTL_MS });
+    this.uploads.set(id, { media, expires: now + UPLOAD_TTL_MS, kind });
     return id;
   }
 
   getUpload(id: string, now = Date.now()): MediaBytes | undefined {
     this.pruneUploads(now);
     return this.uploads.get(id)?.media;
+  }
+
+  /** A pending upload intended as an image/video; a general-file id is refused here. */
+  getMediaUpload(id: string, now = Date.now()): MediaBytes | undefined {
+    this.pruneUploads(now);
+    const entry = this.uploads.get(id);
+    return entry?.kind === "media" ? entry.media : undefined;
+  }
+
+  /** A pending upload intended as a general file; an image/video id is refused here. */
+  getFileUpload(id: string, now = Date.now()): MediaBytes | undefined {
+    this.pruneUploads(now);
+    const entry = this.uploads.get(id);
+    return entry?.kind === "file" ? entry.media : undefined;
   }
 
   dropUpload(id: string): void {
@@ -203,6 +226,23 @@ const MAX_PENDING_UPLOAD_BYTES = 256 * 1024 * 1024;
 
 export function isUploadId(id: string): boolean {
   return UPLOAD_ID.test(id);
+}
+
+const UNSAFE_FILENAME = /[\\/:*?"<>|\u0000-\u001f\u007f]/;
+
+/**
+ * A browser-supplied file name is metadata for the LINE file card, never a local path.
+ * Accept one basename only: no separators or controls, no Windows trailing dot/space
+ * aliasing, and a bounded length. The extension is not prescribed: teaching files may
+ * be PDFs, Office documents or another ordinary format.
+ */
+export function isSafeUploadFilename(filename: unknown): filename is string {
+  if (typeof filename !== "string") return false;
+  const length = [...filename].length;
+  return length >= 1 && length <= 255
+    && filename !== "." && filename !== ".."
+    && !UNSAFE_FILENAME.test(filename)
+    && !filename.endsWith(".") && !filename.endsWith(" ");
 }
 
 /** Trusts file contents, not the client's Content-Type: only formats LINE displays are accepted. */

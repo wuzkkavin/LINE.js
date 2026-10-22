@@ -56,7 +56,7 @@ async function readBody(req) {
   try { return JSON.parse(Buffer.concat(parts).toString("utf8")); } catch { return {}; }
 }
 
-export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, version = "0.1.0", lineEnv } = {}) {
+export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, version = "0.1.0", lineEnv, outbox, adminEvents, materials } = {}) {
   // LINE 引導工具的環境: 資料目錄 (找核心 config.yaml)、是否打包版、Token 產生器 (測試可注入假的)
   const line = {
     dataDir: lineEnv?.dataDir ?? process.env.HELPER_DATA_DIR ?? join(here, "..", "data"),
@@ -101,13 +101,100 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
       if (req.method === "GET" && path === "/api/status") {
         // service/capabilities 是身分標記: 原生 App 用它分辨 3790 上的是不是新版 helper,
         // 避免把還在跑的舊版 AI寶.exe (無 list-models、舊測試邏輯) 誤認成自己的服務 (2026-10-20 老吳實機踩到)。
-        return json(res, 200, { service: "aibao-helper", version, capabilities: ["list-models", "line-config", "token-gen"], bot: bot ? bot.status() : null, serverTime: new Date().toISOString() });
+        return json(res, 200, { service: "aibao-helper", version, capabilities: ["list-models", "line-config", "token-gen", "outbox", "admin-notify"], bot: bot ? bot.status() : null, serverTime: new Date().toISOString() });
       }
       if (req.method === "GET" && path === "/api/bot/activity") {
         // 機器人聊天情況 (第 12 項): 狀態列摘要 + 最近動態 (記憶體環形緩衝, 新到舊)。
         // 唯讀、本機限定 (整個 server 只綁 127.0.0.1, 與既有端點同一認證面)。
         // events 的 question 只是前 30 字片段且從不落盤 (見 bot.recordActivity)。
         return json(res, 200, { ok: true, status: bot ? bot.status() : null, events: bot ? bot.activitySnapshot() : [] });
+      }
+      // 待發清單/發送紀錄 (發送群組訊息): 只做本機存放與規則, 實際送出由 App 殼負責 (見根目錄施工紀錄的分工定案)
+      if (req.method === "GET" && path === "/api/outbox") {
+        return json(res, 200, { ok: true, entries: outbox ? outbox.list() : [] });
+      }
+      if (req.method === "POST" && path === "/api/outbox") {
+        if (!outbox) return json(res, 400, { ok: false, message: "待發清單尚未啟用" });
+        const body = await readBody(req);
+        const r = outbox.create(body);
+        return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, entry: r.entry } : { ok: false, message: r.errors.join("；") });
+      }
+      if (req.method === "POST" && path === "/api/outbox/update") {
+        if (!outbox) return json(res, 400, { ok: false, message: "待發清單尚未啟用" });
+        const body = await readBody(req);
+        const r = outbox.update(body?.id, body?.patch);
+        return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, entry: r.entry } : { ok: false, message: r.errors.join("；") });
+      }
+      if (req.method === "POST" && path === "/api/outbox/cancel") {
+        if (!outbox) return json(res, 400, { ok: false, message: "待發清單尚未啟用" });
+        const body = await readBody(req);
+        const r = outbox.cancel(body?.id);
+        return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, entry: r.entry } : { ok: false, message: r.errors.join("；") });
+      }
+      if (req.method === "POST" && path === "/api/outbox/result") {
+        if (!outbox) return json(res, 400, { ok: false, message: "待發清單尚未啟用" });
+        const body = await readBody(req);
+        const r = outbox.recordResult(body?.id, body?.results, { note: typeof body?.note === "string" ? body.note : "" });
+        return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, entry: r.entry } : { ok: false, message: r.errors.join("；") });
+      }
+      // 排程護欄用的三個動作 (第三階段): 暫停/恢復 (鑰匙不正常)、順延 (加人交接窗口)、跳過錯過的那一次 (重複發)
+      if (req.method === "POST" && path === "/api/outbox/pause") {
+        if (!outbox) return json(res, 400, { ok: false, message: "待發清單尚未啟用" });
+        const body = await readBody(req);
+        const r = outbox.setPaused(body?.id, body?.paused !== false, typeof body?.note === "string" ? body.note : "");
+        return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, entry: r.entry } : { ok: false, message: r.errors.join("；") });
+      }
+      if (req.method === "POST" && path === "/api/outbox/defer") {
+        if (!outbox) return json(res, 400, { ok: false, message: "待發清單尚未啟用" });
+        const body = await readBody(req);
+        const r = outbox.defer(body?.id, Number(body?.nextRunAt), typeof body?.note === "string" ? body.note : "");
+        return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, entry: r.entry } : { ok: false, message: r.errors.join("；") });
+      }
+      if (req.method === "POST" && path === "/api/outbox/skip") {
+        if (!outbox) return json(res, 400, { ok: false, message: "待發清單尚未啟用" });
+        const body = await readBody(req);
+        const r = outbox.skipMissed(body?.id, typeof body?.note === "string" ? body.note : "");
+        return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, entry: r.entry } : { ok: false, message: r.errors.join("；") });
+      }
+      if (req.method === "POST" && path === "/api/outbox/retry-result") {
+        if (!outbox) return json(res, 400, { ok: false, message: "待發清單尚未啟用" });
+        const body = await readBody(req);
+        const r = outbox.recordRetryResult(body?.id, body?.results, { note: typeof body?.note === "string" ? body.note : "" });
+        return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, entry: r.entry } : { ok: false, message: r.errors.join("；") });
+      }
+      // 管理員通知: 事件紀錄查詢 + 殼端送出結果寫回 + 待送清單 (殼端輪詢領取)
+      if (req.method === "GET" && path === "/api/admin-events") {
+        return json(res, 200, { ok: true, events: adminEvents ? adminEvents.list() : [], pending: adminEvents ? adminEvents.pendingNotify() : [] });
+      }
+      if (req.method === "POST" && path === "/api/admin-events/sent") {
+        if (!adminEvents) return json(res, 400, { ok: false, message: "管理員通知尚未啟用" });
+        const body = await readBody(req);
+        const r = adminEvents.markSent(body?.id, body?.ok === true, typeof body?.note === "string" ? body.note : "");
+        return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, event: r.event } : { ok: false, message: r.errors.join("；") });
+      }
+      // 管理員候選名單 (第四階段): 白名單群組近期發言者 + OpenChat 管理員, 供「管理員名單」勾選
+      if (req.method === "GET" && path === "/api/admin-candidates") {
+        const candidates = bot ? await bot.adminCandidates().catch(() => []) : [];
+        return json(res, 200, { ok: true, candidates });
+      }
+      // 教材庫 (第三階段): 「發送群組訊息」可重複取用的圖片/檔案, 存 helper 資料目錄
+      if (req.method === "GET" && path === "/api/materials") {
+        return json(res, 200, { ok: true, materials: materials ? materials.list() : [] });
+      }
+      if (req.method === "POST" && path === "/api/materials") {
+        if (!materials) return json(res, 400, { ok: false, message: "教材庫尚未啟用" });
+        const body = await readBody(req);
+        const buf = typeof body?.dataBase64 === "string" ? Buffer.from(body.dataBase64, "base64") : null;
+        if (!buf) return json(res, 400, { ok: false, message: "檔案內容不正確" });
+        const r = materials.save(body?.name, buf);
+        return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, material: r.value } : { ok: false, message: r.errors.join("；") });
+      }
+      if (req.method === "GET" && path === "/api/materials/file") {
+        const name = new URL(req.url, "http://127.0.0.1").searchParams.get("name") ?? "";
+        const buf = materials ? materials.read(name) : null;
+        if (!buf) { res.writeHead(404); return res.end("not found"); }
+        res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": buf.length, "Cache-Control": "no-store" });
+        return res.end(buf);
       }
       if (req.method === "GET" && path === "/api/settings") {
         return json(res, 200, await settings.publicView(secrets));
