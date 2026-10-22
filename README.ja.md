@@ -62,6 +62,7 @@ npm start
 - **詐欺確率分析**（`jev.token` の設定が必要。[設定](#設定)を参照）：**相手から届いたテキストメッセージ**を右クリック（タッチ操作では長押し）して「詐騙機率分析」（詐欺確率分析）を選ぶと、ダイアログに詐欺確率と判定（> 80% は詐欺の疑いが高い、≤ 20% は詐欺らしくない、その間は判断できないため要確認）を表示します。確率が 20% を超える場合は、最も近い手口と信頼度（偽投資／株推奨グループ、機関・銀行・カスタマーサービスのなりすまし、フィッシングリンク、ネット通販・分割払い解除、親族・友人を装った借金、恋愛詐欺、求人・アルバイト／口座貸し、当選・景品、ローン・代行、その他）も表示します。自分のメッセージ、送信取消済み、復号できない、システム、テキスト以外のメッセージには表示せず、キー未設定時はメニュー項目自体がありません。分析のたびにそのテキストが TypeSafe に送られ課金されます。結果はモデルの推定にすぎません。
 - **デスクトップ通知**：右上の「通知」をクリックすると、ブラウザーに通知の許可を求めて有効にします（ボタンが強調色になります。設定はブラウザーの localStorage に保存され、もう一度クリックすると無効）。ページが前面にないときだけ、ほかの人からの新着メッセージを通知します。各チャットの通知は最大 1 件で、新しいメッセージに置き換わります。通知をクリックするとページに戻ってそのチャットを開き、既読になると通知は閉じます。通知の内容（送信者とメッセージの抜粋）は OS の通知センターに表示されます。安全なコンテキスト（`127.0.0.1`／`localhost` または HTTPS）が必要で、それ以外の http アドレスではボタンを表示しません。
 - **下書き**：チャットを切り替えると、未送信のテキスト（@ メンションと返信先を含む）は元のチャットに残り、戻ると復元されます。ページのメモリにのみ保持し、再読み込みやログアウトで消去します。選択済みの画像／動画は保持しません。
+- **エンドツーエンド暗号化グループの鍵**：本サービスはグループ鍵を自分で作成せず、LINE が配布した鍵だけを使います。メンバー変更直後で LINE がまだ新しい鍵を配布していない間は、送信は失敗し（下書きは保持）、受信メッセージ（リアルタイムを含む）は「復号できません」と表示されます。メンバーが公式アプリで発言し、LINE が新しい鍵を発行すると回復します。本サービスが作った鍵が公式アプリの鍵と並存し、以後グループ全体が復号できなくなるのを防ぐためです（[#2](https://github.com/JS-PACKAGE/LINE.js/issues/2)）。
 - **メッセージ検索と保持**：現在保持しているメッセージを新しい順に検索します。一致件数と結果は省略せず、表示範囲と前後の余裕分だけ DOM を作成します。矢印キー、Home／End、Enter／スペースで移動できます。フロントエンドはチャットごとに最大 500 件、全体で最大 10,000 件を保持し、全体上限では現在のチャット以外の古い利用順にキャッシュを削除します。上限・保持数・削除数を画面に明示します。履歴は連続した窓を過去へ移動するため、さらに古い内容も読み込めます。「最新訊息」（最新）を押すか、履歴の窓を離れてチャットを開き直すと最新ページを取得します。引用への移動とメンション候補は保持範囲のみです。検索自体は履歴取得や既読送信を行いません。通常のチャットでは、ページが表示中で最新の窓の最下部にあり、最新メッセージが見えている場合だけ既読を送ります。
 - **履歴の再試行とリアクション更新**：最初の履歴取得が失敗すると再試行ボタンを表示します。リアクション更新はチップのみを置き換え、画像、動画、音声を作り直しません。
 - **ログアウト時の消去**：検索、チャット内容、プロフィール、画像ビューアー、ダイアログ、そのアカウントのデスクトップ通知を消去します。通知の設定は保持します。
@@ -126,6 +127,8 @@ PWA としてインストールできます（ブラウザーの「安裝」（�
 | Client → Server | `history:fetch` / `message:send` | 履歴 1 ページの取得／テキスト、画像（先に `POST /media/upload`）、スタンプの送信 |
 | Client → Server | `stickers:list` → `stickers` | このアカウントの所有済みスタンプパックとスタンプ id の取得 |
 | Client → Server | `profile:get` → `profile` | `{ requestId }`：自分の `profile`（`userId`、`displayName`、`pictureId?`。`auth:ready` と同じ）を取得。サーバーがログイン時に取得したデータのみを読み、LINE には問い合わせません。未ログイン時は `INVALID_REQUEST` |
+| Client → Server | `chat:admin-token:get` → `chat:admin-token` | `{ requestId, chatId }`：そのチャットのワンタイム管理者トークンを取得。要求元だけに `{ requestId, chatId, token, createdAt }` を返します |
+| Server → Client | `chat:admin-token:changed` | `{ chatId }`：Web のみへの無効化通知。平文を含まず、開いているトークン画面は新しい値を取得します |
 | Client → Server | `message:unsend` | `{ requestId, chatId, messageId }`：自分のメッセージの送信取消（Web ページのみ。サーバーはこのアカウントのメッセージのみ受け付け、`message:send` とレート制限を共有）。成功時は `message:unsend` をブロードキャスト |
 | Client → Server | `message:react` | `{ requestId, chatId, messageId, reaction }`：`NICE`／`LOVE`／`FUN`／`AMAZING`／`SAD`／`OMG`、`null` で取消（Web ページのみ。サーバーが表示した、送信取消されていないメッセージのみ受け付け、`message:send` とレート制限を共有）。成功時は `message:reactions` をブロードキャストします |
 | Client → Server | `chat:read` | 指定メッセージまでの既読通知（応答なし。サーバーが表示済みのメッセージに限り、各位置につき 1 回のみ送信） |
@@ -151,7 +154,7 @@ HTTP：`GET /media/:mediaId`（スタンプ、スタンプパックのアイコ�
      sendsPerMinute: 20          # 全ボット合計の毎分最大送信数（1～120、省略可能、既定 20）
    ```
    `enabled: true` でも有効な `chats` がない場合、サービスは起動に失敗します（「空の一覧＝すべて」という誤解を防ぐためです）。
-2. Token を生成します。`npm run cli -- token` を使用します（[CLI `token`](#tokenボット-api-token-を再生成または取り消し)を参照）。Token の表示は**1 回限り**です。サーバーは SHA-256 のみ保存します（`api-token.json`、権限 600、バージョン管理対象外）。後から確認できないため、忘れた場合は再生成してください。Web ページには Token 管理 UI はなく、CLI のみで操作します。
+2. API **接続用 Bearer Token** を `npm run cli -- token` で生成します（[CLI `token`](#tokenボット-api-token-を再生成または取り消し)を参照）。表示は**1 回限り**で、サーバーは SHA-256 のみ保存します（`api-token.json`、権限 600、バージョン管理対象外）。後から確認できないため、紛失した場合は再生成してください。この接続用 Token は CLI のみで管理し、後述のチャット別管理者トークンとは異なります。
 3. ボットを `ws://<host>:<port>/api/ws`（既定 `ws://127.0.0.1:3789/api/ws`）に接続し、`Authorization: Bearer <Token>` ヘッダーを付けます。
 
 **接続ルール**
@@ -167,18 +170,29 @@ HTTP：`GET /media/:mediaId`（スタンプ、スタンプパックのアイコ�
 | ボット → サービス | `scam:check` | `{ requestId, chatId, messageId }`：`api.chats` 内の**相手から届いた**、サービスが表示済み（リアルタイム受信または `history:fetch` で取得）のテキストメッセージを Jev で分析します。サーバーは自身のキャッシュのテキストを送ります。`jev.token` の設定が必要で（未設定時は `SCAM_CHECK_UNAVAILABLE`）、キャッシュヒットを含め全ボット合計で毎分 10 回です。実際の上流リクエストのみ TypeSafe の料金がかかります。成功時は `scam:result { requestId, chatId, messageId, analysis: { probability, tactic? } }` |
 | ボット → サービス | `profile:get` | `{ requestId }`：自分の ID と名前をいつでも取得できます。`profile { requestId, profile: { userId, displayName, pictureId? } }` を返します（`auth:ready` と同じ内容。LINE には問い合わせず、`history:fetch` と接続ごとに毎秒 10 回の枠を共有。未ログイン時は `INVALID_REQUEST`） |
 | ボット → サービス | `chat:admins:get` | `{ requestId, chatId }`：指定した OpenChat ルームの現任管理者・共同管理者全員を取得します（未発言者も含む）。`api.chats` 内のみで、`history:fetch`／`profile:get` と接続ごとに毎秒 10 回の枠を共有します。要求した接続にのみ `chat:admins { requestId, chatId, ownMemberId, admins: [{ userId, displayName, role, pictureId? }] }` を返します。`role` は `admin`／`coAdmin`、`displayName` は文字列で、`ownMemberId`（そのチャットでの自分のメンバー ID）と `userId` はともに `/^p[A-Za-z0-9]{10,64}$/` に一致します。通常のグループ／個人チャットは `CHAT_ADMINS_UNSUPPORTED`、未ログイン・不明・許可外のチャットは `UNKNOWN_CHAT`。LINE 問い合わせ失敗、不正な ID、ページ取得が不完全な場合は `CHAT_ADMINS_FAILED` とし、一部だけの一覧は返しません。ブラウザーの `/ws` では利用不可 |
+| ボット → サービス | `chat:admin-token:get` | `{ requestId, chatId }`：`api.chats` 内の既知のチャットの平文トークンを取得。`chat:admin-token { requestId, chatId, token, createdAt }` を返します |
+| ボット → サービス | `chat:admin-token:consume` | `{ requestId, chatId, token }`：成功時に即座に無効化して交換し、`chat:admin-token:consumed { requestId, chatId }`（新しい値は含まない）を返します。続けて新しいトークンを接続中の全プラグインにプッシュします |
 | ボット → サービス | `ping` → `pong` | 接続維持。サービスは WebSocket プロトコルレベルの Ping でも 30 秒ごとに確認し、2 回続けて応答がなければ切断します（一般的な WebSocket ライブラリは自動で応答します） |
-| サービス → ボット | `hello`、`auth:state`、`status` | 接続時に送信。`hello` は数値の `protocol: 2` と `serverVersion` を維持し、`capabilities: ["chat:admins"]` で拡張を宣言します。`auth:state` が `ready` でない場合（LINE 未ログイン）、まだ送受信できません |
+| サービス → ボット | `hello`、`auth:state`、`status` | 接続時に送信。`hello` は数値の `protocol: 2` と `serverVersion` を維持し、`capabilities: ["chat:admins", "chat:admin-token"]` で拡張を宣言します。`auth:state` が `ready` でない場合（LINE 未ログイン）、まだ送受信できません |
 | サービス → ボット | `auth:ready` | 自分の `profile.userId` を含み、通常のチャットで自分が送ったメッセージを除外できます。OpenChat では代わりに `chat:admins` 応答の `ownMemberId` を使います |
 | サービス → ボット | `channels` | `api.chats` のチャットルームのみ。変更時に再送します |
+| サービス → ボット | `chat:admin-token` | **プッシュ**（`requestId` なし）`{ chatId, token, createdAt }`：接続時、ログイン完了時、チャンネル一覧の更新時、消費成功のたびに、`api.chats` 内の既知チャットの現在のトークンを接続中の全プラグインに送ります |
+| サービス → ボット | `chat:admin-token:changed` | `{ chatId }`：`api.chats` 内のチャットがサーバーの一覧から外れ、トークンが無効化されたことを通知します（平文なし）。ログアウト時は `ready` 以外の `auth:state` で全トークン無効を示します |
 | サービス → ボット | `message`、`message:edit`、`message:unsend` | `api.chats` のチャットルームの**リアルタイム**メッセージ、編集、送信取消のみ。自分が送ったものも含みます |
 | サービス → ボット | `sent`、`history`、`scam:result`、`profile`、`chat:admins`、`error` | 対応するリクエストへの応答。エラーは汎用コードのみ（`UNKNOWN_CHAT`、`INVALID_REQUEST`、`RATE_LIMITED`、`SEND_FAILED`、`SCAM_CHECK_FAILED`、`CHAT_ADMINS_UNSUPPORTED`、`CHAT_ADMINS_FAILED`…） |
 
-それ以外はすべて `UNKNOWN_TYPE` を返します。ログイン／ログアウト、`chat:read`（既読通知）、`message:unsend`（送信取消）、`message:react`（リアクション）、`channels:refresh`、スタンプ一覧、Token 管理は利用できません。**過去のメッセージは再送しません**（ボットは「今」から開始し、履歴に重複して応答しません。履歴は `history:fetch` を使ってください）。`read`、`update:available`、`api:state`、`scam:state` は送信しません。画像／動画などのメディアのバイト列も取得できません（ボットにはメッセージの `contentType` のみ見えます）。
+それ以外はすべて `UNKNOWN_TYPE` を返します。ログイン／ログアウト、`chat:read`（既読通知）、`message:unsend`（送信取消）、`message:react`（リアクション）、`channels:refresh`、スタンプ一覧、API 接続用 Bearer Token の管理は利用できません。**過去のメッセージは再送しません**（ボットは「今」から開始し、履歴に重複して応答しません。履歴は `history:fetch` を使ってください）。`read`、`update:available`、`api:state`、`scam:state` は送信しません。画像／動画などのメディアのバイト列も取得できません（ボットにはメッセージの `contentType` のみ見えます）。
 
 **管理者のメンション権限**：取得成功後、同じ接続・同じチャットで `message:send.mentions` を使い、取得した未発言の管理者をメンションできます。形式は従来どおり `{ userId, start, end }`（`@` で始まる文字範囲の UTF-16 インデックス）で、1 メッセージにつき最大 20 人です。この追加権限は他の接続・チャット・Web ページに共有しません。再取得を開始した時点で旧権限を取り消し（レート制限や後続の失敗も含む）、最新の取得が成功した場合だけ新しい一覧を許可します。古い並行リクエストは `CHAT_ADMINS_FAILED` となります。切断・ログアウト・アカウント変更でも権限を消去し、処理中の古い結果を無効化します。表示済みメッセージの送信者は従来の規則で引き続きメンション可能です。旧 `chat:admins` **リクエスト**は受け付けず（`UNKNOWN_TYPE`）、応答名としてのみ残します。
 
 隔離した LINE 応答と実際の HTTP／WS Token 認証で、ハンドシェイク、全ページ取得、自分のメンバー ID、メンション権限の付与・取り消しを確認しました。実際の LINE アカウントや NekoGuard プロセスとの結合検証は未実施で、Gate 通過を意味しません。
+
+**チャット別ワンタイム管理者トークン**：チャットを開き、上部の「搜尋」（検索）の隣にある「管理員權杖」を押すと、現在のトークンを表示・コピー・再取得できます。チャットごとに独立し、初回取得時に暗号学的乱数 32 バイト（`chatadm_` 接頭辞＋base64url）で生成します。`createdAt` は Unix ミリ秒です。表示・再取得では消費や交換をしません。メモリ内だけに保持し、ログやブラウザーのストレージには保存しません。ログアウト、アカウント変更、サービス再起動、サーバーのチャット一覧からの削除で無効になります。
+
+- **WEB と認証済み API の両方が平文を取得できます**（所有者の決定）。プラグインは**要求しなくても `/api/ws` でプッシュを受け取り**、`chat:admin-token:get` でも照会でき、いずれも `api.chats` 内のみです。Web はボット API が無効でも既知のチャットを取得できます。Web 向けの平文は要求したタブだけに返し、snapshot や Web への broadcast には含めません。
+- 消費できるのは API のみです。取得・消費は履歴／profile と接続ごとに毎秒 10 回の枠を共有します。正しいトークンは並行要求でも 1 回だけ成功し、直ちに異なる新しい値へ交換します。別チャット・不正・使用済みのトークンは `CHAT_ADMIN_TOKEN_INVALID`、形式不正は `INVALID_REQUEST`、未ログイン・不明・許可外のチャットは `UNKNOWN_CHAT`、生成失敗は `CHAT_ADMIN_TOKEN_FAILED`、頻度超過は `RATE_LIMITED` です。
+- 成功はトークンの消費だけを意味し、**誰にどの権限を与えるかはボットが決定します**。LINE の管理者や API／mention の権限を変更せず、接続用 Bearer Token の代わりにもなりません。API 自身が平文を取得できるため、消費成功は **WEB の利用や LINE 管理者本人であることの証明にはなりません**。
+- Web は秘密を含まない `chat:admin-token:changed` を受信すると旧値を消去し、画面が開いていれば再取得します。画面を閉じる、チャット切り替え、切断、ログアウトでも表示を消去します。クリップボードの内容は利用者が管理してください。
 
 **頻度とリスク**
 - 各接続は `limits.sendsPerSecond`（≤5）の制限を受け、全ボット合計で毎分 `api.sendsPerMinute` を超えてはいけません。超過すると `RATE_LIMITED` を返します。
