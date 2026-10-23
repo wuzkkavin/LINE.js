@@ -404,7 +404,7 @@ jobs:
           "@
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
-          function Shot-App([string]$name, [hashtable]$extraEnv) {
+          function Shot-App([string]$name, [hashtable]$extraEnv, [scriptblock]$whileUp = $null) {
             foreach ($k in $extraEnv.Keys) { Set-Item "env:$k" $extraEnv[$k] }
             $p = Start-Process -FilePath $exe -PassThru
             try {
@@ -419,6 +419,7 @@ jobs:
                 Start-Sleep -Seconds 2
               }
               if (-not $up) { throw "pages/${name}: helper 120 秒未就緒" }
+              if ($whileUp) { & $whileUp }
               Start-Sleep -Seconds 6
               $p.Refresh()
               if ($p.MainWindowHandle -ne [IntPtr]::Zero) {
@@ -443,27 +444,26 @@ jobs:
               Start-Sleep -Seconds 2
             }
           }
-          # 第一次啟動兼拍總覽, 並讓 helper 在資料目錄產生 settings.json
-          Shot-App 'overview' @{}
-          $settingsPath = Join-Path $pagesHome 'settings.json'
-          if (-not (Test-Path $settingsPath)) { throw '逐頁截圖前置失敗: helper 未在資料目錄產生 settings.json' }
-          $seedJs = Join-Path $pagesHome 'seed-settings.cjs'
-          @'
-          const fs = require("fs");
-          const p = process.argv[2];
-          const s = JSON.parse(fs.readFileSync(p, "utf8"));
-          s.ai = s.ai || {};
-          s.ai.chatProfiles = s.ai.chatProfiles || {};
-          s.ai.chatProfiles["c11111111111111111111111111111111"] = {
-            rolePrompt: "(截圖驗證用) 本群專屬角色",
-            scopePrompt: "(截圖驗證用) 只回答電腦與軟體問題",
-            kbEnabled: true, kbFolder: "", chatty: true, personaCustom: true, suspended: false,
-            admins: [{ id: "u22222222222222222222222222222222", name: "截圖驗證管理員" }]
-          };
-          fs.writeFileSync(p, JSON.stringify(s, null, 1));
-          console.log("seeded chatProfiles for page screenshots");
-          '@ | Set-Content $seedJs -Encoding utf8
-          node $seedJs $settingsPath
+          # 第一次啟動兼拍總覽; 趁這次啟動透過 helper API 種入一筆假 chatProfiles
+          # (helper 只在有人存設定時才寫 settings.json, 全新啟動不會有檔案, 不能等檔案;
+          # 用 GET->改->PUT 的控制台同款流程種入, 後續逐頁啟動都會讀到)。
+          $seedAction = {
+            $cur = Invoke-RestMethod -Uri 'http://127.0.0.1:3790/api/settings' -TimeoutSec 15
+            $s = $cur.settings
+            if (-not $s.ai) { $s | Add-Member -NotePropertyName ai -NotePropertyValue ([pscustomobject]@{}) }
+            if (-not $s.ai.chatProfiles) { $s.ai | Add-Member -NotePropertyName chatProfiles -NotePropertyValue ([pscustomobject]@{}) }
+            $profile = [pscustomobject]@{
+              rolePrompt = '(截圖驗證用) 本群專屬角色'; scopePrompt = '(截圖驗證用) 只回答電腦與軟體問題'
+              kbEnabled = $true; kbFolder = ''; chatty = $true; personaCustom = $true; suspended = $false
+              admins = @([pscustomobject]@{ id = 'u22222222222222222222222222222222'; name = '截圖驗證管理員' })
+            }
+            $s.ai.chatProfiles | Add-Member -NotePropertyName 'c11111111111111111111111111111111' -NotePropertyValue $profile -Force
+            $body = $s | ConvertTo-Json -Depth 20
+            $res = Invoke-RestMethod -Uri 'http://127.0.0.1:3790/api/settings' -Method Put -ContentType 'application/json' -Body $body -TimeoutSec 15
+            if (-not $res.ok) { throw '逐頁截圖前置失敗: 種入假 chatProfiles 的 PUT 未回 ok' }
+            Write-Host '已透過 API 種入假 chatProfiles (聊天室管理頁截圖用)'
+          }
+          Shot-App 'overview' @{} $seedAction
           Shot-App 'chat' @{ AIBAO_START_PAGE = 'chat'; AIBAO_CHATVIEW_FORCE = '1' }
           Shot-App 'manage' @{ AIBAO_START_PAGE = 'manage' }
           Shot-App 'send' @{ AIBAO_START_PAGE = 'send' }
