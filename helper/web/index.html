@@ -77,6 +77,13 @@ pre.log { background: #0d2b21; color: #c9e8d5; border-radius: 12px; padding: 12p
 .chatrow .cbadge { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12.5px; background: var(--green-soft); color: var(--dark); border: 1px solid #bfe6cd; }
 .checkline { display: flex; gap: 8px; align-items: center; margin-top: 12px; font-size: 14.5px; color: var(--ink); }
 .checkline input { width: 18px; height: 18px; accent-color: var(--green); }
+.section-title { font-size: 19px; color: var(--dark); margin: 4px 2px 10px; }
+.activityrow { padding: 8px 2px; border-bottom: 1px solid var(--line); font-size: 14.5px; line-height: 1.6; }
+.activityrow .atime { color: var(--muted); margin-right: 8px; }
+.activityrow .aanswer { color: var(--muted); font-size: 13.5px; margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+.admincand { display: flex; gap: 8px; align-items: center; margin-top: 8px; font-size: 14.5px; color: var(--ink); }
+.admincand input { width: 18px; height: 18px; accent-color: var(--green); flex: none; }
+.admincand .csub { font-size: 12.5px; color: var(--muted); }
 a.btn { text-decoration: none; }
 @media (max-width: 720px) { .row, .row3 { grid-template-columns: 1fr; } h1 { font-size: 22px; } }
 </style>
@@ -92,6 +99,7 @@ a.btn { text-decoration: none; }
   </div>
 </header>
 <main class="wrap">
+  <h2 class="section-title">總覽</h2>
   <div class="grid" id="statusGrid">
     <div class="card"><div class="stat-label">LINE 登入 / 機器人連線</div><div class="stat-value" id="stLine">讀取中…</div><div class="stat-sub" id="stSelf"></div><div class="stat-sub" id="stDecrypt"></div></div>
     <div class="card"><img class="bot-avatar" id="botAvatar" src="/assets/avatar.png" alt="AI寶 頭像" onerror="this.style.display='none';"><div class="stat-label">機器人名字 (觸發)</div><div class="stat-value" id="stName">—</div><div class="stat-sub" id="stMode"></div></div>
@@ -99,6 +107,16 @@ a.btn { text-decoration: none; }
     <div class="card"><div class="stat-label">知識庫</div><div class="stat-value" id="stKb">—</div><div class="stat-sub" id="stKbSub"></div></div>
     <div class="card"><div class="stat-label">今日數據</div><div class="stat-value" id="stToday">—</div><div class="stat-sub" id="stScam"></div></div>
   </div>
+
+  <section class="card">
+    <h2>機器人聊天情況</h2>
+    <div class="hint">這裡看得到 AI寶 最近在各聊天室做了什麼：回答了什麼、婉拒了什麼、有沒有發出防詐騙警告。紀錄只保留最近 50 筆，重新開啟程式後會清空。</div>
+    <label for="activityChatFilter">顯示群組</label>
+    <select id="activityChatFilter"><option value="">全部群組</option></select>
+    <div class="hint" id="activityFilterNote" style="display:none"></div>
+    <div id="activityList" style="margin-top:8px"><div class="hint">讀取中…</div></div>
+    <div style="margin-top:10px"><button type="button" class="ghost" id="btnActivityRefresh">重新整理聊天情況</button><span class="test-result" id="activityMsg"></span></div>
+  </section>
 
   <section class="card">
     <h2>LINE 連接設定 (照著四步做)</h2>
@@ -138,6 +156,44 @@ a.btn { text-decoration: none; }
   </section>
 
   <section class="card">
+    <h2>聊天室管理</h2>
+    <div class="hint">每個聊天室自己的設定都集中在這裡改：先選一個聊天室，再改它的角色定位、回答範圍、知識庫、聒噪模式跟管理員。全控制台只有這裡可以改各聊天室的設定。</div>
+    <label for="cmChatSelect">選擇聊天室</label>
+    <select id="cmChatSelect"></select>
+    <div class="hint" id="cmEmpty">目前還沒有可以管理的聊天室：先完成上面步驟二，把群組加入白名單，這裡就會出現。</div>
+    <div id="cmEditor" style="display:none">
+      <div style="margin-top:12px"><span class="pill" id="cmSourcePill">目前用全域預設</span></div>
+      <div class="hint" id="cmSuspendedBanner" style="display:none">
+        <span>這個聊天室之前有一份自訂設定，目前停用中。</span>
+        <button type="button" class="ghost" id="cmRestoreBtn" style="margin-left:8px">恢復使用</button>
+        <button type="button" class="ghost" id="cmDiscardBtn" style="margin-left:6px">捨棄這份設定</button>
+      </div>
+      <label class="checkline"><input type="radio" name="cm-mode" id="cmModeDefault" value="default"> 使用全域預設</label>
+      <label class="checkline"><input type="radio" name="cm-mode" id="cmModeCustom" value="custom"> 本聊天室自訂</label>
+      <div id="cmCustomBox">
+        <div class="hint">這個聊天室用自己的設定，全域預設在這個聊天室不生效，也不會合併。</div>
+        <label for="cmRole">角色定位</label>
+        <textarea id="cmRole" style="min-height:64px"></textarea>
+        <label for="cmScope">回答範圍</label>
+        <textarea id="cmScope"></textarea>
+        <div class="hint">清空這個欄位＝這個聊天室不限制回答範圍。</div>
+        <label class="checkline"><input type="checkbox" id="cmKbEnabled"> 這個聊天室可以讀知識庫</label>
+        <label for="cmKbFolder">知識庫資料夾（這個聊天室專屬）</label>
+        <input type="text" id="cmKbFolder" autocomplete="off">
+        <div class="hint">留空＝用全域知識庫資料夾。關閉知識庫後，這個聊天室問公司問題時不會查知識庫，也不會因為查不到資料而通知管理員；AI 會依一般知識回答，不知道會誠實說不知道。</div>
+        <div class="hint" id="cmKbStatus" style="display:none"></div>
+      </div>
+      <label class="checkline"><input type="checkbox" id="cmChatty"> 聒噪模式：不用叫名字，我也會自己找話題接話</label>
+      <div class="hint">打開後，我會看著這個聊天室最近的對話，自己判斷有沒有自然合適的話可以接；沒有合適的話就保持安靜，不會每則都回。打開後 AI 用量會增加。叫名字或引用問我時，還是照平常方式優先回答；別的聊天室的事、個人資料跟公司機密，我一樣不會說出去。</div>
+      <h3>本聊天室管理員</h3>
+      <div class="hint">先列這個聊天室最近說過話的人與社群管理員，可以打名字搜尋；勾好的人會固定排在最上方。未設定時用備援管理員（在下面「一般與觸發」區設定）。這裡的管理員只是「通知對象」：有重要事件時，AI寶 會在群組裡 @ 他們出面處理；AI寶 本身不會踢人或處分任何人。</div>
+      <div id="cmAdminsList"><div class="hint">候選名單讀取中…</div></div>
+      <div style="margin-top:14px"><button type="button" id="btnSaveCmProfile">儲存本聊天室設定</button><span class="test-result" id="cmSaveMsg"></span></div>
+    </div>
+    <div id="cmOrphanBox" style="margin-top:10px"></div>
+  </section>
+
+  <section class="card">
     <h2>一般與觸發</h2>
     <div class="row">
       <div>
@@ -171,10 +227,8 @@ a.btn { text-decoration: none; }
     </div>
     <label for="lineApiUrl">LINE 核心連線位置 (進階, 通常不用改)</label>
     <input type="text" id="lineApiUrl">
-    <h3>創造者問題的固定回覆</h3>
-    <div class="hint">同事問「你是誰創造的」「作者是誰」「版權是誰的」這類問題時, 我會直接回下面這句, 不會去問 AI。每個人問的次數一樣會計入每日上限與冷卻。這句是固定答覆, 只供檢視, 不能修改。</div>
-    <label for="creatorReply">創造者問題的固定回覆 (唯讀)</label>
-    <input type="text" id="creatorReply" readonly aria-readonly="true">
+    <h3>關於 AI寶 自己的事</h3>
+    <div class="hint">有人問 AI寶 是誰做的、問到版權，或問 AI寶 是用什麼技術做成的時候，AI寶 會委婉拒答（機敏資訊不透露）。</div>
     <h3>機器人人設</h3>
     <div class="hint">填了才算數: 同事問我的年紀、生日、星座、性別、三圍、興趣、婚姻狀態或自我介紹時, 我只會照這裡填的回答; 沒填的欄位我會老實說「這部分我還沒有設定」, 不會自己編。年紀不用填, 我會用出生日自己算。</div>
     <div class="row">
@@ -209,6 +263,9 @@ a.btn { text-decoration: none; }
     </div>
     <label for="personaIntro">自我介紹</label>
     <input type="text" id="personaIntro" autocomplete="off">
+    <h3>備援管理員（聊天室未設管理員時用）</h3>
+    <div class="hint">每個聊天室可以在「聊天室管理」區設定自己的管理員；該聊天室有自己的管理員時，重要事件只通知該室管理員。這裡勾的是備援名單：聊天室沒有自己的管理員時，才通知這裡的人。候選名單來自各聊天室最近說過話的人與社群管理員；勾好後按最下方「儲存全部設定」就會生效。</div>
+    <div id="notifyAdminsList"><div class="hint">候選名單讀取中…</div></div>
   </section>
 
   <section class="card">
@@ -218,8 +275,7 @@ a.btn { text-decoration: none; }
     <label class="checkline"><input type="checkbox" id="aiFallback"> 啟用自動備援 (使用中的 AI 失敗時, 自動改用下一家)</label>
     <h3>機器人定位與範圍</h3>
     <div style="margin-top:6px"><span class="pill">全域的預設設定</span></div>
-    <div class="hint">各群自己的設定在白名單清單那邊改。</div>
-    <div class="hint">已有本群自訂的群組不會用這份，也不會和本群設定合併。</div>
+    <div class="hint">各聊天室自己的設定請到「聊天室管理」區修改；已有本聊天室自訂的聊天室不會用這份，也不會合併。</div>
     <label for="rolePrompt">角色定位</label>
     <textarea id="rolePrompt" style="min-height:64px"></textarea>
     <div class="hint">清空後儲存，會自動回復成出廠預設的角色定位。例：也可以改成「你是華葳集成的資訊小老師，專門陪同事學電腦」這類你想要的身分描述。</div>
@@ -320,20 +376,47 @@ let chatProfilesGlobalRole = "";
 let chatProfilesGlobalScope = "";
 let kbChatsState = {};
 let currentWhitelistChats = [];
-const chatProfileEditors = new Map();
+let notifyAdminsState = [];
+let notifyRulesState = [];
+let activityFilterChatId = "";
+let cmCurrentChatId = "";
+let cmEditorSuspended = false;
+let cmMarkedDelete = false;
+let cmAdminsSelected = [];
 function deepCloneObj(v) { return JSON.parse(JSON.stringify(v || {})); }
+function normalizeAdmins(list) {
+  const out = [];
+  const seen = new Set();
+  for (const a of Array.isArray(list) ? list : []) {
+    const id = typeof a?.id === "string" ? a.id : "";
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, name: typeof a?.name === "string" ? a.name : "" });
+  }
+  return out;
+}
+function adminsKey(list) {
+  return normalizeAdmins(list).map((a) => a.id + "|" + a.name).sort().join(";");
+}
+function unnamedChatLabel(id) {
+  const tail = String(id || "").slice(-4);
+  return tail ? `未命名聊天室 (末 4 碼 ${tail})` : "未命名聊天室";
+}
 function profileStatusText(profile) {
   if (!profile) return "用預設";
   if (profile.suspended) return "本群自訂・已停用待確認";
   const base = profile.personaCustom === false ? "用預設" : "本群自訂";
-  return profile.chatty ? base + "・聒噪開" : base;
+  let t = profile.chatty ? base + "・聒噪開" : base;
+  const n = normalizeAdmins(profile.admins).length;
+  if (n) t += `・本室管理員 ${n} 位`;
+  return t;
 }
 function profilesEqual(a, b) {
   if (!a && !b) return true;
   if (!a || !b) return false;
-  const norm = (x) => ({ rolePrompt: x.rolePrompt || "", scopePrompt: x.scopePrompt || "", kbEnabled: x.kbEnabled !== false, kbFolder: x.kbFolder || "", suspended: !!x.suspended, chatty: !!x.chatty, personaCustom: x.personaCustom !== false });
+  const norm = (x) => ({ rolePrompt: x.rolePrompt || "", scopePrompt: x.scopePrompt || "", kbEnabled: x.kbEnabled !== false, kbFolder: x.kbFolder || "", suspended: !!x.suspended, chatty: !!x.chatty, personaCustom: x.personaCustom !== false, admins: adminsKey(x.admins) });
   const na = norm(a); const nb = norm(b);
-  return na.rolePrompt === nb.rolePrompt && na.scopePrompt === nb.scopePrompt && na.kbEnabled === nb.kbEnabled && na.kbFolder === nb.kbFolder && na.suspended === nb.suspended && na.chatty === nb.chatty && na.personaCustom === nb.personaCustom;
+  return na.rolePrompt === nb.rolePrompt && na.scopePrompt === nb.scopePrompt && na.kbEnabled === nb.kbEnabled && na.kbFolder === nb.kbFolder && na.suspended === nb.suspended && na.chatty === nb.chatty && na.personaCustom === nb.personaCustom && na.admins === nb.admins;
 }
 function providerCard(p) {
   const d = document.createElement("div");
@@ -372,7 +455,8 @@ async function loadAll() {
   $("cooldownSec").value = s.cooldownSec;
   $("dailyLimit").value = s.dailyLimit;
   $("lineApiUrl").value = s.lineApiUrl;
-  $("creatorReply").value = s.creatorReply || "";
+  notifyAdminsState = normalizeAdmins(s.notify && s.notify.admins ? s.notify.admins : []);
+  notifyRulesState = deepCloneObj(s.notify && Array.isArray(s.notify.rules) ? s.notify.rules : []);
   const persona = s.persona || {};
   $("personaBirthdate").value = persona.birthdate || "";
   $("personaGender").value = persona.gender || "";
@@ -399,6 +483,8 @@ async function loadAll() {
   }
   $("lineKeyState").textContent = s.line?.set ? `已設定 (末 4 碼 ${s.line.last4}), 要更換直接在左邊欄位輸入新 Token 按儲存` : "尚未設定, 請先完成步驟一、二, 再回來產生 Token";
   loadLineCfg();
+  loadActivity();
+  loadNotifyAdmins();
   $("aiFallback").checked = !!s.ai.fallback;
   $("rolePrompt").value = s.ai.rolePrompt || "";
   $("scopePrompt").value = s.ai.scopePrompt || "";
@@ -513,153 +599,413 @@ function chatRowEl(c) {
   row.append(main, action);
   return { row, action };
 }
-function buildChatProfileEditor(c, profile) {
-  const chatId = c.id;
-  let editorSuspended = !!(profile && profile.suspended);
-  let markedDelete = false;
-  const editor = document.createElement("div");
-  editor.className = "profile-editor";
-  editor.style.display = "none";
-  editor.style.padding = "10px 4px 14px";
-  editor.style.borderBottom = "1px solid var(--line)";
-  const banner = document.createElement("div");
-  banner.className = "hint";
-  banner.style.display = editorSuspended ? "" : "none";
-  const bannerText = document.createElement("span");
-  bannerText.textContent = "這個群之前有一份自訂設定，目前停用中。";
-  const restoreBtn = document.createElement("button");
-  restoreBtn.type = "button"; restoreBtn.className = "ghost"; restoreBtn.textContent = "恢復使用"; restoreBtn.style.marginLeft = "8px";
-  const discardBtn = document.createElement("button");
-  discardBtn.type = "button"; discardBtn.className = "ghost"; discardBtn.textContent = "捨棄這份設定"; discardBtn.style.marginLeft = "6px";
-  banner.append(bannerText, restoreBtn, discardBtn);
-  editor.appendChild(banner);
-  const modeWrap = document.createElement("div");
-  const radioName = "cp-mode-" + chatId;
-  const labelDefault = document.createElement("label");
-  labelDefault.className = "checkline";
-  const radioDefault = document.createElement("input");
-  radioDefault.type = "radio"; radioDefault.name = radioName; radioDefault.value = "default";
-  labelDefault.append(radioDefault, document.createTextNode(" 跟著全域預設"));
-  const labelCustom = document.createElement("label");
-  labelCustom.className = "checkline";
-  const radioCustom = document.createElement("input");
-  radioCustom.type = "radio"; radioCustom.name = radioName; radioCustom.value = "custom";
-  labelCustom.append(radioCustom, document.createTextNode(" 本群自訂"));
-  // 人設是否自訂看 personaCustom (修復版5): 只開聒噪的條目 personaCustom=false, 人設仍是「跟著全域預設」
-  const personaCustom = !!(profile && profile.personaCustom !== false);
-  if (personaCustom) { radioCustom.checked = true; } else { radioDefault.checked = true; }
-  modeWrap.append(labelDefault, labelCustom);
-  editor.appendChild(modeWrap);
-  const customBox = document.createElement("div");
-  customBox.style.display = personaCustom ? "" : "none";
-  const replaceNote = document.createElement("div");
-  replaceNote.className = "hint";
-  replaceNote.textContent = "這個群用自己的設定，全域預設在這個群不生效。";
-  customBox.appendChild(replaceNote);
-  const roleLabel = document.createElement("label");
-  roleLabel.textContent = "本群角色定位";
-  const roleTa = document.createElement("textarea");
-  roleTa.className = "cp-role"; roleTa.style.minHeight = "64px";
-  roleTa.value = personaCustom ? (profile.rolePrompt || "") : chatProfilesGlobalRole;
-  const scopeLabel = document.createElement("label");
-  scopeLabel.textContent = "本群回答範圍";
-  const scopeTa = document.createElement("textarea");
-  scopeTa.className = "cp-scope";
-  scopeTa.value = personaCustom ? (profile.scopePrompt || "") : chatProfilesGlobalScope;
-  customBox.append(roleLabel, roleTa, scopeLabel, scopeTa);
-  const kbLabel = document.createElement("label");
-  kbLabel.className = "checkline";
-  const kbCheck = document.createElement("input");
-  kbCheck.type = "checkbox"; kbCheck.className = "cp-kb-enabled";
-  kbCheck.checked = profile ? (profile.kbEnabled !== false) : true;
-  kbLabel.append(kbCheck, document.createTextNode(" 這個群可以讀知識庫"));
-  customBox.appendChild(kbLabel);
-  const kbFolderLabel = document.createElement("label");
-  kbFolderLabel.textContent = "知識庫資料夾";
-  const kbFolderInput = document.createElement("input");
-  kbFolderInput.type = "text"; kbFolderInput.className = "cp-kb-folder";
-  kbFolderInput.value = profile ? (profile.kbFolder || "") : "";
-  const kbFolderHint = document.createElement("div");
-  kbFolderHint.className = "hint";
-  kbFolderHint.textContent = "留空＝用全域知識庫資料夾。";
-  const kbNote = document.createElement("div");
-  kbNote.className = "hint";
-  kbNote.textContent = "關閉後，這個群問公司問題時不會查知識庫，也不會因為查不到資料而通知管理員；AI 會依一般知識回答，不知道會誠實說不知道。";
-  customBox.append(kbFolderLabel, kbFolderInput, kbFolderHint, kbNote);
-  try {
-    const kbInfo = kbChatsState && kbChatsState[chatId] ? kbChatsState[chatId] : null;
-    if (kbInfo) {
-      const kbStatusLine = document.createElement("div");
-      kbStatusLine.className = "hint"; kbStatusLine.className = "hint cp-kb-status";
-      if (kbInfo.scanning) { kbStatusLine.textContent = "知識庫狀態：整理中"; }
-      else { kbStatusLine.textContent = "知識庫狀態：" + (kbInfo.files ?? 0) + " 個檔案、" + (kbInfo.chunks ?? 0) + " 段"; }
-      customBox.appendChild(kbStatusLine);
-    }
-  } catch {}
-  editor.appendChild(customBox);
-  // 聒噪模式 (修復版5): 與人設用哪一套互相獨立, 放在 customBox 外面, 兩種模式都看得到。
-  const chattyLabel = document.createElement("label");
-  chattyLabel.className = "checkline";
-  const chattyCheck = document.createElement("input");
-  chattyCheck.type = "checkbox"; chattyCheck.className = "cp-chatty";
-  chattyCheck.checked = !!(profile && profile.chatty);
-  chattyLabel.append(chattyCheck, document.createTextNode(" 聒噪模式: 不用叫名字, 我也會自己找話題接話"));
-  editor.appendChild(chattyLabel);
-  const chattyHint = document.createElement("div");
-  chattyHint.className = "hint";
-  chattyHint.textContent = "打開後, 我會看著這個群最近的對話, 自己判斷有沒有自然合適的話可以接; 沒有合適的話就保持安靜, 不會每則都回。打開後 AI 用量會增加。叫名字或引用問我時, 還是照平常方式優先回答; 別的群的事、個人資料跟公司機密, 我一樣不會說出去。";
-  editor.appendChild(chattyHint);
-  function syncMode() {
-    if (radioCustom.checked) { markedDelete = false; customBox.style.display = ""; }
-    else { customBox.style.display = "none"; }
+function chatManageEntries() {
+  const entries = new Map();
+  for (const c of currentWhitelistChats || []) {
+    entries.set(c.id, {
+      id: c.id,
+      label: c.nameResolved && c.name && c.name !== "(未命名)" ? c.name : unnamedChatLabel(c.id),
+      inWhitelist: true,
+    });
   }
-  radioDefault.addEventListener("change", syncMode);
-  radioCustom.addEventListener("change", syncMode);
-  restoreBtn.addEventListener("click", () => {
-    editorSuspended = false; markedDelete = false;
-    banner.style.display = "none";
-    // 恢復的是「停用前的那一套」: 本來人設用預設的不要被誤切成自訂
-    if (personaCustom) { radioCustom.checked = true; } else { radioDefault.checked = true; }
-    syncMode();
-  });
-  discardBtn.addEventListener("click", () => {
-    markedDelete = true; editorSuspended = false;
-    banner.style.display = "none";
-    chattyCheck.checked = false;
-    radioDefault.checked = true; syncMode(); markedDelete = true;
-  });
-  const entry = {
-    chatId,
-    getPending() {
-      const snap = chatProfilesSnapshot[chatId];
-      if (markedDelete) { return snap ? null : undefined; }
-      const chatty = !!chattyCheck.checked;
-      // 人設用預設且聒噪關閉 = 不需要條目 (有舊條目就刪除)
-      if (radioDefault.checked && !chatty) { return snap ? null : undefined; }
-      // 人設用預設但聒噪開啟: 存一包 personaCustom=false 的條目, 人設欄位放中性值 (解析時整包跟全域走)
-      const obj = radioDefault.checked
-        ? { rolePrompt: "", scopePrompt: "", kbEnabled: true, kbFolder: "", suspended: !!editorSuspended, chatty: true, personaCustom: false }
-        : { rolePrompt: roleTa.value, scopePrompt: scopeTa.value, kbEnabled: !!kbCheck.checked, kbFolder: kbFolderInput.value.trim(), suspended: !!editorSuspended, chatty, personaCustom: true };
-      if (profilesEqual(obj, snap)) return undefined;
-      return obj;
-    },
-    isSuspended() { return editorSuspended; }
-  };
-  chatProfileEditors.set(chatId, entry);
-  return editor;
+  for (const id of Object.keys(chatProfilesState || {})) {
+    if (!entries.has(id)) entries.set(id, { id, label: unnamedChatLabel(id), inWhitelist: false });
+  }
+  return [...entries.values()];
 }
-function renderOrphanProfiles(container) {
+function renderChatManage() {
+  const sel = $("cmChatSelect");
+  const editor = $("cmEditor");
+  const empty = $("cmEmpty");
+  if (!sel || !editor || !empty) return;
+  const entries = chatManageEntries();
+  if (!entries.length) {
+    sel.innerHTML = "";
+    cmCurrentChatId = "";
+    editor.style.display = "none";
+    empty.style.display = "";
+    renderOrphanProfiles();
+    return;
+  }
+  empty.style.display = "none";
+  if (!entries.some((e) => e.id === cmCurrentChatId)) cmCurrentChatId = entries[0].id;
+  sel.innerHTML = "";
+  for (const e of entries) {
+    const o = document.createElement("option");
+    o.value = e.id;
+    o.textContent = e.inWhitelist ? e.label : e.label + "（已不在白名單）";
+    sel.appendChild(o);
+  }
+  sel.value = cmCurrentChatId;
+  renderCmEditor();
+  renderOrphanProfiles();
+}
+function updateCmSourcePill() {
+  const pill = $("cmSourcePill");
+  if (!pill) return;
+  if (cmEditorSuspended) { pill.textContent = "已停用待確認（目前用全域預設）"; pill.className = "pill warn"; return; }
+  if ($("cmModeCustom").checked) { pill.textContent = "目前用本聊天室設定（全域預設不生效）"; pill.className = "pill"; }
+  else { pill.textContent = "目前用全域預設"; pill.className = "pill off"; }
+}
+function syncCmMode() {
+  $("cmCustomBox").style.display = $("cmModeCustom").checked ? "" : "none";
+  updateCmSourcePill();
+}
+function renderCmEditor() {
+  const editor = $("cmEditor");
+  if (!editor || !cmCurrentChatId) return;
+  const chatId = cmCurrentChatId;
+  const profile = chatProfilesState[chatId] || null;
+  cmEditorSuspended = !!(profile && profile.suspended);
+  cmMarkedDelete = false;
+  cmAdminsSelected = normalizeAdmins(profile ? profile.admins : []);
+  cmAdminFilter = "";
+  editor.style.display = "";
+  $("cmSuspendedBanner").style.display = cmEditorSuspended ? "" : "none";
+  const personaCustom = !!(profile && profile.personaCustom !== false);
+  $("cmModeCustom").checked = personaCustom;
+  $("cmModeDefault").checked = !personaCustom;
+  $("cmRole").value = personaCustom ? (profile.rolePrompt || "") : chatProfilesGlobalRole;
+  $("cmScope").value = personaCustom ? (profile.scopePrompt || "") : chatProfilesGlobalScope;
+  $("cmKbEnabled").checked = profile ? (profile.kbEnabled !== false) : true;
+  $("cmKbFolder").value = profile ? (profile.kbFolder || "") : "";
+  $("cmChatty").checked = !!(profile && profile.chatty);
+  const kbInfo = kbChatsState && kbChatsState[chatId] ? kbChatsState[chatId] : null;
+  const kbStatus = $("cmKbStatus");
+  if (kbInfo) {
+    kbStatus.style.display = "";
+    kbStatus.textContent = kbInfo.scanning ? "這個聊天室的知識庫狀態：整理中" : "這個聊天室的知識庫狀態：" + (kbInfo.files ?? 0) + " 個檔案、" + (kbInfo.chunks ?? 0) + " 段";
+  } else kbStatus.style.display = "none";
+  $("cmSaveMsg").textContent = "";
+  syncCmMode();
+  loadCmAdmins(chatId);
+}
+function adminCandidateRow(candidate, selectedList, onToggle) {
+  const label = document.createElement("label");
+  label.className = "admincand";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = selectedList.some((a) => a.id === candidate.id);
+  cb.addEventListener("change", () => onToggle(candidate, cb.checked));
+  const main = document.createElement("span");
+  const nm = document.createElement("span");
+  nm.textContent = candidate.name || "（沒有名字）";
+  main.appendChild(nm);
+  const parts = [];
+  if (Array.isArray(candidate.chats) && candidate.chats.length) parts.push("出現在：" + candidate.chats.join("、"));
+  if (candidate.source === "openchat-admin") parts.push("社群管理員");
+  if (candidate.retained) parts.push("目前不在候選名單，先保留");
+  if (parts.length) {
+    const sub = document.createElement("span");
+    sub.className = "csub";
+    sub.textContent = "（" + parts.join("・") + "）";
+    main.appendChild(document.createTextNode(" "));
+    main.appendChild(sub);
+  }
+  label.append(cb, main);
+  return label;
+}
+// 選人介面 (2026-10-24 修復版6, 老吳定案「人多的情境先行」): 已勾選的人固定排在最上方,
+// 上方有搜尋框可打名字即時篩選; 人多的群組不用從整份名單一個個找。
+let cmAdminCandidates = new Map();
+let cmAdminFilter = "";
+let notifyAdminCandidates = new Map();
+let notifyAdminFilter = "";
+function renderAdminPicker(box, opts) {
+  box.innerHTML = "";
+  const selected = opts.getSelected();
+  if (selected.length) {
+    const pinTitle = document.createElement("div");
+    pinTitle.className = "hint";
+    pinTitle.style.fontWeight = "700";
+    pinTitle.style.marginTop = "8px";
+    pinTitle.textContent = "已選的管理員";
+    box.appendChild(pinTitle);
+    for (const a of selected) {
+      const cand = opts.candidates.get(a.id) || { id: a.id, name: a.name || "", chats: [], source: "", retained: true };
+      box.appendChild(adminCandidateRow(cand, selected, opts.onToggle));
+    }
+  }
+  const search = document.createElement("input");
+  search.type = "text";
+  search.placeholder = "打名字搜尋…";
+  search.autocomplete = "off";
+  search.value = opts.getFilter();
+  search.style.marginTop = "10px";
+  box.appendChild(search);
+  const listBox = document.createElement("div");
+  box.appendChild(listBox);
+  const renderList = () => {
+    listBox.innerHTML = "";
+    const q = opts.getFilter().trim();
+    const selNow = opts.getSelected();
+    const rest = [...opts.candidates.values()].filter((c) => !selNow.some((a) => a.id === c.id));
+    const shown = q ? rest.filter((c) => (c.name || "").includes(q)) : rest;
+    if (!shown.length) {
+      const d = document.createElement("div");
+      d.className = "hint";
+      d.textContent = q ? "沒有名字符合的人。" : "可以勾選的人都在上面了。";
+      listBox.appendChild(d);
+      return;
+    }
+    for (const cand of shown) listBox.appendChild(adminCandidateRow(cand, selNow, opts.onToggle));
+  };
+  search.addEventListener("input", () => { opts.setFilter(search.value); renderList(); });
+  renderList();
+  if (opts.note) {
+    const d = document.createElement("div");
+    d.className = "hint";
+    d.style.marginTop = "8px";
+    d.textContent = opts.note;
+    box.appendChild(d);
+  }
+  if (opts.onWiden) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = "找沒發言過的人";
+    b.style.marginTop = "10px";
+    b.addEventListener("click", () => opts.onWiden());
+    box.appendChild(b);
+    const d = document.createElement("div");
+    d.className = "hint";
+    d.textContent = "上面先列最近說過話的人；要找的人不在裡面，再按這顆按鈕找找看。";
+    box.appendChild(d);
+  }
+}
+async function loadCmAdmins(chatId, wide = false) {
+  const box = $("cmAdminsList");
+  if (!box) return;
+  box.innerHTML = "";
+  const loading = document.createElement("div");
+  loading.className = "hint";
+  loading.textContent = "候選名單讀取中…";
+  box.appendChild(loading);
+  let candidates = [];
+  try {
+    const r = await (await fetch("/api/admin-candidates?chat=" + encodeURIComponent(chatId) + (wide ? "&all=1" : ""))).json();
+    candidates = Array.isArray(r) ? r : (r.candidates || []);
+  } catch { candidates = []; }
+  if (cmCurrentChatId !== chatId) return;
+  const byId = new Map();
+  for (const c of candidates || []) { if (c && c.id) byId.set(c.id, { id: c.id, name: c.name || "", chats: c.chats || [], source: c.source || "" }); }
+  for (const a of cmAdminsSelected) { if (!byId.has(a.id)) byId.set(a.id, { id: a.id, name: a.name || "", chats: [], source: "", retained: true }); }
+  cmAdminCandidates = byId;
+  if (!byId.size) {
+    box.innerHTML = "";
+    const d = document.createElement("div");
+    d.className = "hint";
+    d.textContent = "目前還沒有候選名單：等這個聊天室有人說過話，這裡就會出現可以勾選的人。在那之前，重要事件會通知備援管理員。";
+    box.appendChild(d);
+    return;
+  }
+  renderAdminPicker(box, {
+    candidates: cmAdminCandidates,
+    getSelected: () => cmAdminsSelected,
+    getFilter: () => cmAdminFilter,
+    setFilter: (v) => { cmAdminFilter = v; },
+    onToggle: (c, on) => {
+      if (on) { if (!cmAdminsSelected.some((a) => a.id === c.id)) cmAdminsSelected.push({ id: c.id, name: c.name || "" }); }
+      else cmAdminsSelected = cmAdminsSelected.filter((a) => a.id !== c.id);
+      loadCmAdminsRenderOnly(chatId, wide);
+    },
+    note: wide ? "這份是比較完整的名單：曾在這個聊天室出現過的人與社群管理員。LINE 沒有提供完整成員名單，從未出現過的人無法列出。" : "",
+    onWiden: wide ? null : () => loadCmAdmins(chatId, true),
+  });
+}
+function loadCmAdminsRenderOnly(chatId, wide) {
+  const box = $("cmAdminsList");
+  if (!box || cmCurrentChatId !== chatId) return;
+  renderAdminPicker(box, {
+    candidates: cmAdminCandidates,
+    getSelected: () => cmAdminsSelected,
+    getFilter: () => cmAdminFilter,
+    setFilter: (v) => { cmAdminFilter = v; },
+    onToggle: (c, on) => {
+      if (on) { if (!cmAdminsSelected.some((a) => a.id === c.id)) cmAdminsSelected.push({ id: c.id, name: c.name || "" }); }
+      else cmAdminsSelected = cmAdminsSelected.filter((a) => a.id !== c.id);
+      loadCmAdminsRenderOnly(chatId, wide);
+    },
+    note: wide ? "這份是比較完整的名單：曾在這個聊天室出現過的人與社群管理員。LINE 沒有提供完整成員名單，從未出現過的人無法列出。" : "",
+    onWiden: wide ? null : () => loadCmAdmins(chatId, true),
+  });
+}
+async function loadNotifyAdmins() {
+  const box = $("notifyAdminsList");
+  if (!box) return;
+  let candidates = [];
+  try {
+    const r = await (await fetch("/api/admin-candidates")).json();
+    candidates = Array.isArray(r) ? r : (r.candidates || []);
+  } catch { candidates = []; }
+  const byId = new Map();
+  for (const c of candidates || []) { if (c && c.id) byId.set(c.id, { id: c.id, name: c.name || "", chats: c.chats || [], source: c.source || "" }); }
+  for (const a of notifyAdminsState) { if (!byId.has(a.id)) byId.set(a.id, { id: a.id, name: a.name || "", chats: [], source: "", retained: true }); }
+  notifyAdminCandidates = byId;
+  if (!byId.size) {
+    box.innerHTML = "";
+    const d = document.createElement("div");
+    d.className = "hint";
+    d.textContent = "目前還沒有候選名單：等群組裡有人說過話，這裡就會出現可以勾選的人。";
+    box.appendChild(d);
+    return;
+  }
+  const render = () => renderAdminPicker(box, {
+    candidates: notifyAdminCandidates,
+    getSelected: () => notifyAdminsState,
+    getFilter: () => notifyAdminFilter,
+    setFilter: (v) => { notifyAdminFilter = v; },
+    onToggle: (c, on) => {
+      if (on) { if (!notifyAdminsState.some((a) => a.id === c.id)) notifyAdminsState.push({ id: c.id, name: c.name || "" }); }
+      else notifyAdminsState = notifyAdminsState.filter((a) => a.id !== c.id);
+      render();
+    },
+  });
+  render();
+}
+function cmPendingProfile() {
+  const chatId = cmCurrentChatId;
+  const snap = chatProfilesSnapshot[chatId];
+  if (cmMarkedDelete) return snap ? null : undefined;
+  const chatty = !!$("cmChatty").checked;
+  const admins = normalizeAdmins(cmAdminsSelected);
+  const custom = !!$("cmModeCustom").checked;
+  if (!custom && !chatty && !admins.length) return snap ? null : undefined;
+  const obj = !custom
+    ? { rolePrompt: "", scopePrompt: "", kbEnabled: true, kbFolder: "", suspended: !!cmEditorSuspended, chatty, personaCustom: false, admins }
+    : { rolePrompt: $("cmRole").value, scopePrompt: $("cmScope").value, kbEnabled: !!$("cmKbEnabled").checked, kbFolder: $("cmKbFolder").value.trim(), suspended: !!cmEditorSuspended, chatty, personaCustom: true, admins };
+  if (profilesEqual(obj, snap)) return undefined;
+  return obj;
+}
+async function saveCurrentChatProfile() {
+  const btn = $("btnSaveCmProfile");
+  const msg = $("cmSaveMsg");
+  const chatId = cmCurrentChatId;
+  if (!chatId) { msg.textContent = "請先選一個聊天室"; msg.style.color = "var(--err)"; return; }
+  const pending = cmPendingProfile();
+  if (pending === undefined) { msg.textContent = "沒有變更需要儲存"; msg.style.color = ""; return; }
+  btn.disabled = true; msg.textContent = "儲存中…"; msg.style.color = "";
+  try {
+    const r = await (await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ai: { chatProfiles: { [chatId]: pending } } }) })).json();
+    if (r.ok) {
+      if (pending === null) { delete chatProfilesState[chatId]; delete chatProfilesSnapshot[chatId]; }
+      else { chatProfilesState[chatId] = deepCloneObj(pending); chatProfilesSnapshot[chatId] = deepCloneObj(pending); }
+      const okText = r.message || "已儲存，馬上生效";
+      msg.textContent = okText;
+      msg.style.color = "var(--dark)";
+      await loadWhitelist();
+      const newMsg = $("cmSaveMsg");
+      if (newMsg) { newMsg.textContent = okText; newMsg.style.color = "var(--dark)"; }
+    } else {
+      msg.textContent = "儲存失敗：" + (r.message || "");
+      msg.style.color = "var(--err)";
+    }
+  } catch { msg.textContent = "儲存失敗：連不上控制台服務，請重新整理頁面再試"; msg.style.color = "var(--err)"; }
+  btn.disabled = false;
+}
+const ACTIVITY_KIND_LABEL = { answered: "已回答", chatty: "接話", chatty_pass: "選擇不接話", declined: "婉拒（範圍外）", clarify: "反問確認", name_only: "引導說明", cooldown: "冷卻略過", daily_limit: "每日上限擋下", scam_warned: "防詐騙警告", ai_busy: "AI 忙線", ai_failed: "AI 連不上" };
+async function loadActivity() {
+  const listBox = $("activityList");
+  const sel = $("activityChatFilter");
+  const note = $("activityFilterNote");
+  if (!listBox || !sel || !note) return;
+  try {
+    const q = activityFilterChatId ? "?chat=" + encodeURIComponent(activityFilterChatId) : "";
+    const r = await (await fetch("/api/bot/activity" + q)).json();
+    const events = Array.isArray(r.events) ? r.events : [];
+    const chats = Array.isArray(r.chats) ? r.chats : [];
+    const labelById = new Map();
+    sel.innerHTML = "";
+    const allOpt = document.createElement("option");
+    allOpt.value = "";
+    allOpt.textContent = "全部群組";
+    sel.appendChild(allOpt);
+    for (const c of chats) {
+      if (!c || !c.chatId) continue;
+      const label = c.chatName ? c.chatName : unnamedChatLabel(c.chatId);
+      labelById.set(c.chatId, label);
+      const o = document.createElement("option");
+      o.value = c.chatId;
+      o.textContent = label;
+      sel.appendChild(o);
+    }
+    if (activityFilterChatId && !labelById.has(activityFilterChatId)) {
+      const o = document.createElement("option");
+      o.value = activityFilterChatId;
+      o.textContent = unnamedChatLabel(activityFilterChatId);
+      sel.appendChild(o);
+      labelById.set(activityFilterChatId, o.textContent);
+    }
+    sel.value = activityFilterChatId || "";
+    if (activityFilterChatId) {
+      note.style.display = "";
+      note.textContent = "只看 " + labelById.get(activityFilterChatId) + "：顯示 " + events.length + " 筆（全部共 " + (r.total ?? events.length) + " 筆）";
+    } else note.style.display = "none";
+    listBox.innerHTML = "";
+    if (!events.length) {
+      const d = document.createElement("div");
+      d.className = "hint";
+      d.textContent = activityFilterChatId ? "這個聊天室目前還沒有紀錄：紀錄只保留最近 50 筆，較早的會被新的蓋掉；也可以改選「全部群組」看其他聊天室的情況。" : "目前還沒有紀錄：有人在群組跟機器人說話後，這裡會逐筆出現。";
+      listBox.appendChild(d);
+      return;
+    }
+    for (const ev of events) {
+      const row = document.createElement("div");
+      row.className = "activityrow";
+      const time = document.createElement("span");
+      time.className = "atime";
+      time.textContent = ev.time || "";
+      const kind = document.createElement("span");
+      kind.className = "pill";
+      kind.textContent = ACTIVITY_KIND_LABEL[ev.kind] || "紀錄";
+      const main = document.createElement("span");
+      const chatLabel = ev.chatName || (ev.chatId ? unnamedChatLabel(ev.chatId) : "");
+      const bits = [];
+      if (chatLabel) bits.push(chatLabel);
+      if (ev.senderName) bits.push(ev.senderName);
+      main.textContent = (bits.length ? bits.join("・") + "：" : "") + (ev.question || "");
+      row.append(time, kind, document.createTextNode(" "), main);
+      if (ev.detail) {
+        const dd = document.createElement("div");
+        dd.className = "aanswer";
+        dd.textContent = ev.detail;
+        row.appendChild(dd);
+      }
+      if (typeof ev.answerChars === "number") {
+        const meta = document.createElement("div");
+        meta.className = "aanswer";
+        meta.textContent = "回答 " + ev.answerChars + " 字" + (typeof ev.ms === "number" ? "・" + ev.ms + " 毫秒" : "");
+        row.appendChild(meta);
+      }
+      if (ev.answer) {
+        const ans = document.createElement("div");
+        ans.className = "aanswer";
+        ans.textContent = "回答：" + ev.answer + (ev.answerTruncated ? "（回答原文較長，這裡只保存前 2000 字）" : "");
+        row.appendChild(ans);
+      }
+      listBox.appendChild(row);
+    }
+  } catch {
+    listBox.innerHTML = "";
+    const d = document.createElement("div");
+    d.className = "hint";
+    d.textContent = "聊天情況讀取失敗：連不上控制台服務，請重新整理頁面再試。";
+    listBox.appendChild(d);
+  }
+}
+function renderOrphanProfiles() {
+  const container = $("cmOrphanBox");
+  if (!container) return;
   container.innerHTML = "";
   const whitelistIds = new Set((currentWhitelistChats || []).map((x) => x.id));
   const orphanIds = Object.keys(chatProfilesState || {}).filter((id) => !whitelistIds.has(id));
   if (!orphanIds.length) { container.style.display = "none"; return; }
   container.style.display = "";
   const heading = document.createElement("h3");
-  heading.textContent = "已不在白名單的群組設定";
+  heading.textContent = "已停用的聊天室設定（已不在白名單）";
   container.appendChild(heading);
   const hintEl = document.createElement("div");
   hintEl.className = "hint";
-  hintEl.textContent = "這些群組已經不在白名單，設定還保留著，不會生效。";
+  hintEl.textContent = "這些聊天室已經不在白名單，設定還保留著，不會生效。要恢復使用，先在上面步驟二把聊天室重新加入白名單，再回到這裡上方的清單選它、按「恢復使用」；不要這份設定了，就直接刪除。";
   container.appendChild(hintEl);
   for (const oid of orphanIds) {
     const rowEl = document.createElement("div");
@@ -667,8 +1013,7 @@ function renderOrphanProfiles(container) {
     const mainEl = document.createElement("div");
     const nameEl = document.createElement("div");
     nameEl.className = "cname";
-    const last4 = oid ? oid.slice(-4) : "";
-    nameEl.textContent = "未命名聊天室（末 4 碼）" + last4;
+    nameEl.textContent = unnamedChatLabel(oid);
     const subEl = document.createElement("div");
     subEl.className = "csub";
     subEl.textContent = profileStatusText(chatProfilesState[oid]);
@@ -676,13 +1021,14 @@ function renderOrphanProfiles(container) {
     const actEl = document.createElement("div");
     actEl.className = "caction";
     const delBtn = document.createElement("button");
-    delBtn.type = "button"; delBtn.className = "ghost"; delBtn.textContent = "刪除這個群的設定";
+    delBtn.type = "button"; delBtn.className = "ghost"; delBtn.textContent = "刪除這份設定";
     delBtn.addEventListener("click", async () => {
       delBtn.disabled = true;
       try {
         const rr = await (await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ai: { chatProfiles: { [oid]: null } } }) })).json();
         if (rr && rr.ok === false) { delBtn.disabled = false; return; }
         delete chatProfilesState[oid]; delete chatProfilesSnapshot[oid];
+        if (cmCurrentChatId === oid) cmCurrentChatId = "";
         try {
           const sRes2 = await fetch("/api/settings"); const s2 = await sRes2.json();
           if (s2 && s2.ai) { chatProfilesState = deepCloneObj(s2.ai.chatProfiles || {}); chatProfilesSnapshot = deepCloneObj(s2.ai.chatProfiles || {}); }
@@ -695,77 +1041,33 @@ function renderOrphanProfiles(container) {
     container.appendChild(rowEl);
   }
 }
-async function saveChatProfiles(btn, msg) {
-  const patch = {};
-  for (const entry of chatProfileEditors.values()) {
-    const pending = entry.getPending();
-    if (pending !== undefined) patch[entry.chatId] = pending;
-  }
-  if (!Object.keys(patch).length) { msg.textContent = "沒有變更需要儲存"; msg.style.color = ""; return; }
-  btn.disabled = true; msg.textContent = "儲存中…"; msg.style.color = "";
-  try {
-    const r = await (await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ai: { chatProfiles: patch } }) })).json();
-    if (r.ok) {
-      for (const k of Object.keys(patch)) {
-        if (patch[k] === null) { delete chatProfilesState[k]; delete chatProfilesSnapshot[k]; }
-        else { chatProfilesState[k] = deepCloneObj(patch[k]); chatProfilesSnapshot[k] = deepCloneObj(patch[k]); }
-      }
-      const okText = r.message || "已儲存，馬上生效";
-      msg.textContent = okText;
-      msg.style.color = "var(--dark)";
-      await loadWhitelist();
-      const newMsg = $("chatProfilesMsg");
-      if (newMsg) { newMsg.textContent = okText; newMsg.style.color = "var(--dark)"; }
-      const globalMsg = $("whitelistMsg");
-      if (globalMsg) { globalMsg.textContent = okText; globalMsg.style.color = "var(--dark)"; }
-    } else {
-      msg.textContent = "儲存失敗:" + (r.message || "");
-      msg.style.color = "var(--err)";
-    }
-  } catch { msg.textContent = "儲存失敗: 連不上控制台服務, 請重新整理頁面再試"; msg.style.color = "var(--err)"; }
-  btn.disabled = false;
-}
 // 已儲存白名單逐筆清單 + 移除: 名稱/類型/人數由後端對照核心快照解析, 讀不到名稱顯示「未命名群組」。
 async function loadWhitelist() {
   const box = $("wlList");
   if (!box) return;
   try {
     const r = await (await fetch("/api/line/whitelist")).json();
-    if (!r.ok) { box.innerHTML = ""; return; }
+    if (!r.ok) { box.innerHTML = ""; currentWhitelistChats = []; renderChatManage(); return; }
     currentWhitelistChats = r.chats || [];
-    chatProfileEditors.clear();
+    box.innerHTML = "";
     if (!r.chats.length) {
-      box.innerHTML = "";
       const emptyEl = document.createElement("div");
-      emptyEl.className = "hint"; emptyEl.textContent = "目前白名單是空的: 還沒有任何群組被加入。";
+      emptyEl.className = "hint"; emptyEl.textContent = "目前白名單是空的：還沒有任何群組被加入。";
       box.appendChild(emptyEl);
-      const orphanBox0 = document.createElement("div");
-      orphanBox0.id = "orphanProfiles"; orphanBox0.style.marginTop = "10px";
-      box.appendChild(orphanBox0);
-      renderOrphanProfiles(orphanBox0);
+      renderChatManage();
       return;
     }
-    box.innerHTML = "";
     const title = document.createElement("div");
     title.className = "hint";
-    title.textContent = "目前白名單 (已儲存):";
+    title.textContent = "目前白名單（已儲存）：各聊天室自己的設定請到下方「聊天室管理」區修改。";
     box.appendChild(title);
     for (const c of r.chats) {
-      const itemWrap = document.createElement("div");
       const { row, action } = chatRowEl(c);
       const mainEl = row.children[0];
       const statusEl = document.createElement("div");
       statusEl.className = "csub cp-status";
       statusEl.textContent = profileStatusText(chatProfilesState[c.id]);
       if (mainEl) mainEl.appendChild(statusEl);
-      const profileForEdit = chatProfilesState[c.id] || null;
-      const editor = buildChatProfileEditor(c, profileForEdit);
-      const toggleBtn = document.createElement("button");
-      toggleBtn.type = "button"; toggleBtn.className = "ghost"; toggleBtn.textContent = "設定這個群";
-      toggleBtn.style.marginRight = "6px";
-      toggleBtn.addEventListener("click", () => {
-        editor.style.display = editor.style.display === "none" ? "" : "none";
-      });
       const b = document.createElement("button");
       b.type = "button"; b.className = "ghost"; b.textContent = "移除";
       b.addEventListener("click", async () => {
@@ -787,27 +1089,14 @@ async function loadWhitelist() {
             }
             loadLineCfg();
           }
-        } catch { $("whitelistMsg").textContent = "移除失敗: 連不上控制台服務"; $("whitelistMsg").style.color = "var(--err)"; }
+        } catch { $("whitelistMsg").textContent = "移除失敗：連不上控制台服務"; $("whitelistMsg").style.color = "var(--err)"; }
         b.disabled = false;
       });
-      action.append(toggleBtn, b);
-      itemWrap.append(row, editor);
-      box.appendChild(itemWrap);
+      action.appendChild(b);
+      box.appendChild(row);
     }
-    const saveWrap = document.createElement("div");
-    saveWrap.style.marginTop = "12px";
-    const saveProfilesBtn = document.createElement("button");
-    saveProfilesBtn.type = "button"; saveProfilesBtn.id = "btnSaveChatProfiles"; saveProfilesBtn.textContent = "儲存各群設定";
-    const saveProfilesMsg = document.createElement("span");
-    saveProfilesMsg.className = "test-result"; saveProfilesMsg.id = "chatProfilesMsg";
-    saveProfilesBtn.addEventListener("click", () => saveChatProfiles(saveProfilesBtn, saveProfilesMsg));
-    saveWrap.append(saveProfilesBtn, saveProfilesMsg);
-    box.appendChild(saveWrap);
-    const orphanBox = document.createElement("div");
-    orphanBox.id = "orphanProfiles"; orphanBox.style.marginTop = "10px";
-    box.appendChild(orphanBox);
-    renderOrphanProfiles(orphanBox);
-  } catch { box.innerHTML = ""; }
+    renderChatManage();
+  } catch { box.innerHTML = ""; renderChatManage(); }
 }
 async function loadLog() {
   try { const r = await (await fetch("/api/logs")).json(); $("logTail").textContent = r.tail || "(今天還沒有 log)"; } catch { $("logTail").textContent = "Log 讀取失敗: 連不上控制台服務, 請重新整理頁面"; }
@@ -842,8 +1131,8 @@ function collect() {
     cooldownSec: Number($("cooldownSec").value) || 20,
     dailyLimit: Number($("dailyLimit").value) || 100,
     lineApiUrl: $("lineApiUrl").value.trim(),
-    creatorReply: $("creatorReply").value.trim(),
     showSources: $("showSources").checked,
+    notify: { admins: normalizeAdmins(notifyAdminsState), rules: deepCloneObj(notifyRulesState) },
     persona: {
       birthdate: $("personaBirthdate").value.trim(),
       gender: $("personaGender").value.trim(),
@@ -947,6 +1236,26 @@ $("btnGenToken").onclick = async () => {
   btn.disabled = false;
 };
 $("btnRefreshTop").onclick = () => loadAll();
+$("activityChatFilter").addEventListener("change", () => { activityFilterChatId = $("activityChatFilter").value || ""; loadActivity(); });
+$("btnActivityRefresh").onclick = () => loadActivity();
+$("cmChatSelect").addEventListener("change", () => { cmCurrentChatId = $("cmChatSelect").value || ""; renderCmEditor(); renderOrphanProfiles(); });
+$("cmModeDefault").addEventListener("change", syncCmMode);
+$("cmModeCustom").addEventListener("change", syncCmMode);
+$("cmRestoreBtn").addEventListener("click", () => {
+  cmEditorSuspended = false; cmMarkedDelete = false;
+  $("cmSuspendedBanner").style.display = "none";
+  syncCmMode();
+});
+$("cmDiscardBtn").addEventListener("click", () => {
+  cmMarkedDelete = true; cmEditorSuspended = false;
+  $("cmSuspendedBanner").style.display = "none";
+  $("cmChatty").checked = false;
+  cmAdminsSelected = [];
+  $("cmModeDefault").checked = true; $("cmModeCustom").checked = false;
+  syncCmMode();
+  $("cmSaveMsg").textContent = "已標記捨棄這份設定，按「儲存本聊天室設定」後才會真的刪掉。";
+});
+$("btnSaveCmProfile").onclick = () => saveCurrentChatProfile();
 $("btnLogDir").onclick = async () => { try { const r = await (await fetch("/api/log-dir")).json(); $("logDirText").textContent = r.dir; } catch { $("logDirText").textContent = "讀取失敗: 連不上控制台服務, 請重新整理頁面"; } };
 $("btnLogRefresh").onclick = loadLog;
 loadAll().catch(() => { $("saveMsg").textContent = "讀不到設定, 請確認程式有在執行, 再重新整理頁面"; });
