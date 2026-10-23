@@ -269,7 +269,7 @@ export class HelperBot {
     this.chatNames = new Map(); // chatId -> 顯示名稱 (活動面板用; 同樣來自 channels 影格)
     this.historyPrefetchedChats = new Set(); // 本次連線已補登過的聊天室 (重連時清空重補)
     this.historyPrefetchInFlight = new Set();
-    this.stats = { date: "", answered: 0, triggered: 0, scamChecked: 0, scamWarned: 0 };
+    this.stats = { date: "", answered: 0, triggered: 0, scamChecked: 0, scamWarned: 0, scamScanned: 0 };
     // Jev 接通狀態 (2026-10-21 真接通): 誠實原則 — 只有真的收到過核心 scam:result 才准說 ok。
     // unconfigured = 沒啟用或還沒存金鑰; unverified = 已啟用且有金鑰, 但這次啟動還沒成功判讀過;
     // ok = 已成功判讀 (jevLastOkAt 為最近一次的 ISO 時間); error = 最近一次 Jev 判讀失敗、已退回 AI
@@ -288,6 +288,12 @@ export class HelperBot {
     // senders: [寄件者顯示名稱] }。decryptLastScanAt 為最近一輪完整掃描完成的時間;
     // 還沒掃過任何一輪時 summary 的 state 是 unknown, 不准冒充正常 (誠實原則同 Jev)。
     this.decryptByChat = new Map();
+    // 即時解密活狀態 (2026-10-22 修復): chatId -> { lastOkAt, lastFailAt } (epoch ms)。
+    // 為什麼需要它: 歷史掃描看到的 failed 混著「舊世代不可復原的歷史訊息」與「現在真的
+    // 讀不到」; 2026-10-21 事故群復原後即時訊息明明可解可回, 卻被 100 則窗內的舊壞訊息
+    // 永久標成異常, 連發送都被護欄擋下。活狀態只認即時事件: 最後一次即時失敗之後
+    // 有沒有即時成功 — 有 = 群是活的, 歷史壞訊息只提示、不擋事 (見 decryptSummary 的 blocking)。
+    this.decryptLiveByChat = new Map();
     this.decryptLastScanAt = null;
     this.decryptScanTimer = null;
     this.decryptScanInFlight = false;
@@ -319,7 +325,7 @@ export class HelperBot {
       const raw = JSON.parse(readFileSync(this.dailyStatePath, "utf8"));
       if (raw && raw.date === localDateKey()) {
         this.triggerState.daily = { date: raw.date, count: Number(raw.dailyCount) || 0 };
-        this.stats = { date: raw.date, answered: Number(raw.answered) || 0, triggered: Number(raw.triggered) || 0, scamChecked: Number(raw.scamChecked) || 0, scamWarned: Number(raw.scamWarned) || 0 };
+        this.stats = { date: raw.date, answered: Number(raw.answered) || 0, triggered: Number(raw.triggered) || 0, scamChecked: Number(raw.scamChecked) || 0, scamWarned: Number(raw.scamWarned) || 0, scamScanned: Number(raw.scamScanned) || 0 };
       }
     } catch { /* 檔案不存在或損壞: 從零開始, 不擋啟動 */ }
   }
@@ -332,7 +338,7 @@ export class HelperBot {
         date: this.triggerState.daily.date || localDateKey(),
         dailyCount: this.triggerState.daily.count,
         answered: this.stats.answered, triggered: this.stats.triggered,
-        scamChecked: this.stats.scamChecked, scamWarned: this.stats.scamWarned,
+        scamChecked: this.stats.scamChecked, scamWarned: this.stats.scamWarned, scamScanned: this.stats.scamScanned,
       }), "utf8");
     } catch { /* 寫入失敗不影響服務; 計數退回記憶體模式 */ }
   }
@@ -480,7 +486,7 @@ export class HelperBot {
   cfg() { return this.settings.get(); }
   rollStats() {
     const d = localDateKey();
-    if (this.stats.date !== d) this.stats = { date: d, answered: 0, triggered: 0, scamChecked: 0, scamWarned: 0 };
+    if (this.stats.date !== d) this.stats = { date: d, answered: 0, triggered: 0, scamChecked: 0, scamWarned: 0, scamScanned: 0 };
   }
   status() {
     this.rollStats();
@@ -498,7 +504,7 @@ export class HelperBot {
       aiModel: s.ai.providers[s.ai.active]?.model ?? "",
       kb: this.kb ? this.kb.status() : null,
       scam: {
-        enabled: s.scam.enabled, threshold: s.scam.threshold, checkedToday: this.stats.scamChecked, warnedToday: this.stats.scamWarned,
+        enabled: s.scam.enabled, threshold: s.scam.threshold, checkedToday: this.stats.scamChecked, warnedToday: this.stats.scamWarned, scannedToday: this.stats.scamScanned,
         // Jev 誠實狀態 (防詐騙頁顯示用): state 四態 + 最近成功時間 + 最近失敗的白話原因
         jevState: this.jevState, jevLastOkAt: this.jevLastOkAt, jevLastError: this.jevLastError,
       },
@@ -679,7 +685,9 @@ export class HelperBot {
     return new Promise((resolve, reject) => {
       const requestId = `h${++this.reqSeq}-${Date.now()}`;
       const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error("send timeout")); }, 10000);
-      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject });
+      // chatId 一併記在 pending 上: sent 影格本身不帶聊天室, onFrame 靠這筆把自己送出的
+      // 訊息以「正確的聊天室」登記進登記簿 (分群隔離, 2026-10-23 稽核修復)。
+      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject, chatId });
       this.sendFrame({ type: "message:send", requestId, chatId, text, ...(replyTo ? { replyTo } : {}) });
     });
   }
@@ -691,7 +699,7 @@ export class HelperBot {
     return new Promise((resolve, reject) => {
       const requestId = `h${++this.reqSeq}-${Date.now()}`;
       const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error("send file timeout")); }, 30000);
-      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
+      this.pending.set(requestId, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); }, chatId });
       this.sendFrame({ type: "message:send", requestId, chatId, file: { filename, dataBase64: Buffer.from(bytes).toString("base64") } });
     });
   }
@@ -780,6 +788,11 @@ export class HelperBot {
       totalScanned += r.scanned;
       if (r.failed > 0) {
         totalFailed += r.failed;
+        // blocking (2026-10-22 修復): 這個群「現在」是不是真的讀不到 — 只認即時活狀態:
+        // 最後一次即時失敗之後沒有任何即時成功, 才算擋事的壞狀態。歷史窗裡有舊世代
+        // 壞訊息、但即時訊息解得開的群 blocking=false (只提示歷史問題, 不擋發送)。
+        const live = this.decryptLiveByChat.get(chatId);
+        const blocking = !!(live && live.lastFailAt > 0 && live.lastFailAt > live.lastOkAt);
         issues.push({
           chatId,
           name: this.chatNames.get(chatId) ?? "",
@@ -788,6 +801,9 @@ export class HelperBot {
           lastFailAt: r.lastFailAt,
           lastFailTime: r.lastFailTime,
           senders: [...r.senders],
+          blocking,
+          lastLiveOkAt: live && live.lastOkAt ? new Date(live.lastOkAt).toISOString() : null,
+          lastLiveFailAt: live && live.lastFailAt ? new Date(live.lastFailAt).toISOString() : null,
         });
       }
     }
@@ -815,6 +831,9 @@ export class HelperBot {
       chatsChecked: this.decryptByChat.size,
       lastScanAt: this.decryptLastScanAt,
       issues,
+      // 現在真的讀不到、需要擋下發送的聊天室 (issue.blocking 的子集); 消費端 (殼/Ubuntu
+      // 執行器) 只准用這份判斷暫停, 用整份 issues 會把「歷史有舊壞訊息但即時正常」的群誤擋。
+      blockingChats: issues.filter((i) => i.blocking).map((i) => i.chatId),
       missedTotal: totalMissed,
       missedIssues,
     };
@@ -977,7 +996,9 @@ export class HelperBot {
   // 查無此訊息時在登記簿留空字串記號, 避免每次引用都重查。
   async isQuotedSelf(m) {
     if (!m.replyTo || !this.selfId) return false;
-    const known = this.registry.lookup(m.replyTo);
+    // 分群隔離 (2026-10-23 稽核修復): 認定只限「本聊天室」登記過的紀錄;
+    // 被引用的訊息若是在別的群登記的, 視同沒登記過, 之後也只查本聊天室的歷史。
+    const known = this.registry.lookup(m.replyTo, m.channelId ?? "");
     if (known !== undefined) return known === this.selfId;
     if (!this.connected) return false;
     try {
@@ -993,7 +1014,9 @@ export class HelperBot {
         if (!frame.hasMore || !frame.cursor) break;
         cursor = frame.cursor;
       }
-      this.registry.register(m.replyTo, "", m.channelId ?? "");
+      // 本聊天室歷史也查無此訊息才留負記號; 登記簿裡若已有紀錄 (例如別群的正式紀錄,
+      // 跨群引用情境), 不可用負記號把人家覆寫掉 (分群隔離, 2026-10-23 稽核修復)。
+      if (this.registry.lookup(m.replyTo) === undefined) this.registry.register(m.replyTo, "", m.channelId ?? "");
       return false;
     } catch (e) {
       this.logger?.warn("觸發判斷", "引用訊息寄件者補查失敗, 本次不以引用觸發", { id: m.messageId, error: String(e?.message ?? e) });
@@ -1032,8 +1055,11 @@ export class HelperBot {
     }
     // 自己送出的訊息: 核心在 sent 影格回新訊息的 messageId, 立刻登記為機器人本人,
     // 之後有人引用這則回答, 登記簿就認得出來 (引用續答觸發的認定主路徑)。
+    // sent 影格不帶聊天室: 改用送出時記在 pending 上的 chatId 登記 (分群隔離,
+    // 2026-10-23 稽核修復) — 登記成空白的話, 這則回答會被別的群「借用」來跨群認定。
     if (frame.type === "sent" && frame.messageId && this.selfId) {
-      this.registry.register(frame.messageId, this.selfId, "");
+      const sentChatId = frame.requestId ? (this.pending.get(frame.requestId)?.chatId ?? "") : "";
+      this.registry.register(frame.messageId, this.selfId, sentChatId);
     }
     if (frame.requestId && this.pending.has(frame.requestId)) {
       const p = this.pending.get(frame.requestId);
@@ -1057,8 +1083,26 @@ export class HelperBot {
     }
   }
 
+  // 記即時解密活狀態: 只認真的從核心即時推播進來的事件 (歷史回補不經這裡)。
+  // 成功 = 真人 (非自己) 的文字訊息解開了; 失敗 = 核心標了 decryptFailed 的佔位訊息。
+  noteLiveDecrypt(m) {
+    const chatId = m?.channelId;
+    if (!chatId) return;
+    let rec = this.decryptLiveByChat.get(chatId);
+    if (!rec) { rec = { lastOkAt: 0, lastFailAt: 0 }; this.decryptLiveByChat.set(chatId, rec); }
+    const nowMs = Date.now();
+    if (m.decryptFailed === true) { rec.lastFailAt = nowMs; return; }
+    if (this.selfId && m.senderId && m.senderId !== this.selfId
+      && m.contentType !== "CHATEVENT" && m.contentType !== "18"
+      && typeof m.text === "string" && m.text) {
+      rec.lastOkAt = nowMs;
+    }
+  }
+
   async onMessage(m) {
-    if (!m || typeof m.text !== "string") return;
+    if (!m) return;
+    this.noteLiveDecrypt(m);
+    if (typeof m.text !== "string") return;
     const s = this.cfg();
     this.rollStats();
     this.logger?.info("訊息接收", "收到訊息", { id: m.messageId, chat: m.channelId, sender: m.senderId, len: m.text.length });
@@ -1085,6 +1129,10 @@ export class HelperBot {
 
   async handleAutoScam(m, s) {
     if (!s.scam.enabled) return;
+    // 掃描計數 (2026-10-22 修復): 每則真人訊息都過預篩, 這個數字讓「有在看每一則」
+    // 在總覽上看得見 — checkedToday 只計預篩命中、真的送判讀的次數, 兩者口徑不同:
+    // 2026-10-22 真機就是只有打招呼訊息、預篩沒命中, checkedToday=0 看起來像沒在監控。
+    this.stats.scamScanned++;
     const pre = prefilterScam(m.text);
     if (!pre.hit) { this.logger?.debugLog("防詐騙", "預篩未命中, 不送判讀", { id: m.messageId }); return; }
     this.scamLimiter.limit = s.scam.perMinute ?? 10;

@@ -209,10 +209,14 @@ export class OutboxStore {
     this.save();
     return { ok: true, entry };
   }
-  setPaused(id, paused, note = "") {
+  // 暫停/恢復。reason 記「為什麼暫停」: "decrypt" = 鑰匙（解密）異常被護欄自動暫停,
+  // 這種暫停在鑰匙恢復正常後由執行端自動恢復; 其他（人工在畫面按的）一律 "manual",
+  // 絕不自動恢復。舊資料沒有 pauseReason 欄位, 視為 manual（不自動動它）。
+  setPaused(id, paused, note = "", reason = "") {
     const entry = this.entries.find((e) => e.id === id);
     if (!entry) return { ok: false, errors: ["找不到這筆待發"] };
     entry.status = paused ? "paused" : "pending";
+    entry.pauseReason = paused ? (reason || "manual") : "";
     entry.updatedAt = this.now();
     entry.history.push({ ts: this.now(), note: note || (paused ? "已暫停" : "已恢復") });
     this.save();

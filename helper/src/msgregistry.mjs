@@ -52,12 +52,18 @@ export class MessageSenderRegistry {
     this.maybeSave();
   }
 
-  // 回傳 senderId ("" = 查過但查無此訊息); undefined = 沒登記過或已過期
-  lookup(messageId) {
+  // 回傳 senderId ("" = 查過但查無此訊息); undefined = 沒登記過或已過期。
+  // 分群隔離 (2026-10-23 稽核修復, 老吳「分群組記憶」明令): 呼叫端有給 channelId 時,
+  // 登記時已記下聊天室的條目只有在「同一個聊天室」被查才算數 — 在 A 群登記的訊息,
+  // 拿去 B 群查要視同沒登記過, 引用續答不得跨群解析。登記時聊天室不明 ("") 的條目
+  // 無法證明屬於哪一群, 維持可查 (sent 影格本來就不帶聊天室, 但 bot 送出時已另記
+  // requestId->chatId, 見 bot.onFrame 的 sent 分支; 即時訊息影格也會以正確聊天室覆寫)。
+  lookup(messageId, channelId = "") {
     if (!messageId) return undefined;
     const hit = this.map.get(String(messageId));
     if (!hit) return undefined;
     if (this.now() - hit.ts > this.ttlMs) { this.map.delete(String(messageId)); return undefined; }
+    if (channelId && hit.channelId && hit.channelId !== channelId) return undefined;
     return hit.senderId;
   }
 

@@ -10,6 +10,7 @@ import { maskSecret } from "./secrets.mjs";
 import { applyCoreApiConfig, detectPackaged, readCoreApiStatus, removeCoreApiChat, runCliToken } from "./linecfg.mjs";
 import { syncJevCoreConfig } from "./jev.mjs";
 import { fetchCoreChannels, shapeChatList } from "./corechats.mjs";
+import { activityChatOptions, filterActivityEvents } from "./activityfilter.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(here, "..", "web");
@@ -107,7 +108,12 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         // 機器人聊天情況 (第 12 項): 狀態列摘要 + 最近動態 (記憶體環形緩衝, 新到舊)。
         // 唯讀、本機限定 (整個 server 只綁 127.0.0.1, 與既有端點同一認證面)。
         // events 的 question 只是前 30 字片段且從不落盤 (見 bot.recordActivity)。
-        return json(res, 200, { ok: true, status: bot ? bot.status() : null, events: bot ? bot.activitySnapshot() : [] });
+        // 群組篩選 (2026-10-23 老吳裁示): ?chat=<chatId> 只回該群的紀錄 (純顯示層,
+        // 不改動紀錄本身); chats 是選單用的不重複群組清單, total 是未篩選總筆數,
+        // 供畫面把「顯示筆數/全部筆數」分開標明。不帶 chat 時 events 與改版前相同。
+        const all = bot ? bot.activitySnapshot() : [];
+        const chat = url.searchParams.get("chat") ?? "";
+        return json(res, 200, { ok: true, status: bot ? bot.status() : null, events: filterActivityEvents(all, chat), chats: activityChatOptions(all), total: all.length });
       }
       // 待發清單/發送紀錄 (發送群組訊息): 只做本機存放與規則, 實際送出由 App 殼負責 (見根目錄施工紀錄的分工定案)
       if (req.method === "GET" && path === "/api/outbox") {
@@ -141,7 +147,7 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
       if (req.method === "POST" && path === "/api/outbox/pause") {
         if (!outbox) return json(res, 400, { ok: false, message: "待發清單尚未啟用" });
         const body = await readBody(req);
-        const r = outbox.setPaused(body?.id, body?.paused !== false, typeof body?.note === "string" ? body.note : "");
+        const r = outbox.setPaused(body?.id, body?.paused !== false, typeof body?.note === "string" ? body.note : "", typeof body?.reason === "string" ? body.reason : "");
         return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, entry: r.entry } : { ok: false, message: r.errors.join("；") });
       }
       if (req.method === "POST" && path === "/api/outbox/defer") {
@@ -164,6 +170,8 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
       }
       // 管理員通知: 事件紀錄查詢 + 殼端送出結果寫回 + 待送清單 (殼端輪詢領取)
       if (req.method === "GET" && path === "/api/admin-events") {
+        // 領取前先結算到期的合併彙總 (節流窗已過的被合併事件補送一則彙總, 見 adminnotify)
+        if (adminEvents?.collectDueSummaries) { try { adminEvents.collectDueSummaries(); } catch { /* 彙總失敗不擋查詢 */ } }
         return json(res, 200, { ok: true, events: adminEvents ? adminEvents.list() : [], pending: adminEvents ? adminEvents.pendingNotify() : [] });
       }
       if (req.method === "POST" && path === "/api/admin-events/sent") {

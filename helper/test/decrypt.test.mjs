@@ -206,6 +206,44 @@ test("decrypt: 有以事件送達的訊息不算漏接; 未達門檻與連線前
   assert.equal(s2.missedIssues[0].missed, 2);
 });
 
+test("decrypt(修復): 歷史有舊壞訊息但即時訊息正常 = 不擋事 (blocking=false); 即時也失敗才擋", async (t) => {
+  const core = await startFakeCore(t);
+  // 歷史窗裡留著舊世代解不開的訊息 (2026-10-21 事故群復原後的真實形貌)
+  core.state.history = [
+    msg(1), msg(2),
+    msg(3, { text: undefined, decryptFailed: true, senderId: "u-fox", senderName: "妖狐藏馬(假)" }),
+    msg(4),
+  ];
+  const { bot } = await startBot(t, core);
+
+  // 只有歷史證據、還沒有任何即時事件: 不冒充「現在壞掉」, 不擋事
+  let s = await bot.scanDecryptHealthOnce();
+  assert.equal(s.state, "failed"); // 歷史問題仍誠實呈現
+  assert.equal(s.issues[0].blocking, false);
+  assert.deepEqual(s.blockingChats, []);
+
+  // 即時來一則正常文字 (群是活的): 仍不擋, 且記下最後即時成功時間
+  core.state.sendEvent(msg(50, { text: "管理員在不在" }));
+  await waitUntil(() => (bot.decryptLiveByChat.get(CHAT)?.lastOkAt ?? 0) > 0, 4000, "live ok recorded");
+  s = await bot.scanDecryptHealthOnce();
+  assert.equal(s.issues[0].blocking, false);
+  assert.ok(s.issues[0].lastLiveOkAt);
+
+  // 即時來一則解不開的佔位訊息、之後沒有成功: 這才是「現在真的讀不到」, 要擋
+  core.state.sendEvent(msg(51, { text: undefined, decryptFailed: true, senderId: "u-fox", senderName: "妖狐藏馬(假)" }));
+  await waitUntil(() => (bot.decryptLiveByChat.get(CHAT)?.lastFailAt ?? 0) >= (bot.decryptLiveByChat.get(CHAT)?.lastOkAt ?? 0), 4000, "live fail recorded");
+  s = await bot.scanDecryptHealthOnce();
+  assert.equal(s.issues[0].blocking, true);
+  assert.deepEqual(s.blockingChats, [CHAT]);
+
+  // 即時再來一則正常文字: 自動解除擋事 (不用人工處理)
+  core.state.sendEvent(msg(52, { text: "復原了" }));
+  await waitUntil(() => (bot.decryptLiveByChat.get(CHAT)?.lastOkAt ?? 0) > (bot.decryptLiveByChat.get(CHAT)?.lastFailAt ?? 0), 4000, "live ok again");
+  s = await bot.scanDecryptHealthOnce();
+  assert.equal(s.issues[0].blocking, false);
+  assert.deepEqual(s.blockingChats, []);
+});
+
 test("decrypt: 看守計時器會自己掃描並可停止", async (t) => {
   const core = await startFakeCore(t);
   core.state.history = [msg(1, { text: undefined, decryptFailed: true })];

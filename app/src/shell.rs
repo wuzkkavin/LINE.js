@@ -31,6 +31,63 @@ pub fn logs_dir() -> PathBuf {
 static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 /// 殼 log: 寫進資料目錄 logs\shell.log (規格書 v3 第 9 節)。絕不寫入任何機密 (Key/Token/QR/PIN)。
+/// 紀錄頁讀取本機紀錄檔 (2026-10-22 事故修復): 直接讀資料目錄裡的紀錄檔,
+/// 不依賴服務在線 — 舊版走服務的 /api/logs, 引擎沒開/讀不到時就永遠「讀取中」然後空白,
+/// 使用者最需要看紀錄的時候 (引擎壞掉時) 反而看不到。改成本機直讀後, 引擎沒開也看得到;
+/// 讀不到檔案時回傳白話說明文字, 絕不回空字串讓畫面靜默空白。
+pub fn read_logs_tail(max_lines: usize) -> String {
+    read_logs_tail_in(&logs_dir(), max_lines)
+}
+
+fn read_logs_tail_in(dir: &std::path::Path, max_lines: usize) -> String {
+    if !dir.exists() {
+        return "目前還沒有任何紀錄。\n(紀錄資料夾尚未建立 — 程式剛裝好、還沒產生過紀錄時會是這樣。)".to_string();
+    }
+    // 服務紀錄檔名是 helper-<日期>.log: 取資料夾裡最新的一份 (不假設今天一定有)。
+    let mut helper_log: Option<PathBuf> = None;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let mut names: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| {
+                        let n = n.to_string_lossy();
+                        n.starts_with("helper-") && n.ends_with(".log")
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        names.sort();
+        helper_log = names.pop();
+    }
+    let mut sections: Vec<String> = Vec::new();
+    let mut push_tail = |title: &str, path: &std::path::Path| {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let lines: Vec<&str> = text.lines().collect();
+                let start = lines.len().saturating_sub(max_lines);
+                sections.push(format!("===== {title} (最後 {} 行) =====\n{}", lines.len() - start, lines[start..].join("\n")));
+            }
+            Err(e) => {
+                sections.push(format!("===== {title} =====\n(讀不到這個紀錄檔: {e}。可能是檔案還沒建立, 或被其他程式鎖住。)"));
+            }
+        }
+    };
+    push_tail("程式紀錄 shell.log", &dir.join("shell.log"));
+    if let Some(p) = &helper_log {
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        push_tail(&format!("服務紀錄 {name}"), p);
+    }
+    push_tail("引擎紀錄 launcher.log", &dir.join("launcher.log"));
+    let joined = sections.join("\n\n");
+    if joined.trim().is_empty() {
+        "紀錄檔目前是空的。".to_string()
+    } else {
+        joined
+    }
+}
+
 pub fn log_line(msg: &str) {
     let dir = logs_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -79,6 +136,13 @@ pub struct ShellSettings {
     /// 以 serde default 補 forest (森林綠, 出廠預設), 不影響既有偏好。
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 開啟程式時是否自動登入並啟用服務 (2026-10-22 老吳交代新增, 預設關閉)。
+    /// 關閉時: 程式開啟後引擎不啟動、停在未登入狀態, 由使用者按「登入並啟用」才開始。
+    /// 與「隨 Windows 開機自動啟動」(HKCU Run) 互相獨立: 自啟動只負責把程式叫起來
+    /// (縮系統匣待命), 要不要接著登入由這個欄位決定。舊設定檔沒有此欄位時
+    /// serde default = false (不自動登入), 符合老吳定的出廠預設。
+    #[serde(default)]
+    pub auto_login: bool,
 }
 
 fn default_true() -> bool {
@@ -91,7 +155,7 @@ fn default_theme() -> String {
 
 impl Default for ShellSettings {
     fn default() -> Self {
-        Self { show_window_on_start: true, tray_hint_shown: false, theme: default_theme() }
+        Self { show_window_on_start: true, tray_hint_shown: false, theme: default_theme(), auto_login: false }
     }
 }
 
@@ -249,6 +313,30 @@ fn make_zip_stored(files: &[(String, Vec<u8>)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logs_tail_reads_local_files_without_engine() {
+        // 紀錄頁本機直讀 (2026-10-22 事故修復): 引擎沒開也要讀得到檔案內容,
+        // 而且只取尾段; 資料夾不存在時回白話說明而不是空字串。
+        let dir = std::env::temp_dir().join(format!("aibao-logs-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 不存在的資料夾 → 白話說明, 不是空白
+        let missing = read_logs_tail_in(&dir, 10);
+        assert!(missing.contains("還沒有任何紀錄"), "應回白話說明: {missing}");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut shell_content = String::new();
+        for i in 0..50 {
+            shell_content.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(dir.join("shell.log"), &shell_content).unwrap();
+        std::fs::write(dir.join("helper-2026-10-22.log"), "helper ok\n").unwrap();
+        let text = read_logs_tail_in(&dir, 5);
+        assert!(text.contains("line 49") && text.contains("line 45"), "應含尾段: {text}");
+        assert!(!text.contains("line 44\n"), "尾段以外不應出現: {text}");
+        assert!(text.contains("helper ok"), "應合併服務紀錄: {text}");
+        assert!(text.contains("讀不到這個紀錄檔"), "缺 launcher.log 要明說原因: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn diagnostic_zip_structure_is_valid() {

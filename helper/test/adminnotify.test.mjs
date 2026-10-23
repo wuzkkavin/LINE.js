@@ -82,6 +82,72 @@ test("matchNotifyRules(第四階段): 只挑啟用且符合的規則, 關鍵字�
   assert.equal(matchNotifyRules(notify, "unanswered", {}).length, 0);
 });
 
+test("事件紀錄(修復): 被合併的事件在節流窗過後補送一則彙總, 不再石沉大海", () => {
+  const dir = mkdtempSync(join(tmpdir(), "admnev-"));
+  try {
+    let nowMs = Date.parse("2026-10-22T13:53:00+08:00");
+    const store = new AdminEventStore({ path: join(dir, "e.json"), now: () => nowMs });
+    const evt = { kind: "keyword", chatId: "c1", chatName: "公司群", detail: "有人提到「管理員」", message: "有人提到關鍵字：…" };
+    const first = store.record(evt);
+    assert.equal(first.action, "notify");
+    store.markSent(first.event.id, true);
+    nowMs += 1 * 60_000; // 13:54
+    assert.equal(store.record(evt).reason, "throttled");
+    nowMs += 1 * 60_000; // 13:55
+    const third = store.record(evt);
+    assert.equal(third.reason, "throttled");
+    assert.equal(third.event.mergedCount, 2);
+    // 還在靜默期內 (最後一筆合併未滿 10 分鐘): 不急著彙總
+    nowMs += 5 * 60_000;
+    assert.equal(store.collectDueSummaries().length, 0);
+    // 靜默滿 10 分鐘: 產生一則彙總, 進待送清單; 原事件合併數歸零並記已補送
+    nowMs += 6 * 60_000;
+    const made = store.collectDueSummaries();
+    assert.equal(made.length, 1);
+    assert.equal(made[0].isSummary, true);
+    assert.equal(made[0].summaryOf, first.event.id);
+    assert.match(made[0].message, /另外還有 2 則/);
+    assert.equal(store.pendingNotify().some((e) => e.id === made[0].id), true);
+    const orig = store.list().find((e) => e.id === first.event.id);
+    assert.equal(orig.mergedCount, 0);
+    assert.equal(orig.mergedTotal, 2);
+    assert.ok(orig.summarySentAt);
+    // 不重複產生
+    assert.equal(store.collectDueSummaries().length, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("事件紀錄(修復): 第一筆送失敗不當節流錨點, 窗內下一筆仍可通知", () => {
+  const dir = mkdtempSync(join(tmpdir(), "admnev-"));
+  try {
+    let nowMs = Date.parse("2026-10-22T13:53:00+08:00");
+    const store = new AdminEventStore({ path: join(dir, "e.json"), now: () => nowMs });
+    const evt = { kind: "keyword", chatId: "c1", detail: "有人提到「管理員」" };
+    const first = store.record(evt);
+    assert.equal(first.action, "notify");
+    store.markSent(first.event.id, false, "通知送不出去");
+    nowMs += 1 * 60_000;
+    // 舊版會被 throttled 合併進送失敗的那一筆; 修復後重新通知
+    assert.equal(store.record(evt).action, "notify");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("事件紀錄(修復): 送失敗的通知不吃每日額度", () => {
+  const dir = mkdtempSync(join(tmpdir(), "admnev-"));
+  try {
+    let nowMs = Date.parse("2026-10-22T00:00:00+08:00");
+    const store = new AdminEventStore({ path: join(dir, "e.json"), now: () => nowMs, throttleMs: 0 });
+    for (let i = 0; i < NOTIFY_DAILY_CAP; i++) {
+      const r = store.record({ kind: "unanswered", chatId: "c" + i });
+      assert.equal(r.action, "notify");
+      store.markSent(r.event.id, false, "送不出去");
+      nowMs += 1000;
+    }
+    // 20 筆全送失敗: 額度不應被吃光, 第 21 筆仍可通知
+    assert.equal(store.record({ kind: "unanswered", chatId: "cx" }).action, "notify");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("事件紀錄(第四階段): markSent 寫回送出結果, pendingNotify 只列還沒送的", () => {
   const dir = mkdtempSync(join(tmpdir(), "admnev-"));
   try {
