@@ -365,19 +365,48 @@ jobs:
           # (helper 只在有人存設定時才寫 settings.json, 全新啟動不會有檔案, 不能等檔案;
           # 用 GET->改->PUT 的控制台同款流程種入, 後續逐頁啟動都會讀到)。
           $seedAction = {
-            $cur = Invoke-RestMethod -Uri 'http://127.0.0.1:3790/api/settings' -TimeoutSec 15
-            $s = $cur.settings
-            if (-not $s.ai) { $s | Add-Member -NotePropertyName ai -NotePropertyValue ([pscustomobject]@{}) }
-            if (-not $s.ai.chatProfiles) { $s.ai | Add-Member -NotePropertyName chatProfiles -NotePropertyValue ([pscustomobject]@{}) }
-            $profile = [pscustomobject]@{
-              rolePrompt = '(截圖驗證用) 本群專屬角色'; scopePrompt = '(截圖驗證用) 只回答電腦與軟體問題'
-              kbEnabled = $true; kbFolder = ''; chatty = $true; personaCustom = $true; suspended = $false
-              admins = @([pscustomobject]@{ id = 'u22222222222222222222222222222222'; name = '截圖驗證管理員' })
-            }
-            $s.ai.chatProfiles | Add-Member -NotePropertyName 'c11111111111111111111111111111111' -NotePropertyValue $profile -Force
-            $body = $s | ConvertTo-Json -Depth 20
-            $res = Invoke-RestMethod -Uri 'http://127.0.0.1:3790/api/settings' -Method Put -ContentType 'application/json' -Body $body -TimeoutSec 15
-            if (-not $res.ok) { throw '逐頁截圖前置失敗: 種入假 chatProfiles 的 PUT 未回 ok' }
+            $seedJs = Join-Path $pagesHome 'seed-settings.cjs'
+          @'
+          const http = require("http");
+          function req(method, path, body) {
+            return new Promise((resolve, reject) => {
+              const data = body ? JSON.stringify(body) : null;
+              const r = http.request(
+                { host: "127.0.0.1", port: 3790, path, method, headers: data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {} },
+                (res) => {
+                  let buf = "";
+                  res.on("data", (c) => (buf += c));
+                  res.on("end", () => {
+                    try { resolve(JSON.parse(buf)); } catch { resolve({}); }
+                  });
+                }
+              );
+              r.on("error", reject);
+              if (data) r.write(data);
+              r.end();
+            });
+          }
+          (async () => {
+            const s = await req("GET", "/api/settings");
+            if (!s || typeof s !== "object" || !("botName" in s)) { console.error("seed: GET /api/settings shape unexpected"); process.exit(1); }
+            s.ai = s.ai || {};
+            s.ai.chatProfiles = s.ai.chatProfiles || {};
+            s.ai.chatProfiles["c11111111111111111111111111111111"] = {
+              rolePrompt: "（截圖驗證用）本群專屬角色",
+              scopePrompt: "（截圖驗證用）只回答電腦與軟體問題",
+              kbEnabled: true, kbFolder: "", chatty: true, personaCustom: true, suspended: false,
+              admins: [{ id: "u22222222222222222222222222222222", name: "截圖驗證管理員" }],
+            };
+            const res = await req("PUT", "/api/settings", s);
+            if (!res || res.ok !== true) { console.error("seed: PUT /api/settings did not return ok"); process.exit(1); }
+            const back = await req("GET", "/api/settings");
+            const got = back && back.ai && back.ai.chatProfiles && back.ai.chatProfiles["c11111111111111111111111111111111"];
+            if (!got || !Array.isArray(got.admins) || got.admins.length !== 1) { console.error("seed: read-back verification failed"); process.exit(1); }
+            console.log("seeded chatProfiles via API (read-back ok)");
+          })().catch((e) => { console.error(e); process.exit(1); });
+          '@ | Set-Content $seedJs -Encoding utf8
+            node $seedJs
+            if ($LASTEXITCODE -ne 0) { throw '逐頁截圖前置失敗: 種入假 chatProfiles 失敗' }
             Write-Host '已透過 API 種入假 chatProfiles (聊天室管理頁截圖用)'
           }
           Shot-App 'overview' @{} $seedAction
