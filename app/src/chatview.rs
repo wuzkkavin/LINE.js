@@ -33,6 +33,32 @@ pub struct ChatViewHost {
 }
 
 impl ChatViewHost {
+    /// WebView 是否已建立 (給聊天室畫面頁的進頁狀態紀錄用)。
+    pub fn is_created(&self) -> bool {
+        #[cfg(all(windows, target_env = "msvc"))]
+        {
+            self.inner.is_some()
+        }
+        #[cfg(not(all(windows, target_env = "msvc")))]
+        {
+            false
+        }
+    }
+
+    /// 重新載入聊天畫面: 銷毀目前的 WebView 與其瀏覽器內容 (含 profile 連線),
+    /// 清掉錯誤與上次嘗試時間, 下一次 sync 會重新建立並重新載入核心聊天頁。
+    /// 給畫面全白等異常時自救用, 不必結束程式。
+    #[cfg(all(windows, target_env = "msvc"))]
+    pub fn reset(&mut self) {
+        self.inner = None;
+        self.error = None;
+        self.last_attempt = None;
+        crate::shell::log_line("嵌入聊天畫面: 已銷毀 WebView, 下一幀會重新建立 (使用者按了重新載入)");
+    }
+
+    #[cfg(not(all(windows, target_env = "msvc")))]
+    pub fn reset(&mut self) {}
+
     pub fn new() -> Self {
         Self {
             #[cfg(all(windows, target_env = "msvc"))]

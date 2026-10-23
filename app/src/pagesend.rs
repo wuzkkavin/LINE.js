@@ -225,7 +225,7 @@ impl PageChannel {
                         return Ok(());
                     }
                     if s == "idle" || s == "error" {
-                        return Err("尚未登入 LINE, 請先到「LINE 登入」頁登入後再發送".into());
+                        return Err("尚未登入 LINE, 請先到「總覽」頁登入後再發送".into());
                     }
                 }
                 "auth:ready" => return Ok(()),

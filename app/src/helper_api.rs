@@ -240,6 +240,19 @@ pub fn get_admin_candidates() -> Result<serde_json::Value, String> {
     with_retry("/api/admin-candidates", || once_get("/api/admin-candidates", 30))
 }
 
+/// 單一聊天室的管理員候選名單 (聊天室管理頁用): 只回該室的近期發言者與社群管理員,
+/// 回應形狀與 get_admin_candidates 相同 (candidates 陣列, 每筆含 id/name/chats/source)。
+pub fn admin_candidates_chat(chat_id: &str, all: bool) -> Result<serde_json::Value, String> {
+    // all=false (預設): 只回近期在這個聊天室發言過的人 + 社群管理員 (人多時先看這份短名單);
+    // all=true: 按下「找沒發言過的人」才抓的較寬名單 (曾在這個聊天室出現過的人 + 社群管理員)。
+    let path = if all {
+        format!("/api/admin-candidates?chat={chat_id}&all=1")
+    } else {
+        format!("/api/admin-candidates?chat={chat_id}")
+    };
+    with_retry(&path.clone(), move || once_get(&path, 30))
+}
+
 /// 教材庫清單
 pub fn get_materials() -> Result<serde_json::Value, String> {
     get_json("/api/materials")
