@@ -1470,7 +1470,7 @@ export class HelperBot {
     const chatCfg = resolveChatSettings(s, m.channelId);
     // 引用續答: 引用的是機器人自己的訊息時, 視同被名字觸發 (認定方式見 isQuotedSelf)
     const quotedSelf = m.replyTo ? await this.isQuotedSelf(m) : false;
-    const verdict = evaluateTrigger({ text: m.text, senderId: m.senderId, selfId: this.selfId, settings: s, state: this.triggerState, quotedSelf });
+    const verdict = evaluateTrigger({ text: m.text, senderId: m.senderId, selfId: this.selfId, settings: s, state: this.triggerState, quotedSelf, chatId: m.channelId });
     // 引用診斷欄位 (第 1 項續查): replyTo 有無與引用認定結果一律入 log —
     // 2026-10-20 實機引用無回應時, 舊 log 連「這則訊息到底有沒有帶 replyTo」都查不到,
     // 斷點只能定界不能定案; 之後任何引用問題都能直接從 log 判讀核心送達形狀。
@@ -1478,6 +1478,8 @@ export class HelperBot {
     if (!verdict.triggered) {
       // 活動面板 (第 12 項): 被冷卻/每日上限擋下的也要留一筆, 管理員才看得出「有在擋」
       if (verdict.reason === "cooldown") this.recordActivity({ kind: "cooldown", m });
+      if (verdict.reason === "window_user") this.recordActivity({ kind: "window_user", m });
+      if (verdict.reason === "window_all") this.recordActivity({ kind: "window_all", m });
       if (verdict.reason === "daily_limit") this.recordActivity({ kind: "daily_limit", m });
       let noticeSent = false;
       if (verdict.limitReached) {
@@ -1501,7 +1503,7 @@ export class HelperBot {
       this.recordActivity({ kind: "name_only", m });
       return true;
     }
-    markTriggered(this.triggerState, m.senderId);
+    markTriggered(this.triggerState, m.senderId, new Date(), m.channelId);
     this.stats.triggered++;
     const question = verdict.question;
     // 機敏意圖 (修復版6): 創作者/版權/技術實作等機敏問題改回委婉拒答, 不呼叫 AI、不附來源、

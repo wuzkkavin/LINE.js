@@ -340,6 +340,8 @@ struct SettingsForm {
     trigger_mode: String,
     cooldown_sec: u32,
     daily_limit: u32,
+    per_user_chat_minute: u32,
+    all_chats_minute: u32,
     ai_active: String,
     ai_role: String,
     ai_scope: String,
@@ -2255,6 +2257,15 @@ fn tray_state_of(engine: &EngineSnap, login: &LoginUi) -> (String, String, bool)
     }
 }
 
+// 60 秒視窗上限 (修復版7): 從設定 JSON 讀出兩個數字; 舊存檔沒有這兩個欄位時用出廠預設 (3 / 10)。
+// 0 是合法值 (表示不限制), 不可用「讀不到或 0 就回預設」的寫法蓋掉使用者的設定。
+fn rate_limits_from_settings(v: &Value) -> (u32, u32) {
+    (
+        v.get("perUserChatMinuteLimit").and_then(|x| x.as_u64()).unwrap_or(3) as u32,
+        v.get("allChatsMinuteLimit").and_then(|x| x.as_u64()).unwrap_or(10) as u32,
+    )
+}
+
 // ---------- 設定表單: 載入 / 儲存 ----------
 
 impl App {
@@ -2269,6 +2280,9 @@ impl App {
         f.trigger_mode = v.get("triggerMode").and_then(|x| x.as_str()).unwrap_or("standard").to_string();
         f.cooldown_sec = v.get("cooldownSec").and_then(|x| x.as_u64()).unwrap_or(20) as u32;
         f.daily_limit = v.get("dailyLimit").and_then(|x| x.as_u64()).unwrap_or(100) as u32;
+        let (puc, acm) = rate_limits_from_settings(v);
+        f.per_user_chat_minute = puc;
+        f.all_chats_minute = acm;
         f.ai_active = v.get("ai").and_then(|a| a.get("active")).and_then(|x| x.as_str()).unwrap_or("openai").to_string();
         f.ai_role = v
             .get("ai")
@@ -2417,6 +2431,8 @@ impl App {
             "triggerMode": f.trigger_mode,
             "cooldownSec": f.cooldown_sec,
             "dailyLimit": f.daily_limit,
+            "perUserChatMinuteLimit": f.per_user_chat_minute,
+            "allChatsMinuteLimit": f.all_chats_minute,
             "ai": { "active": f.ai_active, "providers": providers, "rolePrompt": f.ai_role, "scopePrompt": f.ai_scope },
             "scam": {
                 "enabled": f.scam_enabled,
@@ -3378,6 +3394,8 @@ impl App {
                             "clarify" => ("反問確認", self.palette.warn),
                             "name_only" => ("引導說明", self.palette.idle),
                             "cooldown" => ("冷卻略過", self.palette.warn),
+                            "window_user" => ("問太密擋下", self.palette.warn),
+                            "window_all" => ("全部群問太密擋下", self.palette.warn),
                             "daily_limit" => ("每日上限擋下", self.palette.warn),
                             "scam_warned" => ("防詐騙警告", self.palette.bad),
                             "ai_busy" => ("AI 忙線", self.palette.warn),
@@ -4137,6 +4155,15 @@ impl App {
                 ui.label("每日回答上限:");
                 ui.add(egui::DragValue::new(&mut self.form.daily_limit).range(0..=10000));
             });
+            ui.horizontal(|ui| {
+                ui.label("每人每群／60 秒上限:");
+                ui.add(egui::DragValue::new(&mut self.form.per_user_chat_minute).range(0..=1000));
+                ui.label("所有群合計／60 秒上限:");
+                ui.add(egui::DragValue::new(&mut self.form.all_chats_minute).range(0..=1000));
+            });
+            ui.label(egui::RichText::new("每人每群／60 秒: 同一個人在同一個聊天室，任意連續 60 秒內最多問 AI 幾次。").weak());
+            ui.label(egui::RichText::new("所有群合計／60 秒: 所有允許的聊天室加起來，任意連續 60 秒內最多問幾次；用滿後，其他群的人也要等有空額才能問。").weak());
+            ui.label(egui::RichText::new("兩個數字填 0 表示不限制。只算真正送出的提問: 只叫名字打招呼不算，AI 當次回答失敗也算一次；次數在程式重啟後會清零。").weak());
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
                 if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存設定" }).clicked() {
@@ -5499,7 +5526,7 @@ impl App {
 mod tests {
     use super::{
         chat_profile_uses_custom, chat_profiles_new_orig, chat_profiles_patch, decode_image_rgba, icon_rgba,
-        parse_start_page, ChatProfileForm, EngineOpGate, Page, NAV_PAGES,
+        parse_start_page, rate_limits_from_settings, ChatProfileForm, EngineOpGate, Page, NAV_PAGES,
     };
     use std::collections::HashMap;
     use std::io::Cursor;
@@ -5696,6 +5723,18 @@ mod tests {
         };
         assert!(!chat_profile_uses_custom(Some(&admins_only)), "只設管理員不影響人設來源");
         assert!(chat_profile_uses_custom(Some(&profile("角色"))));
+    }
+
+    #[test]
+    fn rate_limits_settings_round_trip() {
+        // 修復版7: 兩個 60 秒視窗上限的讀寫來回 — 寫進設定 JSON 的鍵名與讀回來的解析必須對得上;
+        // 舊存檔沒有欄位時回出廠預設 (3 / 10); 使用者填的 0 (不限制) 要原樣保留, 不可被預設蓋掉。
+        let body = serde_json::json!({ "perUserChatMinuteLimit": 5, "allChatsMinuteLimit": 30 });
+        assert_eq!(rate_limits_from_settings(&body), (5, 30));
+        let legacy = serde_json::json!({ "cooldownSec": 20, "dailyLimit": 100 });
+        assert_eq!(rate_limits_from_settings(&legacy), (3, 10), "舊存檔缺欄位要用出廠預設");
+        let zero = serde_json::json!({ "perUserChatMinuteLimit": 0, "allChatsMinuteLimit": 0 });
+        assert_eq!(rate_limits_from_settings(&zero), (0, 0), "0 是不限制, 不能被當成缺欄位");
     }
 
     #[test]

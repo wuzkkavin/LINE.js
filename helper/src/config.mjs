@@ -53,6 +53,13 @@ export function defaultSettings() {
     triggerMode: "standard",
     cooldownSec: 20,
     dailyLimit: 100,
+    // 60 秒視窗上限 (修復版7, 老吳 2026-10-24 核准補齊 Codex 版有而 AI寶 缺的兩個可調限制):
+    // perUserChatMinuteLimit = 同一個人在同一個聊天室、任意連續 60 秒內最多送出的提問數;
+    // allChatsMinuteLimit = 所有白名單聊天室加總、同樣 60 秒內的提問數。用滿後該提問先擋下不送 AI。
+    // 只計真正送出的提問 (只叫名字的引導不計; AI 當次失敗照計, 計次點見 trigger.mjs 的 markTriggered)。
+    // 0 = 不限制。視窗計數只存記憶體, 服務重啟後清零 (每日上限的本機保存不受影響)。
+    perUserChatMinuteLimit: 3,
+    allChatsMinuteLimit: 10,
     // 開啟程式時自動登入並啟用服務 (2026-10-22 老吳交代, 預設關閉, 與兩版同步):
     // Ubuntu 版由 main.mjs 的啟動閘門與控制台「登入並啟用」按鈕使用 (服務照常啟動,
     // 機器人先不連線, 等使用者按了才連); Windows 版的同名行為由 App 殼的

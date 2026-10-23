@@ -231,7 +231,18 @@ a.btn { text-decoration: none; }
         <label for="dailyLimit">每日回答上限 (則)</label>
         <input type="number" id="dailyLimit" min="1" max="10000">
       </div>
+      <div>
+        <label for="perUserChatMinuteLimit">每人每群／60 秒上限 (次)</label>
+        <input type="number" id="perUserChatMinuteLimit" min="0" max="1000">
+        <div class="hint">同一個人在同一個聊天室，任意連續 60 秒內最多問 AI 幾次。填 0 表示不限制。</div>
+      </div>
+      <div>
+        <label for="allChatsMinuteLimit">所有群合計／60 秒上限 (次)</label>
+        <input type="number" id="allChatsMinuteLimit" min="0" max="1000">
+        <div class="hint">所有允許的聊天室加起來，任意連續 60 秒內最多問幾次；用滿後，其他群的人也要等有空額才能問。填 0 表示不限制。</div>
+      </div>
     </div>
+    <div class="hint">上面兩個 60 秒上限只算真正送出的提問：只叫名字打招呼不算，AI 當次回答失敗也算一次。次數在服務重啟後會清零。</div>
     <label for="lineApiUrl">LINE 核心連線位置 (進階, 通常不用改)</label>
     <input type="text" id="lineApiUrl">
     <h3>關於 AI寶 自己的事</h3>
@@ -462,6 +473,8 @@ async function loadAll() {
   $("triggerMode").value = s.triggerMode;
   $("cooldownSec").value = s.cooldownSec;
   $("dailyLimit").value = s.dailyLimit;
+  $("perUserChatMinuteLimit").value = s.perUserChatMinuteLimit ?? 3;
+  $("allChatsMinuteLimit").value = s.allChatsMinuteLimit ?? 10;
   $("lineApiUrl").value = s.lineApiUrl;
   notifyAdminsState = normalizeAdmins(s.notify && s.notify.admins ? s.notify.admins : []);
   notifyRulesState = deepCloneObj(s.notify && Array.isArray(s.notify.rules) ? s.notify.rules : []);
@@ -953,7 +966,7 @@ async function saveCurrentChatProfile() {
   } catch { msg.textContent = "儲存失敗：連不上控制台服務，請重新整理頁面再試"; msg.style.color = "var(--err)"; }
   btn.disabled = false;
 }
-const ACTIVITY_KIND_LABEL = { answered: "已回答", chatty: "接話", chatty_pass: "選擇不接話", declined: "婉拒（範圍外）", clarify: "反問確認", name_only: "引導說明", cooldown: "冷卻略過", daily_limit: "每日上限擋下", scam_warned: "防詐騙警告", ai_busy: "AI 忙線", ai_failed: "AI 連不上" };
+const ACTIVITY_KIND_LABEL = { answered: "已回答", chatty: "接話", chatty_pass: "選擇不接話", declined: "婉拒（範圍外）", clarify: "反問確認", name_only: "引導說明", cooldown: "冷卻略過", window_user: "問太密擋下", window_all: "全部群問太密擋下", daily_limit: "每日上限擋下", scam_warned: "防詐騙警告", ai_busy: "AI 忙線", ai_failed: "AI 連不上" };
 async function loadActivity() {
   const listBox = $("activityList");
   const sel = $("activityChatFilter");
@@ -1181,6 +1194,8 @@ function collect() {
     triggerMode: $("triggerMode").value,
     cooldownSec: Number($("cooldownSec").value) || 20,
     dailyLimit: Number($("dailyLimit").value) || 100,
+    perUserChatMinuteLimit: $("perUserChatMinuteLimit").value.trim() === "" ? 3 : Math.max(0, Math.floor(Number($("perUserChatMinuteLimit").value) || 0)),
+    allChatsMinuteLimit: $("allChatsMinuteLimit").value.trim() === "" ? 10 : Math.max(0, Math.floor(Number($("allChatsMinuteLimit").value) || 0)),
     lineApiUrl: $("lineApiUrl").value.trim(),
     showSources: $("showSources").checked,
     notify: { admins: normalizeAdmins(notifyAdminsState), rules: deepCloneObj(notifyRulesState) },
