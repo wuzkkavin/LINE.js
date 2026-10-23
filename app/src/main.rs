@@ -431,6 +431,8 @@ struct App {
     manage_candidates_for: String,
     // 聊天室管理頁選管理員: 搜尋關鍵字 (本機即時過濾) 與是否已切到較寬名單 (all=1)。
     manage_admin_search: String,
+    // 聊天室管理頁聊天室清單的搜尋關鍵字 (群很多時打群名篩選, 企業多群場景)。
+    manage_chat_search: String,
     manage_candidates_all: bool,
     // 機器人與觸發頁備援管理員選人: 搜尋關鍵字 (本機即時過濾)。
     backup_admin_search: String,
@@ -978,6 +980,7 @@ impl App {
             manage_candidates_slot: Arc::new(Mutex::new(None)),
             manage_candidates_for: String::new(),
             manage_admin_search: String::new(),
+            manage_chat_search: String::new(),
             manage_candidates_all: false,
             backup_admin_search: String::new(),
             chat_log_last_page: None,
@@ -3772,6 +3775,37 @@ impl App {
         self.spawn_chat_profiles_put(ctx, body, new_orig, Vec::new());
     }
 
+    /// 聊天室清單每列的設定狀態摘要 (企業多群場景): 一眼看到這個群用哪套設定、聒噪、
+    /// 管理員與知識庫狀態, 不用逐群點開。優先看編輯中的表單 (目前選定群的未儲存修改也算),
+    /// 其次看已儲存原貌, 都沒有就是全域預設狀態。
+    fn chat_profile_summary(&self, chat_id: &str) -> String {
+        let f = self
+            .form
+            .chat_profiles
+            .get(chat_id)
+            .or_else(|| self.form.chat_profiles_orig.get(chat_id));
+        match f {
+            Some(f) => {
+                let source = if f.suspended {
+                    "已停用待確認"
+                } else if f.custom {
+                    "本聊天室自訂"
+                } else {
+                    "全域預設"
+                };
+                let chatty = if f.chatty { "聒噪開" } else { "聒噪關" };
+                let admins = if f.admins.is_empty() {
+                    "未設管理員".to_string()
+                } else {
+                    format!("管理員 {} 位", f.admins.len())
+                };
+                let kb = if f.kb_enabled { "知識庫開" } else { "知識庫關" };
+                format!("{source}・{chatty}・{admins}・{kb}")
+            }
+            None => "全域預設・聒噪關・未設管理員・知識庫開".to_string(),
+        }
+    }
+
     /// 聊天室管理頁 (修復版6 新頁): 先選一個聊天室, 在同一頁改完這個聊天室的全部設定再儲存。
     /// 分群設定全 App 只在這一頁可以改; 全域預設在「AI 設定」頁, 這裡不重複提供。
     fn page_manage(&mut self, ui: &mut egui::Ui) {
@@ -3794,28 +3828,53 @@ impl App {
         if self.manage_chat_id.is_empty() || !options.iter().any(|(id, _)| *id == self.manage_chat_id) {
             self.manage_chat_id = options[0].0.clone();
         }
-        // 頁首: 聊天室選擇 (只用名稱選)
+        // 頁首: 聊天室清單 (企業多群場景, 老吳 2026-10-24 定案): 群很多時先用搜尋找,
+        // 每列附設定狀態摘要 (來源/聒噪/管理員/知識庫), 不用逐群點開才知道狀態;
+        // 按「選取」在下方編輯該群 (動線: 先選聊天室→改設定→同頁儲存)。一律用名稱, 不顯示編號。
+        ui.label(egui::RichText::new("選擇聊天室").strong());
         ui.horizontal(|ui| {
-            ui.label("選擇聊天室:");
-            let selected_label = options
-                .iter()
-                .find(|(id, _)| *id == self.manage_chat_id)
-                .map(|(_, label)| label.clone())
-                .unwrap_or_default();
-            egui::ComboBox::from_id_salt("manage-chat-select")
-                .selected_text(selected_label)
-                .width(320.0)
-                .show_ui(ui, |ui| {
-                    for (id, label) in &options {
-                        if ui.selectable_label(*id == self.manage_chat_id, label.clone()).clicked() {
-                            self.manage_chat_id = id.clone();
-                            self.manage_admin_search.clear();
-                            self.manage_candidates_all = false;
-                            self.manage_candidates.clear();
-                        }
-                    }
-                });
+            ui.label("搜尋:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.manage_chat_search)
+                    .desired_width(260.0)
+                    .hint_text("打群名關鍵字篩選…"),
+            );
+            if !self.manage_chat_search.is_empty() && ui.button("清除").clicked() {
+                self.manage_chat_search.clear();
+            }
         });
+        let q = self.manage_chat_search.trim().to_string();
+        let rows: Vec<(String, String, String)> = options
+            .iter()
+            .filter(|(_, label)| q.is_empty() || label.contains(&q))
+            .map(|(id, label)| (id.clone(), label.clone(), self.chat_profile_summary(id)))
+            .collect();
+        if rows.is_empty() {
+            ui.label(egui::RichText::new("沒有名字符合的聊天室。").weak());
+        }
+        let current = self.manage_chat_id.clone();
+        let mut picked: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("manage-chat-list")
+            .max_height(200.0)
+            .show(ui, |ui| {
+                for (id, label, sub) in &rows {
+                    let selected = *id == current;
+                    chat_list_row(ui, label, sub, |ui| {
+                        if selected {
+                            let _ = chat_action_btn(ui, "編輯中", false);
+                        } else if chat_action_btn(ui, "選取", true).clicked() {
+                            picked = Some(id.clone());
+                        }
+                    });
+                }
+            });
+        if let Some(id) = picked {
+            self.manage_chat_id = id;
+            self.manage_admin_search.clear();
+            self.manage_candidates_all = false;
+            self.manage_candidates.clear();
+        }
         ui.add_space(8.0);
         let chat_id = self.manage_chat_id.clone();
         // 換聊天室就讀該室的管理員候選名單 (只讀該室, 不混其他聊天室的人)

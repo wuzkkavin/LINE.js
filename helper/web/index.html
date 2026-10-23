@@ -81,6 +81,11 @@ pre.log { background: #0d2b21; color: #c9e8d5; border-radius: 12px; padding: 12p
 .activityrow { padding: 8px 2px; border-bottom: 1px solid var(--line); font-size: 14.5px; line-height: 1.6; }
 .activityrow .atime { color: var(--muted); margin-right: 8px; }
 .activityrow .aanswer { color: var(--muted); font-size: 13.5px; margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+.cmchatrow { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; margin-top: 8px; cursor: pointer; background: var(--card); }
+.cmchatrow:hover { border-color: var(--green); }
+.cmchatrow.sel { border-color: var(--green); background: var(--bg); }
+.cmchatrow .cname { font-weight: 600; font-size: 14.5px; }
+.cmchatrow .csub { font-size: 12.5px; color: var(--muted); margin-top: 1px; }
 .admincand { display: flex; gap: 8px; align-items: center; margin-top: 8px; font-size: 14.5px; color: var(--ink); }
 .admincand input { width: 18px; height: 18px; accent-color: var(--green); flex: none; }
 .admincand .csub { font-size: 12.5px; color: var(--muted); }
@@ -158,8 +163,10 @@ a.btn { text-decoration: none; }
   <section class="card">
     <h2>聊天室管理</h2>
     <div class="hint">每個聊天室自己的設定都集中在這裡改：先選一個聊天室，再改它的角色定位、回答範圍、知識庫、聒噪模式跟管理員。全控制台只有這裡可以改各聊天室的設定。</div>
-    <label for="cmChatSelect">選擇聊天室</label>
-    <select id="cmChatSelect"></select>
+    <label for="cmChatSearch">選擇聊天室（群很多時先搜尋，每列有設定狀態摘要）</label>
+    <input type="text" id="cmChatSearch" placeholder="打群名關鍵字篩選…" autocomplete="off">
+    <div id="cmChatList"></div>
+    <select id="cmChatSelect" style="display:none"></select>
     <div class="hint" id="cmEmpty">目前還沒有可以管理的聊天室：先完成上面步驟二，把群組加入白名單，這裡就會出現。</div>
     <div id="cmEditor" style="display:none">
       <div style="margin-top:12px"><span class="pill" id="cmSourcePill">目前用全域預設</span></div>
@@ -380,6 +387,7 @@ let notifyAdminsState = [];
 let notifyRulesState = [];
 let activityFilterChatId = "";
 let cmCurrentChatId = "";
+let cmChatFilter = "";
 let cmEditorSuspended = false;
 let cmMarkedDelete = false;
 let cmAdminsSelected = [];
@@ -613,6 +621,47 @@ function chatManageEntries() {
   }
   return [...entries.values()];
 }
+// 聊天室清單每列的設定狀態摘要 (企業多群場景): 一眼看到這個群用哪套設定、聒噪、
+// 管理員與知識庫狀態, 不用逐群點開。資料看 chatProfilesState (編輯中的工作副本)。
+function cmProfileSummary(id) {
+  const p = (typeof chatProfilesState !== "undefined" && chatProfilesState[id]) || null;
+  if (!p) return "全域預設・聒噪關・未設管理員・知識庫開";
+  const source = p.suspended ? "已停用待確認" : (p.personaCustom ? "本聊天室自訂" : "全域預設");
+  const chatty = p.chatty ? "聒噪開" : "聒噪關";
+  const admins = Array.isArray(p.admins) && p.admins.length ? "管理員 " + p.admins.length + " 位" : "未設管理員";
+  const kb = p.kbEnabled === false ? "知識庫關" : "知識庫開";
+  return source + "・" + chatty + "・" + admins + "・" + kb;
+}
+function renderCmChatList(entries) {
+  const box = $("cmChatList");
+  if (!box) return;
+  box.innerHTML = "";
+  const q = cmChatFilter.trim();
+  const shown = q ? entries.filter((e) => e.label.includes(q)) : entries;
+  if (!shown.length) {
+    const d = document.createElement("div");
+    d.className = "hint";
+    d.textContent = "沒有名字符合的聊天室。";
+    box.appendChild(d);
+    return;
+  }
+  for (const e of shown) {
+    const row = document.createElement("div");
+    row.className = "cmchatrow" + (e.id === cmCurrentChatId ? " sel" : "");
+    const nm = document.createElement("div");
+    nm.className = "cname";
+    nm.textContent = e.inWhitelist ? e.label : e.label + "（已不在白名單）";
+    const sub = document.createElement("div");
+    sub.className = "csub";
+    sub.textContent = cmProfileSummary(e.id);
+    row.append(nm, sub);
+    row.addEventListener("click", () => {
+      cmCurrentChatId = e.id;
+      renderChatManage();
+    });
+    box.appendChild(row);
+  }
+}
 function renderChatManage() {
   const sel = $("cmChatSelect");
   const editor = $("cmEditor");
@@ -624,6 +673,7 @@ function renderChatManage() {
     cmCurrentChatId = "";
     editor.style.display = "none";
     empty.style.display = "";
+    renderCmChatList([]);
     renderOrphanProfiles();
     return;
   }
@@ -637,6 +687,7 @@ function renderChatManage() {
     sel.appendChild(o);
   }
   sel.value = cmCurrentChatId;
+  renderCmChatList(entries);
   renderCmEditor();
   renderOrphanProfiles();
 }
@@ -1239,6 +1290,7 @@ $("btnRefreshTop").onclick = () => loadAll();
 $("activityChatFilter").addEventListener("change", () => { activityFilterChatId = $("activityChatFilter").value || ""; loadActivity(); });
 $("btnActivityRefresh").onclick = () => loadActivity();
 $("cmChatSelect").addEventListener("change", () => { cmCurrentChatId = $("cmChatSelect").value || ""; renderCmEditor(); renderOrphanProfiles(); });
+$("cmChatSearch").addEventListener("input", () => { cmChatFilter = $("cmChatSearch").value || ""; renderCmChatList(chatManageEntries()); });
 $("cmModeDefault").addEventListener("change", syncCmMode);
 $("cmModeCustom").addEventListener("change", syncCmMode);
 $("cmRestoreBtn").addEventListener("click", () => {
