@@ -38,19 +38,79 @@ async function activeProvider(base, client = {}) {
   const received = [];
   const errors = [];
   const reactions = [];
+  const joined = [];
   const storage = { async flush() {}, async get() {}, async set() {} };
   const provider = new EvexLineProvider(storage, "DESKTOPWIN", {
     onMessage: (message, kind) => received.push({ message, kind }),
     onRead() {}, onStatus() {}, onError: (code) => errors.push(code),
     onReactions: (...args) => reactions.push(args),
+    onMemberJoined: (...args) => joined.push(args),
   });
   // Listening would start real polling; the tests emit events themselves.
   provider.listen = () => {};
   provider.base = base;
   await provider.activate(base);
   Object.assign(provider.client, client);
-  return { provider, received, errors, reactions, emit: (...args) => provider.client.emit(...args) };
+  return { provider, received, errors, reactions, joined, emit: (...args) => provider.client.emit(...args) };
 }
+
+test("every account-wide OpenChat push reads the watched chats' own events: history is skipped, new joins are reported once, malformed ones dropped", async () => {
+  const member = `p${"j".repeat(32)}`;
+  const joinEvent = (joined, type = "NOTIFIED_JOIN_SQUARE_CHAT") => ({ type, payload: { notifiedJoinSquareChat: joined } });
+  const valid = (squareMemberMid, displayName, extra = {}) => joinEvent({ squareChatMid: SQUARE, joinedMember: { squareMemberMid, displayName, ...extra } });
+  const requests = [];
+  // LINE's answers, in order: two history pages, then whatever happened since the last sync token.
+  const answers = [
+    { events: [valid(`p${"o".repeat(32)}`, "老成員")], syncToken: "s0", continuationToken: "c1" },
+    { events: [valid(`p${"q".repeat(32)}`, "也很老")], syncToken: "s1" },
+    {
+      events: [
+        valid(member, "新朋友", { profileImageObsHash: "0hAbCdEfGh", role: "MEMBER" }),
+        joinEvent({ squareChatMid: SQUARE, joinedMember: { squareMemberMid: OWN_MEMBER, displayName: "" } }, 2),
+        joinEvent({ squareChatMid: GROUP_A, joinedMember: { squareMemberMid: member, displayName: "x" } }),
+        valid(mid(1), "x"),
+        valid(member, 5),
+        valid(member, "x", { profileImageObsHash: 1 }),
+        joinEvent({ squareChatMid: SQUARE }),
+        joinEvent(undefined),
+      ],
+      syncToken: "s2",
+    },
+    { events: [], syncToken: "s2" },
+  ];
+  const base = fakeBase({ square: { async fetchSquareChatEvents(request) { requests.push(request); return answers.shift() ?? { events: [], syncToken: "s2" }; } } });
+  const { provider, joined, received, emit } = await activeProvider(base);
+  // The account-wide stream never carries who joined; such an event there is ignored.
+  emit("square:event", valid(member, "推播串"));
+  provider.watchSquareJoins([SQUARE, GROUP_A]);
+  await settle();
+  assert.deepEqual(joined, [], "joins from before the watch are history");
+  // Any push counts, whatever its type: here an unrelated status change of another chat.
+  emit("square:event", { type: "NOTIFIED_UPDATE_SQUARE_CHAT_STATUS", payload: {} });
+  await settle();
+  assert.deepEqual(joined, [
+    [SQUARE, { userId: member, displayName: "新朋友", pictureId: "avatar-o-0hAbCdEfGh", pictureUrl: "https://obs.line-scdn.net/0hAbCdEfGh" }],
+    [SQUARE, { userId: OWN_MEMBER, displayName: "" }],
+  ]);
+  // linejs emits every push as "square:event" first; a message is one more push.
+  const message = { message: { id: "77", to: SQUARE, from: member, contentType: "NONE", text: "嗨", createdTime: String(1_700_000_000_077), contentMetadata: {} } };
+  emit("square:event", { type: "NOTIFICATION_MESSAGE", payload: { notificationMessage: { squareChatMid: SQUARE, squareMessage: message } } });
+  emit("square:message", { raw: message });
+  await settle();
+  assert.deepEqual(received.map(({ message }) => [message.senderName, message.senderPictureId]), [["新朋友", "avatar-o-0hAbCdEfGh"]]);
+  assert.equal(joined.length, 2, "a later fetch reports nothing twice");
+  assert.deepEqual(requests.map(({ squareChatMid, syncToken, continuationToken }) => [squareChatMid, syncToken, continuationToken]), [
+    [SQUARE, undefined, undefined],
+    [SQUARE, "s0", "c1"],
+    [SQUARE, "s1", undefined],
+    [SQUARE, "s2", undefined],
+  ]);
+  const client = provider.client;
+  await provider.close();
+  client.emit("square:event", { type: "NOTIFICATION_MESSAGE", payload: {} });
+  await settle();
+  assert.equal(requests.length, 4, "a closed session stops watching");
+});
 
 const talk = (id, to, from, text, extra = {}) => ({ raw: { id, to, from, toType: "GROUP", contentType: "NONE", text, createdTime: String(1_700_000_000_000 + Number(id)), contentMetadata: {}, ...extra } });
 

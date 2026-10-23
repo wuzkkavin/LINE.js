@@ -31,6 +31,11 @@ async function main(): Promise<void> {
     onChecked: (chatId) => hub.handleChecked(chatId),
     onChatsChanged: () => hub.handleChatsChanged(),
     onReactions: (chatId, messageId, reactions) => hub.handleReactions(chatId, messageId, reactions),
+    onMemberJoined: (chatId, member) => {
+      // 小語's decision: name and picture are logged. JSON quoting keeps a crafted name to one log line.
+      console.info(`LINE 社群成員加入：chat=${chatId} member=${member.userId} name=${JSON.stringify(member.displayName)} picture=${member.pictureUrl ?? "-"}`);
+      hub.handleMemberJoined(chatId, member);
+    },
     onStatus: (state) => {
       console.info(`LINE 狀態：${state}`);
       hub.setStatus(state);

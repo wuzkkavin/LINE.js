@@ -3,7 +3,7 @@ import { BaseClient, type Device, type FetchLike } from "@evex/linejs/base";
 import { LINEStruct } from "@evex/linejs/thrift";
 import type { Message as LineMessage, SquareMessage as LineSquareMessage } from "@evex/linejs-types";
 import { avatarMediaId, mp4DurationMs, sniffImage, sniffMedia, type AvatarHost, type MediaBytes } from "../media/service.js";
-import type { Channel, ChannelRef, ChatAdmin, ChatAdmins, HistoryPage, MemberRole, Mention, Message, Profile, ReactionKind, Reactions, ReadPosition, StickerPackage } from "../model/dto.js";
+import type { Channel, ChannelRef, ChatAdmin, ChatAdmins, HistoryPage, JoinedMember, MemberRole, Mention, Message, Profile, ReactionKind, Reactions, ReadPosition, StickerPackage } from "../model/dto.js";
 import { withMyReaction } from "../model/store.js";
 import { discardResponse, readResponseText } from "../response.js";
 import { memberRole, mentionMetadata, parseMentions, replyTarget } from "./members.js";
@@ -34,6 +34,8 @@ export interface ProviderEvents {
    * Talk chats have no parsed live event: their reactions come with the message and with history.
    */
   onReactions: (chatId: string, messageId: string, reactions: Reactions | undefined) => void;
+  /** Someone joined an OpenChat chat (NOTIFIED_JOIN_SQUARE_CHAT). */
+  onMemberJoined: (chatId: string, member: JoinedMember) => void;
   onStatus: (state: "listening" | "reconnecting") => void;
   onError: (code: "SESSION_WRITE_FAILED" | "LINE_LISTEN_FAILED" | "MESSAGE_PARSE_FAILED") => void;
 }
@@ -80,6 +82,11 @@ export interface LineProvider {
   unsendMessage(channel: ChannelRef, messageId: string): Promise<void>;
   /** Sets (or, with undefined, removes) this account's reaction to a message. */
   react(channel: ChannelRef, messageId: string, kind: ReactionKind | undefined): Promise<void>;
+  /**
+   * OpenChat chats whose member joins are reported (onMemberJoined). Replaces the previous set;
+   * joins that happened before a chat is watched are never reported.
+   */
+  watchSquareJoins(chatIds: readonly string[]): void;
   close(): Promise<void>;
 }
 
@@ -106,6 +113,7 @@ const LOOKUP_RETRY_MS = 5 * 60 * 1000;
 const MAX_LOOKUP_MISSES = 2000;
 const TALK_USER_MID = /^u[0-9a-f]{32}$/;
 const SQUARE_MEMBER_MID = /^p[A-Za-z0-9]{10,64}$/;
+const SQUARE_CHAT_MID = /^m[A-Za-z0-9]{10,64}$/;
 const STICKER_PACKS_CACHE_MS = 10 * 60 * 1000;
 const PACK_META_CONCURRENCY = 4;
 const UNREAD_MAX_PAGES = 20;
@@ -145,6 +153,17 @@ interface SquareHistory {
   updates: Map<string, { unsent?: boolean; reactions?: Reactions }>;
   liveUpdates: Set<string>;
   loading?: Promise<Message[]>;
+}
+
+/** Where a watched OpenChat chat's event stream was read up to. */
+interface JoinWatch {
+  client: Client;
+  syncToken?: string;
+  continuationToken?: string;
+  /** False while walking up to the newest event: joins seen then are history, not news. */
+  caughtUp: boolean;
+  running?: Promise<void>;
+  again: boolean;
 }
 
 // Let the lookup cap stop candidate preparation before traversing the remaining messages.
@@ -189,6 +208,9 @@ export class EvexLineProvider implements LineProvider {
   private previewDecrypts = new Map<string, { raw: LineMessage; undecryptable: boolean }>();
   // E2EE messages linejs could not decrypt; they stay ciphertext and become placeholders.
   private undecryptable = new WeakSet<LineMessage>();
+  // OpenChat chats watched for joins: LINE reports a join only in the chat's own event stream
+  // (fetchSquareChatEvents), never in the account-wide push stream that `listen` follows.
+  private joinWatches = new Map<string, JoinWatch>();
 
   constructor(
     private readonly storage: SessionStorage,
@@ -318,6 +340,8 @@ export class EvexLineProvider implements LineProvider {
     });
     client.on("square:event", (event) => {
       if (this.client !== client) return;
+      // Every account-wide push may follow a join: read each watched chat's own events right away.
+      for (const chatId of this.joinWatches.keys()) this.checkJoins(chatId);
       const type = String(event.type);
       if (type === "NOTIFIED_DESTROY_MESSAGE" || type === "5") {
         const destroyed = event.payload?.notifiedDestroyMessage;
@@ -337,6 +361,86 @@ export class EvexLineProvider implements LineProvider {
       }
     });
     this.listen();
+  }
+
+  watchSquareJoins(chatIds: readonly string[]): void {
+    const client = this.client;
+    if (!client || this.stopped) return;
+    const wanted = new Set(chatIds.filter((chatId) => SQUARE_CHAT_MID.test(chatId)));
+    for (const chatId of this.joinWatches.keys()) if (!wanted.has(chatId)) this.joinWatches.delete(chatId);
+    for (const chatId of wanted) {
+      if (this.joinWatches.get(chatId)?.client === client) continue;
+      this.joinWatches.set(chatId, { client, caughtUp: false, again: false });
+      this.checkJoins(chatId);
+    }
+  }
+
+  /** One fetch per chat at a time; a trigger during a fetch runs one more right after it. */
+  private checkJoins(chatId: string): void {
+    const watch = this.joinWatches.get(chatId);
+    if (!watch || watch.client !== this.client) return;
+    if (watch.running) {
+      watch.again = true;
+      return;
+    }
+    watch.running = this.fetchJoins(chatId, watch)
+      // The position is kept; the next trigger or tick retries from it.
+      .catch(() => {})
+      .finally(() => {
+        watch.running = undefined;
+        if (watch.again && this.joinWatches.get(chatId) === watch) {
+          watch.again = false;
+          this.checkJoins(chatId);
+        }
+      });
+  }
+
+  /**
+   * The first fetches walk the chat from its oldest event to the newest without reporting anything
+   * (those joins are history); after that only events newer than the kept sync token arrive.
+   */
+  private async fetchJoins(chatId: string, watch: JoinWatch): Promise<void> {
+    for (let page = 0; page < SQUARE_MAX_PAGES; page += 1) {
+      const response = await watch.client.base.square.fetchSquareChatEvents({
+        squareChatMid: chatId, limit: SQUARE_PAGE_SIZE,
+        ...(watch.syncToken ? { syncToken: watch.syncToken } : {}),
+        ...(watch.continuationToken ? { continuationToken: watch.continuationToken } : {}),
+      } as Parameters<Client["base"]["square"]["fetchSquareChatEvents"]>[0]);
+      if (this.client !== watch.client || this.joinWatches.get(chatId) !== watch) return;
+      const events = Array.isArray(response?.events) ? response.events : [];
+      if (watch.caughtUp) {
+        for (const event of events) {
+          const type = String(event?.type);
+          if (type === "NOTIFIED_JOIN_SQUARE_CHAT" || type === "2") this.memberJoined(chatId, event.payload?.notifiedJoinSquareChat);
+        }
+      }
+      if (typeof response?.syncToken === "string" && response.syncToken) watch.syncToken = response.syncToken;
+      const next = typeof response?.continuationToken === "string" && response.continuationToken ? response.continuationToken : undefined;
+      if (events.length === 0 || !next) {
+        watch.continuationToken = undefined;
+        watch.caughtUp = true;
+        return;
+      }
+      watch.continuationToken = next;
+    }
+  }
+
+  /** Typed payload, but still LINE input: anything off-shape is dropped, never guessed at. */
+  private memberJoined(chatId: string, joined: { squareChatMid?: unknown; joinedMember?: Partial<Record<"squareMemberMid" | "displayName" | "profileImageObsHash" | "role", unknown>> } | undefined): void {
+    const member = joined?.joinedMember;
+    if (joined?.squareChatMid !== chatId
+      || typeof member?.squareMemberMid !== "string" || !SQUARE_MEMBER_MID.test(member.squareMemberMid)
+      || typeof member.displayName !== "string"
+      || (member.profileImageObsHash !== undefined && typeof member.profileImageObsHash !== "string")) return;
+    const pictureId = avatarMediaId("obs", member.profileImageObsHash);
+    // Their first messages then show the right name and picture without another lookup.
+    this.rememberProfile(member.squareMemberMid, member.displayName, pictureId, true, memberRole(member.role));
+    this.events.onMemberJoined(chatId, {
+      userId: member.squareMemberMid,
+      displayName: member.displayName,
+      // pictureId only exists for a validated hash, so the URL never carries anything else.
+      ...(pictureId ? { pictureId, pictureUrl: `https://obs.line-scdn.net/${pictureId.slice("avatar-o-".length)}` } : {}),
+    });
   }
 
   /** The message's media is no longer fetchable through us, and the hub replaces what it shows. */
@@ -1431,6 +1535,7 @@ export class EvexLineProvider implements LineProvider {
     this.previewDecrypts.clear();
     this.stickerPackages = undefined;
     this.squareCache.clear();
+    this.joinWatches.clear();
     this.retryDelay = 1000;
     if (!base) return;
     base.authToken = undefined;
