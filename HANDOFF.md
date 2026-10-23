@@ -132,7 +132,16 @@
 - 雲端：build-app run 39713204547（head 2a0a353）四 job 全 success（build-engine／build-app／build-legacy／legacy-scenarios；本日 runner 明顯較慢，總時長約 46 分鐘，長尾在 build-legacy 歷史定版建置）。探針全 ok：engine_bytes=105,067,520（與 §6.8 build-windows v1.8.1 引擎同大小）、engine_id=410d96ce7e27565a-105067520、helper 身分／bot 欄位／list-models／test-ai／chats／whitelist 路由全 ok、login_roundtrip=ok、shutdown_path=signal_file、ports_freed=true；GUI 結束 residual=none、雙埠 False；主視窗截圖親自檢視（總覽正常、粉圓體、定版頭像、頁尾版權宣告＋上游出處入鏡）。
 - payload 世代查證：下載成品以 strings 實查含 chat:admin-token（14 處，含 :changed／:consumed 與 hello capabilities ["chat:admins","chat:admin-token"]）及版本戳記 serverVersion "1.8.1"、"1.8.1+0.1.0+66bd26c07558"——內嵌引擎已由 v1.8.0 世代升至 v1.8.1（含 E2EE 群組金鑰解密修正 #2 與聊天室一次性管理員權杖）。
 - 成品：AI寶-App.exe 128,016,896 bytes（較上版 +9,728，與引擎增量一致）、MD5 7fc0bc6c9f3a747bb4c42a5b30451daa、SHA256 f380a9261deb7c19339a4837a34ade869a20487ead45708eb7c47035e9f7cffd。Drive 同 id 1BWJiznBeMoeQbIaS7jxbKagiNBcnrmfX 原地換新（回讀大小＋MD5 一致、trashed=false）；Release aibao-app-v1 資產 AI-Bao-App.exe 同步換新（回讀 size＋sha256 一致）；run artifacts 4 件已全刪（複查 total_count=0）。
-- 未驗證（待老吳實機，比照歷次）：真帳號下 admin-token 推送／兌換、成員變動後 E2EE 解密修正的實際行為；裝新版前須先完全結束舊版 App；歷次未驗證項（引用續答真機、群組清單、聊天室畫面真機渲染與切頁縮匣不殘影、自啟動重開機等）照舊未驗。
+- 未驗證（待老吳實機，比照歷次）：真帳號下 admin-token 推送／兌換、成員
+
+## 6.10 每日上游同步：社群成員加入偵測 5 連發（2026-10-23）
+
+- 上游 5 筆（5da4c6f→7b9b5cd）：79e5784 社群成員加入時推送 chat:member-joined 給機器人並記錄日誌、43e65d1 真實帳號實測記錄（docs）、6416637 日誌記錄暱稱與大頭貼網址、b8e35ad 改從各社群事件串偵測成員加入（即時觸發＋30 秒保底）、7b9b5cd 每次社群推播即查成員加入、推送含頭像連結。
+- main＝18428bb（快進推送）、ai-bao＝f610acf（另含同日稍早 origin/ai-bao 既有推送 ce013fe 等修復批的合併，無衝突）。合併時 AGENTS.md 規則 11 內容衝突（同 §6.8 模式）：保留 fork 的 message:send .txt 擴充（2026-10-20 裁示）與 2026-10-22 一般檔案通道段落，併入上游的 chat:member-joined 推送規範（capabilities 增 chat:member-joined、obs.line-scdn.net 日誌記錄）；SECURITY.md 自動合併正確（capabilities 列更新＋新增 OpenChat member joins 列）。helper/、pack/ 零改動。
+- 測試（實跑）：typecheck 通過；上游 375/375（新增 3 題來自上游）；helper 110/111——唯一失敗為 KB 大掃描事件迴圈計時測試（同 §6.8/§6.9 已知環境性：當下 VM 負載 16–18，單跑同樣失敗 1514ms＞600ms 閾值；相關程式碼本次零改動）；pack 48/48。
+- 雲端：build-windows run 39888631817（head f610acf）conclusion＝success；exe 105,123,328 bytes，strings 實查含 chat:member-joined（2 處，證明新上游碼在包內）；core-3789.png／console-3790.png 雙截圖齊全；該 run artifacts 已全刪（total_count＝0）。
+- Drive：依排程指示，本次**未換新**網頁版 AI寶.exe（live id 17YntO3DfH8FrU7hRjLpbBObhJjFTLExB，換新與否等老吳決定）與原生 App 版 AI寶-App.exe（驗收測試中）。
+- 未驗證：KB 計時測試待負載正常時補跑；真帳號下 chat:member-joined 實際推送（待老吳實機，社群「對話機器人技術交流」已指示停止監聽）。變動後 E2EE 解密修正的實際行為；裝新版前須先完全結束舊版 App；歷次未驗證項（引用續答真機、群組清單、聊天室畫面真機渲染與切頁縮匣不殘影、自啟動重開機等）照舊未驗。
 
 ## 7. 操作手冊（常用指令）
 
