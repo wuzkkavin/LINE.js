@@ -62,7 +62,7 @@ jobs:
   build-app:
     needs: build-engine
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: 取出原始碼
         uses: actions/checkout@v4
@@ -466,6 +466,105 @@ jobs:
             $result | Set-Content 'gui-idle-result.txt' -Encoding utf8
           }
 
+      - name: 逐頁截圖 — 每一頁都要入鏡 (修復版6 硬性驗證)
+        shell: pwsh
+        run: |
+          # 修復版4/5 教訓: 有兩頁沒拍到截圖就交件, 老吳實機才發現問題。本步逐頁以
+          # AIBAO_START_PAGE 指定起始頁重啟 App 截圖, 逐張存 artifact 供人工檢視;
+          # 聊天室畫面頁另加 AIBAO_CHATVIEW_FORCE=1, 讓 WebView 真的嵌入核心頁
+          # (未登入時是核心登入頁實景), 不再只拍未登入占位。聊天室管理頁先種入一筆
+          # 假 chatProfiles, 讓編輯區有內容入鏡。缺任何一頁即整輪紅燈, 不准缺頁交件。
+          $ErrorActionPreference = 'Stop'
+          $pagesHome = Join-Path $env:RUNNER_TEMP 'aibao-pages-data'
+          if (Test-Path $pagesHome) { Remove-Item $pagesHome -Recurse -Force }
+          New-Item -ItemType Directory -Force $pagesHome | Out-Null
+          New-Item -ItemType Directory -Force pages | Out-Null
+          $env:HWLINEHELPER_HOME = $pagesHome
+          @{ schema = 1; theme = 'forest'; auto_login = $true; show_window_on_start = $true; tray_hint_shown = $true } |
+            ConvertTo-Json | Set-Content (Join-Path $pagesHome 'shell-settings.json') -Encoding utf8
+          $exe = (Resolve-Path 'out/AI寶.exe').Path
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class Win32Pg {
+            [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+          }
+          "@
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          function Shot-App([string]$name, [hashtable]$extraEnv) {
+            foreach ($k in $extraEnv.Keys) { Set-Item "env:$k" $extraEnv[$k] }
+            $p = Start-Process -FilePath $exe -PassThru
+            try {
+              $deadline = (Get-Date).AddSeconds(120)
+              $up = $false
+              while ((Get-Date) -lt $deadline) {
+                if ($p.HasExited) { throw "pages/${name}: App 自行結束 (exit $($p.ExitCode))" }
+                try {
+                  $b = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3
+                  if ($b.StatusCode -eq 200) { $up = $true; break }
+                } catch { }
+                Start-Sleep -Seconds 2
+              }
+              if (-not $up) { throw "pages/${name}: helper 120 秒未就緒" }
+              Start-Sleep -Seconds 6
+              $p.Refresh()
+              if ($p.MainWindowHandle -ne [IntPtr]::Zero) {
+                [Win32Pg]::SetWindowPos($p.MainWindowHandle, [IntPtr]::Zero, 10, 10, 1000, 700, 0x0040) | Out-Null
+                [Win32Pg]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+                Start-Sleep -Seconds 2
+              }
+              $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+              $bmp.Save((Join-Path $PWD "pages\page-$name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+              Write-Host "page ${name}: screenshot $((Get-Item "pages\page-$name.png").Length) bytes"
+            } finally {
+              foreach ($k in $extraEnv.Keys) { Remove-Item "env:$k" -ErrorAction SilentlyContinue }
+              if (-not $p.HasExited) {
+                Start-Process -FilePath $exe -ArgumentList '--quit' | Out-Null
+                $dl = (Get-Date).AddSeconds(120)
+                while (-not $p.HasExited -and (Get-Date) -lt $dl) { Start-Sleep -Seconds 2 }
+                if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; throw "pages/${name}: --quit 後未結束" }
+              }
+              Start-Sleep -Seconds 2
+            }
+          }
+          # 第一次啟動兼拍總覽, 並讓 helper 在資料目錄產生 settings.json
+          Shot-App 'overview' @{}
+          $settingsPath = Join-Path $pagesHome 'settings.json'
+          if (-not (Test-Path $settingsPath)) { throw '逐頁截圖前置失敗: helper 未在資料目錄產生 settings.json' }
+          $seedJs = Join-Path $pagesHome 'seed-settings.cjs'
+          @'
+          const fs = require("fs");
+          const p = process.argv[2];
+          const s = JSON.parse(fs.readFileSync(p, "utf8"));
+          s.ai = s.ai || {};
+          s.ai.chatProfiles = s.ai.chatProfiles || {};
+          s.ai.chatProfiles["c11111111111111111111111111111111"] = {
+            rolePrompt: "(截圖驗證用) 本群專屬角色",
+            scopePrompt: "(截圖驗證用) 只回答電腦與軟體問題",
+            kbEnabled: true, kbFolder: "", chatty: true, personaCustom: true, suspended: false,
+            admins: [{ id: "u22222222222222222222222222222222", name: "截圖驗證管理員" }]
+          };
+          fs.writeFileSync(p, JSON.stringify(s, null, 1));
+          console.log("seeded chatProfiles for page screenshots");
+          '@ | Set-Content $seedJs -Encoding utf8
+          node $seedJs $settingsPath
+          Shot-App 'chat' @{ AIBAO_START_PAGE = 'chat'; AIBAO_CHATVIEW_FORCE = '1' }
+          Shot-App 'manage' @{ AIBAO_START_PAGE = 'manage' }
+          Shot-App 'send' @{ AIBAO_START_PAGE = 'send' }
+          Shot-App 'ai' @{ AIBAO_START_PAGE = 'ai' }
+          Shot-App 'bot' @{ AIBAO_START_PAGE = 'bot' }
+          Shot-App 'kb' @{ AIBAO_START_PAGE = 'kb' }
+          Shot-App 'scam' @{ AIBAO_START_PAGE = 'scam' }
+          Shot-App 'logs' @{ AIBAO_START_PAGE = 'logs' }
+          Shot-App 'appsettings' @{ AIBAO_START_PAGE = 'app' }
+          Shot-App 'about' @{ AIBAO_START_PAGE = 'about' }
+          Get-ChildItem pages | ForEach-Object { "shot: $($_.Name) $($_.Length) bytes" }
+
       - name: 上傳成品、探針結果、截圖與 log
         if: always()
         uses: actions/upload-artifact@v4
@@ -483,6 +582,7 @@ jobs:
             gui-idle-shell.log
             foreign-shell.log
             themes/theme-*.png
+            pages/page-*.png
           if-no-files-found: warn
 
   # 舊世代建置 (結束殘留情境的前置): 歷史定版各自建出當代產物 —
