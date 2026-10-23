@@ -260,3 +260,56 @@ export class KnowledgeBase {
     };
   }
 }
+
+// 分群知識庫池: 全域一份 + 每個有專屬資料夾的群一份, 索引檔照 chatId 分開存放, 互不混用。
+export class KbPool {
+  constructor({ dataDir, logger, globalFolder = "" } = {}) {
+    this.dataDir = dataDir ?? "";
+    this.logger = logger;
+    this.global = new KnowledgeBase({
+      folder: globalFolder ?? "",
+      indexPath: this.dataDir ? join(this.dataDir, "kb-index.json") : undefined,
+      logger,
+    });
+    this.perChat = new Map(); // chatId -> KnowledgeBase
+  }
+  globalKb() { return this.global; }
+  forFolder(chatId, folder) {
+    const f = typeof folder === "string" ? folder : "";
+    if (!f || f === this.global.folder) return this.global;
+    const existing = this.perChat.get(chatId);
+    if (existing && existing.folder === f) return existing;
+    const inst = new KnowledgeBase({
+      folder: f,
+      indexPath: this.dataDir ? join(this.dataDir, `kb-index-chat-${chatId}.json`) : undefined,
+      logger: this.logger,
+    });
+    this.perChat.set(chatId, inst);
+    void inst.scan();
+    return inst;
+  }
+  syncFromSettings(settings) {
+    const profiles = settings?.ai?.chatProfiles ?? {};
+    const out = [];
+    if (!profiles || typeof profiles !== "object") return out;
+    for (const [chatId, p] of Object.entries(profiles)) {
+      if (!p || typeof p !== "object") continue;
+      if (p.suspended) continue;
+      if (p.kbEnabled === false) continue;
+      const folder = typeof p.kbFolder === "string" ? p.kbFolder : "";
+      if (!folder) continue;
+      if (folder === this.global.folder) continue;
+      const inst = this.forFolder(chatId, folder);
+      out.push({ chatId, folder, fileCount: inst.countSupportedFiles() });
+    }
+    return out;
+  }
+  chatStatuses() {
+    const out = {};
+    for (const [chatId, inst] of this.perChat) out[chatId] = inst.status();
+    return out;
+  }
+  setGlobalFolder(folder) {
+    this.global.setFolder(folder ?? "");
+  }
+}

@@ -68,6 +68,9 @@ export function defaultSettings() {
       // 回答範圍 (非機密, publicView 明文回傳); 空字串 = 不限制範圍
       scopePrompt: DEFAULT_SCOPE_PROMPT,
       memoryTurns: 6,
+      // 分群設定: { [chatId]: { rolePrompt, scopePrompt, kbEnabled, kbFolder, suspended } }
+      // 沒有條目 = 用全域預設; suspended=true = 停用中 (視同用預設)
+      chatProfiles: {},
     },
     scam: {
       enabled: true,
@@ -81,6 +84,34 @@ export function defaultSettings() {
     notify: { admins: [], rules: [] },
     log: { debug: false, retentionDays: 14 },
   };
+}
+
+export const CHAT_ID_RE = /^[ucrsm][0-9a-f]{32}$/;
+
+export function normalizeChatProfile(p) {
+  const src = p && typeof p === "object" && !Array.isArray(p) ? p : {};
+  const toStr = (v, max) => {
+    if (typeof v === "string") return v.slice(0, max);
+    if (v == null) return "";
+    return String(v).slice(0, max);
+  };
+  return {
+    rolePrompt: toStr(src.rolePrompt, 4000),
+    scopePrompt: toStr(src.scopePrompt, 4000),
+    kbEnabled: src.kbEnabled === undefined ? true : Boolean(src.kbEnabled),
+    kbFolder: toStr(src.kbFolder, 1024),
+    suspended: src.suspended === undefined ? false : Boolean(src.suspended),
+  };
+}
+
+export function normalizeChatProfiles(profiles) {
+  const out = {};
+  if (!profiles || typeof profiles !== "object" || Array.isArray(profiles)) return out;
+  for (const [chatId, profile] of Object.entries(profiles)) {
+    if (!CHAT_ID_RE.test(chatId)) continue;
+    out[chatId] = normalizeChatProfile(profile);
+  }
+  return out;
 }
 
 function deepMerge(base, patch) {
@@ -109,6 +140,7 @@ export class SettingsStore {
         const stored = JSON.parse(readFileSync(this.path, "utf8"));
         this.data = deepMerge(defaultSettings(), stored);
         this.migrateRoleSplit(stored);
+        if (this.data.ai) this.data.ai.chatProfiles = normalizeChatProfiles(this.data.ai.chatProfiles);
       } catch (e) {
         this.logger?.warn("設定", "設定檔讀取失敗, 改用預設值", { error: String(e?.message ?? e) });
         this.data = defaultSettings();
@@ -134,7 +166,36 @@ export class SettingsStore {
   }
   get() { return this.data; }
   update(patch) {
-    this.data = deepMerge(this.data, patch);
+    // chatProfiles 補丁需先處理: deepMerge 無法刪鍵, null = 刪除該群條目要在 merge 前先分流。
+    let chatProfilesPatch;
+    let hasChatProfilesPatch = false;
+    let patchForMerge = patch;
+    if (patch && typeof patch === "object" && patch.ai && typeof patch.ai === "object" && !Array.isArray(patch.ai) && Object.prototype.hasOwnProperty.call(patch.ai, "chatProfiles")) {
+      hasChatProfilesPatch = true;
+      chatProfilesPatch = patch.ai.chatProfiles;
+      patchForMerge = { ...patch, ai: { ...patch.ai } };
+      delete patchForMerge.ai.chatProfiles;
+    }
+    this.data = deepMerge(this.data, patchForMerge);
+    if (!this.data.ai || typeof this.data.ai !== "object") this.data.ai = defaultSettings().ai;
+    if (!this.data.ai.chatProfiles || typeof this.data.ai.chatProfiles !== "object" || Array.isArray(this.data.ai.chatProfiles)) {
+      this.data.ai.chatProfiles = {};
+    }
+    if (hasChatProfilesPatch && chatProfilesPatch && typeof chatProfilesPatch === "object" && !Array.isArray(chatProfilesPatch)) {
+      for (const [chatId, val] of Object.entries(chatProfilesPatch)) {
+        if (!CHAT_ID_RE.test(chatId)) continue;
+        if (val === null) { delete this.data.ai.chatProfiles[chatId]; continue; }
+        if (!val || typeof val !== "object" || Array.isArray(val)) continue;
+        const existing = this.data.ai.chatProfiles[chatId] && typeof this.data.ai.chatProfiles[chatId] === "object" && !Array.isArray(this.data.ai.chatProfiles[chatId])
+          ? this.data.ai.chatProfiles[chatId] : {};
+        this.data.ai.chatProfiles[chatId] = { ...existing, ...val };
+      }
+    } else if (hasChatProfilesPatch && chatProfilesPatch === null) {
+      // 整個 chatProfiles 傳 null: 清空全部 (防禦性處理, 契約未定義但不應把 null 存進去)
+      this.data.ai.chatProfiles = {};
+    }
+    // 正規化所有既有條目 (防舊存檔形狀不齊 + 剛合併的補丁欄位)
+    this.data.ai.chatProfiles = normalizeChatProfiles(this.data.ai.chatProfiles);
     // 角色定位清空後儲存 = 自動回復出廠預設 (2026-10-21 老吳定案)。
     // 注意回答範圍 scopePrompt 不在此列: 它清空就是「不限制範圍」, 必須保留空字串。
     if (typeof this.data.ai?.rolePrompt === "string" && !this.data.ai.rolePrompt.trim()) {

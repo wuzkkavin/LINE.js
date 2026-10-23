@@ -57,7 +57,7 @@ async function readBody(req) {
   try { return JSON.parse(Buffer.concat(parts).toString("utf8")); } catch { return {}; }
 }
 
-export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, version = "0.1.0", lineEnv, outbox, adminEvents, materials } = {}) {
+export function createConsoleServer({ settings, secrets, ai, kb, kbPool, bot, logger, version = "0.1.0", lineEnv, outbox, adminEvents, materials } = {}) {
   // LINE 引導工具的環境: 資料目錄 (找核心 config.yaml)、是否打包版、Token 產生器 (測試可注入假的)
   const line = {
     dataDir: lineEnv?.dataDir ?? process.env.HELPER_DATA_DIR ?? join(here, "..", "data"),
@@ -102,7 +102,7 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
       if (req.method === "GET" && path === "/api/status") {
         // service/capabilities 是身分標記: 原生 App 用它分辨 3790 上的是不是新版 helper,
         // 避免把還在跑的舊版 AI寶.exe (無 list-models、舊測試邏輯) 誤認成自己的服務 (2026-10-20 老吳實機踩到)。
-        return json(res, 200, { service: "aibao-helper", version, capabilities: ["list-models", "line-config", "token-gen", "outbox", "admin-notify"], bot: bot ? bot.status() : null, serverTime: new Date().toISOString() });
+        return json(res, 200, { service: "aibao-helper", version, capabilities: ["list-models", "line-config", "token-gen", "outbox", "admin-notify", "chat-profiles"], bot: bot ? bot.status() : null, serverTime: new Date().toISOString() });
       }
       if (req.method === "GET" && path === "/api/bot/activity") {
         // 機器人聊天情況 (第 12 項): 狀態列摘要 + 最近動態 (記憶體環形緩衝, 新到舊)。
@@ -234,6 +234,21 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         if (body?.line) delete body.line;
         await Promise.all(keyUpdates);
         settings.update(body);
+        // 分群知識庫預熱: 有專屬資料夾的群在存檔後同步建立/更新各自索引 (背景掃描)
+        let chatKbNotices = [];
+        if (kbPool) {
+          try {
+            if (typeof body?.kb?.folder === "string") kbPool.setGlobalFolder(body.kb.folder);
+            const warmed = kbPool.syncFromSettings(settings.get()) ?? [];
+            for (const item of warmed) {
+              if (item.fileCount > KB_LARGE_FOLDER_FILES) {
+                chatKbNotices.push(`提醒: 有一個群組專屬的知識庫資料夾「${item.folder}」有 ${item.fileCount} 個文件檔案, 數量非常多 — 建立索引會在背景花比較久的時間 (不影響其他功能)。建議另外建一個只放要給 AI 參考文件的專用資料夾, 會快很多。`);
+              }
+            }
+          } catch (e) {
+            logger?.warn("設定", "分群知識庫同步發生錯誤, 已略過", { error: String(e?.message ?? e) });
+          }
+        }
         if (lineTokenChanged) await reconnectBot().catch(() => {});
         // Jev 接通同步: 每次存檔後把核心 config.yaml 的 jev 區段與目前設定/金鑰對齊
         // (啟用且有金鑰就寫入、停用或清除金鑰就清空; 只動 jev 區段, 安全規格同白名單寫入)。
@@ -243,14 +258,16 @@ export function createConsoleServer({ settings, secrets, ai, kb, bot, logger, ve
         if (bot?.refreshJevState) await bot.refreshJevState().catch(() => {});
         // 知識庫掃描改在背景跑: 大資料夾掃描要很久, 設定回應不能等它 (舊版同步掃描把這支 API
         // 卡住 100+ 秒, App 端直接逾時跳 Network Error — 2026-10-20 實機定案之二)。
-        let kbNotice = "";
+        let kbNotice = chatKbNotices.join(" ");
+        if (kbPool && typeof body?.kb?.folder === "string") kbPool.setGlobalFolder(body.kb.folder);
         if (kb && typeof body?.kb?.folder === "string") {
           kb.setFolder(body.kb.folder);
           void kb.scan();
           if (body.kb.folder) {
             const n = kb.countSupportedFiles();
             if (n > KB_LARGE_FOLDER_FILES) {
-              kbNotice = `提醒: 這個知識庫資料夾有 ${n} 個文件檔案, 數量非常多 — 建立索引會在背景花比較久的時間 (不影響其他功能), 之後每次重整也會久。建議另外建一個只放要給 AI 參考文件的專用資料夾, 會快很多。`;
+              const globalNotice = `提醒: 這個知識庫資料夾有 ${n} 個文件檔案, 數量非常多 — 建立索引會在背景花比較久的時間 (不影響其他功能), 之後每次重整也會久。建議另外建一個只放要給 AI 參考文件的專用資料夾, 會快很多。`;
+              kbNotice = kbNotice ? `${kbNotice} ${globalNotice}` : globalNotice;
             }
           }
         }

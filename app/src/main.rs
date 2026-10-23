@@ -162,6 +162,118 @@ struct NotifyRuleForm {
     admin_ids: Vec<String>,
 }
 
+/// 分群設定表單 (settings.ai.chatProfiles 的一個群一包; 契約見規格書《分群角色定位與回答範圍》):
+/// custom=false 表示這個群跟著全域預設 (沒有條目, 或使用者在畫面切回用預設待刪除);
+/// custom=true 表示本群自訂 (取代全域, 不是疊加)。suspended=true 是「移出白名單後保留但停用」,
+/// 重新加入後要由使用者在展開編輯區按「恢復使用」才生效。
+#[derive(Clone, Default, PartialEq)]
+struct ChatProfileForm {
+    custom: bool,
+    role: String,
+    scope: String,
+    kb_enabled: bool,
+    kb_folder: String,
+    suspended: bool,
+}
+
+impl ChatProfileForm {
+    /// 送給 helper 的完整物件 (欄位名照共用契約: rolePrompt/scopePrompt/kbEnabled/kbFolder/suspended)。
+    fn to_value(&self) -> Value {
+        serde_json::json!({
+            "rolePrompt": self.role,
+            "scopePrompt": self.scope,
+            "kbEnabled": self.kb_enabled,
+            "kbFolder": self.kb_folder,
+            "suspended": self.suspended
+        })
+    }
+
+    /// 從 settings.ai.chatProfiles 的一包解析回表單; 缺欄位照契約預設 (kbEnabled 預設 true)。
+    fn from_value(v: &Value) -> Self {
+        Self {
+            custom: true,
+            role: v.get("rolePrompt").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            scope: v.get("scopePrompt").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            kb_enabled: v.get("kbEnabled").and_then(|x| x.as_bool()).unwrap_or(true),
+            kb_folder: v.get("kbFolder").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            suspended: v.get("suspended").and_then(|x| x.as_bool()).unwrap_or(false),
+        }
+    }
+}
+
+/// 組「儲存各群設定」的補丁: 只含與載入原貌不同的群。
+/// 切回用預設 (custom=false) 或表單裡已不存在的原有群 = 傳 null 刪除; 新自訂/改過欄位的群 = 完整物件
+/// (suspended 的變更也併進完整物件一起送, 伺服器端照契約合併欄位)。
+fn chat_profiles_patch(forms: &HashMap<String, ChatProfileForm>, orig: &HashMap<String, ChatProfileForm>) -> serde_json::Map<String, Value> {
+    let mut patch = serde_json::Map::new();
+    for (id, o) in orig {
+        match forms.get(id) {
+            None => {
+                patch.insert(id.clone(), Value::Null);
+            }
+            Some(f) if !f.custom => {
+                patch.insert(id.clone(), Value::Null);
+            }
+            Some(f) if f != o => {
+                patch.insert(id.clone(), f.to_value());
+            }
+            _ => {}
+        }
+    }
+    for (id, f) in forms {
+        if orig.contains_key(id) {
+            continue;
+        }
+        if f.custom {
+            patch.insert(id.clone(), f.to_value());
+        }
+    }
+    patch
+}
+
+/// 補丁送出成功後的新原貌: 以原貌為底, null 的群刪掉、物件的群換成表單目前值。
+fn chat_profiles_new_orig(
+    forms: &HashMap<String, ChatProfileForm>,
+    orig: &HashMap<String, ChatProfileForm>,
+    patch: &serde_json::Map<String, Value>,
+) -> HashMap<String, ChatProfileForm> {
+    let mut out = orig.clone();
+    for (id, v) in patch {
+        if v.is_null() {
+            out.remove(id);
+        } else if let Some(f) = forms.get(id) {
+            out.insert(id.clone(), f.clone());
+        }
+    }
+    out
+}
+
+/// bot 狀態裡一份知識庫索引狀態 (全域 kb 或某群的 kbChats) 的白話一行,
+/// 格式比照知識庫頁: 檔案數、片段數、整理中標示、資料夾。
+fn kb_status_line(kb: &Value) -> String {
+    let files = kb.get("files").and_then(|v| v.as_u64()).unwrap_or(0);
+    let chunks = kb.get("chunks").and_then(|v| v.as_u64()).unwrap_or(0);
+    let ready = kb.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
+    let scanning = kb.get("scanning").and_then(|v| v.as_bool()).unwrap_or(false);
+    let folder = kb.get("folder").and_then(|v| v.as_str()).unwrap_or("");
+    let mut line = format!(
+        "檔案 {} 個、片段 {} 段{}",
+        files,
+        chunks,
+        if scanning {
+            " (索引正在背景整理中…)"
+        } else if ready {
+            " (已就緒)"
+        } else {
+            " (尚無可用檔案)"
+        }
+    );
+    if !folder.is_empty() {
+        line.push_str(&format!("; 資料夾: {folder}"));
+    }
+    line
+}
+
 #[derive(Default)]
 struct SettingsForm {
     loaded: bool,
@@ -200,6 +312,10 @@ struct SettingsForm {
     notify_admins: Vec<(String, String)>,
     notify_rules: Vec<NotifyRuleForm>,
     save_msg: Option<String>,
+    // 分群設定 (機器人與觸發頁白名單清單逐群編輯): chat_profiles 是目前畫面上的表單值,
+    // chat_profiles_orig 是載入時的原貌快照, 儲存時兩邊比對才知道哪些群要送完整物件、哪些送 null 刪除。
+    chat_profiles: HashMap<String, ChatProfileForm>,
+    chat_profiles_orig: HashMap<String, ChatProfileForm>,
 }
 
 struct HelperSnap {
@@ -248,6 +364,16 @@ struct App {
     // 端點失敗時 wl_loaded 永遠為 false, 60fps 無限重試把 log 灌爆、錯誤訊息疊加。
     // 改為: 進頁自動載入一次, 失敗就停, 使用者按「重新讀取白名單」才再試。
     wl_attempted: bool,
+    // 分群設定 (白名單清單逐群展開編輯): 展開狀態、儲存/刪除/停用的背景結果通道與待套用的新原貌。
+    chat_profile_expanded: std::collections::HashSet<String>,
+    chat_profiles_slot: Slot<Value>,
+    chat_profiles_msg: Option<String>,
+    /// 儲存/刪除成功後要套用的 (新原貌, 成功後要從表單移除的 chatId 清單 — 孤兒刪除用)。
+    chat_profiles_pending: Option<(HashMap<String, ChatProfileForm>, Vec<String>)>,
+    chat_suspend_slot: Slot<Value>,
+    chat_suspend_id: Option<String>,
+    /// 正在移除白名單的 chatId: 移除成功後若該群有自訂設定, 要追加送 suspended=true 保留但停用。
+    pending_remove_chat: Option<String>,
     // 機器人聊天情況面板 (第 12 項): 活動端點的最近結果與上次抓取時間
     activity_slot: Arc<Mutex<Option<serde_json::Value>>>,
     activity: Option<serde_json::Value>,
@@ -784,6 +910,13 @@ impl App {
             whitelist: Vec::new(),
             wl_loaded: false,
             wl_attempted: false,
+            chat_profile_expanded: std::collections::HashSet::new(),
+            chat_profiles_slot: Arc::new(Mutex::new(None)),
+            chat_profiles_msg: None,
+            chat_profiles_pending: None,
+            chat_suspend_slot: Arc::new(Mutex::new(None)),
+            chat_suspend_id: None,
+            pending_remove_chat: None,
             activity_slot: Arc::new(Mutex::new(None)),
             activity: None,
             activity_fetched_at: None,
@@ -2084,6 +2217,16 @@ impl App {
             .and_then(|x| x.as_str())
             .unwrap_or(DEFAULT_SCOPE_PROMPT)
             .to_string();
+        // 分群設定跟著同一條載入路徑進表單, 並留一份原貌快照供儲存時比對增刪改。
+        f.chat_profiles.clear();
+        f.chat_profiles_orig.clear();
+        if let Some(profiles) = v.get("ai").and_then(|a| a.get("chatProfiles")).and_then(|x| x.as_object()) {
+            for (chat_id, pv) in profiles {
+                let form = ChatProfileForm::from_value(pv);
+                f.chat_profiles.insert(chat_id.clone(), form.clone());
+                f.chat_profiles_orig.insert(chat_id.clone(), form);
+            }
+        }
         f.providers.clear();
         if let Some(providers) = v.get("ai").and_then(|a| a.get("providers")).and_then(|p| p.as_object()) {
             for (pid, pv) in providers {
@@ -2261,6 +2404,82 @@ impl App {
         });
     }
 
+    /// 「儲存各群設定」: 只送有變更的群組成的補丁 (完整物件或 null), 走既有 PUT /api/settings。
+    /// 成功後的新原貌先存進 chat_profiles_pending, 等 poll 收到成功回應才套用。
+    fn save_chat_profiles(&mut self, ctx: &egui::Context) {
+        if self.busy.get("chat_profiles").copied().unwrap_or(false) {
+            return;
+        }
+        let patch = chat_profiles_patch(&self.form.chat_profiles, &self.form.chat_profiles_orig);
+        if patch.is_empty() {
+            self.chat_profiles_msg = Some("各群設定沒有變更, 不需要儲存。".to_string());
+            return;
+        }
+        let new_orig = chat_profiles_new_orig(&self.form.chat_profiles, &self.form.chat_profiles_orig, &patch);
+        let body = serde_json::json!({ "ai": { "chatProfiles": Value::Object(patch) } });
+        self.spawn_chat_profiles_put(ctx, body, new_orig, Vec::new());
+    }
+
+    /// 刪除一個已不在白名單的群的設定: 立刻送該群 null, 成功後重讀設定狀態。
+    fn delete_orphan_chat_profile(&mut self, ctx: &egui::Context, chat_id: String) {
+        if self.busy.get("chat_profiles").copied().unwrap_or(false) {
+            return;
+        }
+        let mut patch = serde_json::Map::new();
+        patch.insert(chat_id.clone(), Value::Null);
+        let mut new_orig = self.form.chat_profiles_orig.clone();
+        new_orig.remove(&chat_id);
+        let body = serde_json::json!({ "ai": { "chatProfiles": Value::Object(patch) } });
+        self.spawn_chat_profiles_put(ctx, body, new_orig, vec![chat_id]);
+    }
+
+    /// 分群設定補丁的共用送出通道 (儲存與孤兒刪除共用 busy 鎖與結果 slot, 同一時間只送一筆)。
+    fn spawn_chat_profiles_put(
+        &mut self,
+        ctx: &egui::Context,
+        body: Value,
+        new_orig: HashMap<String, ChatProfileForm>,
+        remove_form_ids: Vec<String>,
+    ) {
+        self.busy.insert("chat_profiles".into(), true);
+        self.chat_profiles_msg = None;
+        self.chat_profiles_pending = Some((new_orig, remove_form_ids));
+        let slot = self.chat_profiles_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let result = helper_api::put_settings(body);
+            *slot.lock().unwrap() = Some(match result {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    /// 白名單移除成功後的連動: 該群若有自訂設定, 追加送 { suspended: true } 只改停用欄位,
+    /// 設定保留不刪 (日後重新加入時在展開編輯區提示恢復)。結果進 chat_suspend_slot 由 poll 收。
+    fn spawn_suspend_chat_profile(&mut self, ctx: &egui::Context, chat_id: String) {
+        if self.busy.get("chat_profiles").copied().unwrap_or(false) {
+            // 儲存/刪除進行中就先記 log; 原貌快照裡仍留著這筆, 使用者下次按「儲存各群設定」前
+            // 狀態顯示會是未停用 — 但同一時間只會有一種寫入, 不冒險併發送第二筆。
+            shell::log_line(&format!("分群設定停用暫緩 (chatId={chat_id}): 已有分群設定儲存進行中"));
+            return;
+        }
+        self.busy.insert("chat_profiles".into(), true);
+        self.chat_suspend_id = Some(chat_id.clone());
+        let body = serde_json::json!({ "ai": { "chatProfiles": { chat_id: { "suspended": true } } } });
+        let slot = self.chat_suspend_slot.clone();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let result = helper_api::put_settings(body);
+            *slot.lock().unwrap() = Some(match result {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
     fn poll_async_results(&mut self, ctx: &egui::Context) {
         // 待發清單載入結果
         if let Some(v) = self.outbox_slot.lock().unwrap().take() {
@@ -2358,6 +2577,47 @@ impl App {
             self.form.jev_key_input.clear();
             self.form.jev_key_clear = false;
         }
+        // 分群設定儲存/刪除結果: 成功才套用新原貌快照; 孤兒刪除還要把表單條目移除並重讀設定狀態。
+        if let Some(v) = self.chat_profiles_slot.lock().unwrap().take() {
+            self.busy.insert("chat_profiles".into(), false);
+            let pending = self.chat_profiles_pending.take();
+            if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+                let is_orphan_delete = pending.as_ref().map(|(_, ids)| !ids.is_empty()).unwrap_or(false);
+                if let Some((new_orig, remove_ids)) = pending {
+                    self.form.chat_profiles_orig = new_orig;
+                    for id in &remove_ids {
+                        self.form.chat_profiles.remove(id);
+                    }
+                }
+                self.chat_profiles_msg = Some("已儲存，馬上生效".to_string());
+                if is_orphan_delete {
+                    // 照定案重讀設定狀態: 清掉 poller 快取, 下一輪會把最新設定整份抓回來填表單。
+                    self.snap.lock().unwrap().settings = None;
+                    self.form_needs_load = true;
+                }
+            } else {
+                let m = v.get("message").and_then(|m| m.as_str()).unwrap_or("儲存失敗, 請稍後再試一次");
+                self.chat_profiles_msg = Some(format!("各群設定沒有存成功: {m}"));
+            }
+        }
+        // 白名單移除連動的停用結果: 成功才把本地狀態同步標成停用中。
+        if let Some(v) = self.chat_suspend_slot.lock().unwrap().take() {
+            self.busy.insert("chat_profiles".into(), false);
+            let chat_id = self.chat_suspend_id.take().unwrap_or_default();
+            if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+                if let Some(f) = self.form.chat_profiles.get_mut(&chat_id) {
+                    f.suspended = true;
+                }
+                if let Some(f) = self.form.chat_profiles_orig.get_mut(&chat_id) {
+                    f.suspended = true;
+                }
+                shell::log_line(&format!("分群設定已停用保留 (chatId={chat_id}): 群組移出白名單"));
+            } else {
+                let m = v.get("message").and_then(|m| m.as_str()).unwrap_or("停用失敗");
+                self.chat_profiles_msg = Some(format!("群組已移出白名單, 但這個群的自訂設定停用沒有成功: {m}"));
+                shell::log_line(&format!("分群設定停用失敗 (chatId={chat_id}): {m}"));
+            }
+        }
         // AI 測試連線 / 模型清單
         let pids: Vec<String> = self.test_slots.keys().cloned().collect();
         for pid in pids {
@@ -2413,6 +2673,15 @@ impl App {
             // 加入/移除後白名單管理清單也要同步重讀
             if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) && self.wl_loaded {
                 self.spawn_whitelist_load(ctx);
+            }
+            // 移除白名單連動 (定案: 保留但停用): 移除成功且該群有自訂設定時,
+            // 追加一筆只改 suspended 的補丁; 加入白名單不走這條 (pending_remove_chat 只有移除時才有值)。
+            if let Some(removed_id) = self.pending_remove_chat.take() {
+                if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false)
+                    && self.form.chat_profiles_orig.contains_key(&removed_id)
+                {
+                    self.spawn_suspend_chat_profile(ctx, removed_id);
+                }
             }
         }
         // 白名單管理清單讀取
@@ -2502,6 +2771,7 @@ impl App {
         if self.busy.get("apply").copied().unwrap_or(false) {
             return;
         }
+        self.pending_remove_chat = None;
         self.busy.insert("apply".into(), true);
         let slot = self.apply_slot.clone();
         let ctx2 = ctx.clone();
@@ -2541,6 +2811,8 @@ impl App {
         if self.busy.get("apply").copied().unwrap_or(false) {
             return;
         }
+        // 記住正在移除哪個群: poll 收到成功後要連動把該群的自訂設定停用保留。
+        self.pending_remove_chat = Some(chat_id.clone());
         self.busy.insert("apply".into(), true);
         let slot = self.apply_slot.clone();
         let ctx2 = ctx.clone();
@@ -3016,6 +3288,8 @@ impl App {
                         let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                         let (label, color) = match kind {
                             "answered" => ("已回答", self.palette.ok),
+                            "declined" => ("婉拒（範圍外）", self.palette.idle),
+                            "clarify" => ("反問確認", self.palette.warn),
                             "name_only" => ("引導說明", self.palette.idle),
                             "cooldown" => ("冷卻略過", self.palette.warn),
                             "daily_limit" => ("每日上限擋下", self.palette.warn),
@@ -3148,7 +3422,10 @@ impl App {
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
         // 第一張卡 (2026-10-21 老吳定案): 機器人定位與範圍, 兩欄都可編輯、儲存即時生效 (機器人每則訊息讀最新設定)。
-        card(ui, self.palette, "機器人定位與範圍", |ui| {
+        card(ui, self.palette, "機器人定位與範圍（全域的預設設定）", |ui| {
+            ui.label(egui::RichText::new("各群自己的設定在『機器人與觸發』頁的白名單清單那邊改。").weak().small());
+            ui.label(egui::RichText::new("已有本群自訂的群組不會用這份，也不會和本群設定合併。").weak().small());
+            ui.add_space(6.0);
             ui.label(egui::RichText::new("角色定位").strong());
             ui.add(egui::TextEdit::multiline(&mut self.form.ai_role).desired_rows(2).desired_width(f32::INFINITY));
             ui.label(egui::RichText::new("清空後儲存，會自動回復成出廠預設的角色定位。例：也可以改成「你是華葳集成的資訊小老師，專門陪同事學電腦」這類你想要的身分描述。").weak().small());
@@ -3299,6 +3576,87 @@ fn draw_qr(ui: &mut egui::Ui, pal: theme::Palette, content: &str, size: f32) {
 }
 
 impl App {
+    /// 白名單某一群的展開編輯區 (就地展開, 不跳頁): 用哪一套、本群角色與範圍、本群知識庫。
+    /// 這裡只改表單狀態, 存檔統一走白名單清單下方的「儲存各群設定」。
+    /// 知識庫狀態的顯示選擇: 該群在 bot.kbChats 有自己的狀態就顯示該群的;
+    /// 沒有 (用全域資料夾或尚未自訂) 就顯示全域知識庫的狀態一行。
+    fn chat_profile_editor(&mut self, ui: &mut egui::Ui, chat_id: &str, kb_chats: &Value, global_kb: &Value) {
+        // 還沒有表單條目的群先建一份草稿: 先跟著全域預設, 欄位預填全域目前值,
+        // 之後切到本群自訂時不用從空白重打 (已有 profile 的群表單裡本來就是 profile 的值)。
+        if !self.form.chat_profiles.contains_key(chat_id) {
+            self.form.chat_profiles.insert(
+                chat_id.to_string(),
+                ChatProfileForm {
+                    custom: false,
+                    role: self.form.ai_role.clone(),
+                    scope: self.form.ai_scope.clone(),
+                    kb_enabled: true,
+                    kb_folder: String::new(),
+                    suspended: false,
+                },
+            );
+        }
+        let pal = self.palette;
+        let f = match self.form.chat_profiles.get_mut(chat_id) {
+            Some(f) => f,
+            None => return,
+        };
+        ui.add_space(4.0);
+        if f.suspended {
+            ui.label(egui::RichText::new("這個群之前有一份自訂設定，目前停用中。").color(pal.warn_text));
+            ui.horizontal(|ui| {
+                if ui.button("恢復使用").clicked() {
+                    f.suspended = false;
+                }
+                if ui.button("捨棄這份設定").clicked() {
+                    f.custom = false;
+                    f.suspended = false;
+                }
+            });
+            ui.label(egui::RichText::new("按下方「儲存各群設定」後才會生效。").weak().small());
+            ui.add_space(4.0);
+        }
+        ui.horizontal(|ui| {
+            ui.label("這個群要用哪一套:");
+            ui.selectable_value(&mut f.custom, false, "跟著全域預設");
+            ui.selectable_value(&mut f.custom, true, "本群自訂");
+        });
+        if !f.custom {
+            ui.label(egui::RichText::new("這個群用全域的預設設定, 在「AI 設定」頁那張卡改。").weak().small());
+        } else {
+            ui.label(egui::RichText::new("這個群用自己的設定，全域預設在這個群不生效。").weak().small());
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("本群的角色定位").strong());
+            ui.add(egui::TextEdit::multiline(&mut f.role).desired_rows(2).desired_width(f32::INFINITY));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("本群的回答範圍").strong());
+            ui.add(egui::TextEdit::multiline(&mut f.scope).desired_rows(4).desired_width(f32::INFINITY));
+            ui.label(egui::RichText::new("清空這個欄位＝這個群不限制範圍，什麼問題都回答").weak().small());
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("這個群的知識庫").strong());
+            ui.checkbox(&mut f.kb_enabled, "這個群可以讀知識庫");
+            ui.label(egui::RichText::new("關閉後，這個群問公司問題時不會查知識庫，也不會因為查不到資料而通知管理員；AI 會依一般知識回答，不知道會誠實說不知道。").weak().small());
+            ui.horizontal(|ui| {
+                ui.label("知識庫資料夾:");
+                ui.add(egui::TextEdit::singleline(&mut f.kb_folder).desired_width(340.0).hint_text("例如 D:\\公司文件\\專案資料"));
+                if ui.button("選擇資料夾…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        f.kb_folder = path.to_string_lossy().to_string();
+                    }
+                }
+            });
+            ui.label(egui::RichText::new("留空＝用全域知識庫資料夾。").weak().small());
+        }
+        // 知識庫整理狀態不分模式都顯示一行: 該群有自己的狀態就顯示該群的, 沒有就顯示全域的。
+        if let Some(entry) = kb_chats.get(chat_id) {
+            ui.label(egui::RichText::new(format!("這個群的知識庫: {}", kb_status_line(entry))).weak().small());
+        } else if !global_kb.is_null() {
+            ui.label(egui::RichText::new(format!("全域知識庫: {}", kb_status_line(global_kb))).weak().small());
+        }
+        ui.add_space(4.0);
+        ui.separator();
+    }
+
     fn page_bot(&mut self, ui: &mut egui::Ui) {
         ui.heading("機器人與觸發");
         ui.add_space(8.0);
@@ -3466,22 +3824,104 @@ impl App {
                 }
                 let wl = self.whitelist.clone();
                 let busy_apply_now = self.busy.get("apply").copied().unwrap_or(false);
+                // 分群知識庫狀態 (bot.kbChats, 只有自訂資料夾的群才有) 與全域知識庫狀態先各抓一份,
+                // 展開編輯區顯示用; 迴圈裡不再反覆鎖快取。
+                let status = self.helper_status();
+                let bot_status = status.as_ref().and_then(|s| s.get("bot")).cloned().unwrap_or(Value::Null);
+                let kb_chats = bot_status.get("kbChats").cloned().unwrap_or(Value::Null);
+                let global_kb = bot_status.get("kb").cloned().unwrap_or(Value::Null);
                 for c in &wl {
                     let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if id.is_empty() {
+                        continue;
+                    }
                     let resolved = c.get("nameResolved").and_then(|v| v.as_bool()).unwrap_or(false);
                     let name = chat_display_name(c.get("name").and_then(|v| v.as_str()), resolved);
-                    let sub = chat_sub_text(
+                    let sub_base = chat_sub_text(
                         c.get("kind").and_then(|v| v.as_str()),
                         c.get("memberCount").and_then(|v| v.as_i64()),
                         resolved,
                     );
+                    // 狀態小字: 這個群目前用哪一套設定, 一眼可分。
+                    let state_txt = match self.form.chat_profiles.get(&id).map(|f| (f.custom, f.suspended)) {
+                        Some((true, true)) => "本群自訂・已停用待確認",
+                        Some((true, false)) => "本群自訂",
+                        _ => "用預設",
+                    };
+                    let sub = format!("{sub_base}・{state_txt}");
+                    let mut toggle_expand = false;
+                    let mut remove_clicked = false;
                     chat_list_row(ui, &name, &sub, |ui| {
                         if chat_action_btn(ui, "移除", !busy_apply_now).clicked() {
-                            self.start_remove(&ctx, id.clone());
+                            remove_clicked = true;
+                        }
+                        if chat_action_btn(ui, "設定這個群", true).clicked() {
+                            toggle_expand = true;
                         }
                     });
+                    if toggle_expand {
+                        if !self.chat_profile_expanded.remove(&id) {
+                            self.chat_profile_expanded.insert(id.clone());
+                        }
+                    }
+                    if remove_clicked {
+                        self.start_remove(&ctx, id.clone());
+                    }
+                    if self.chat_profile_expanded.contains(&id) {
+                        self.chat_profile_editor(ui, &id, &kb_chats, &global_kb);
+                    }
                 }
                 ui.label(egui::RichText::new("移除後要把 AI寶 完全關閉再重新開啟才會生效 (與加入相同)。").weak());
+                // 各群設定統一由這顆存檔: 只送有變更的群 (切回用預設的送刪除、新自訂/改過的送完整物件)。
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let saving_profiles = self.busy.get("chat_profiles").copied().unwrap_or(false);
+                    if primary_btn(ui, self.palette, if saving_profiles { "儲存中…" } else { "儲存各群設定" }).clicked() && !saving_profiles {
+                        self.save_chat_profiles(&ctx);
+                    }
+                    if let Some(m) = &self.chat_profiles_msg {
+                        ui.label(m.clone());
+                    }
+                });
+                // 已不在白名單的群組設定: 條目還留在設定裡 (保留但停用), 列在這裡讓使用者能手動清掉;
+                // 沒有這種條目時整區不顯示。
+                let wl_ids: std::collections::HashSet<&str> = wl.iter().filter_map(|c| c.get("id").and_then(|v| v.as_str())).collect();
+                let mut orphans: Vec<String> = self
+                    .form
+                    .chat_profiles_orig
+                    .keys()
+                    .filter(|id| !wl_ids.contains(id.as_str()))
+                    .cloned()
+                    .collect();
+                orphans.sort();
+                if !orphans.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("已不在白名單的群組設定").size(15.0));
+                    ui.label(egui::RichText::new("這些群已經不在白名單, 它們的自訂設定留著但不會生效; 之後把群加回白名單時, 會先問你要不要恢復。不要了可以從這裡刪掉。").weak().small());
+                    let mut delete_id: Option<String> = None;
+                    for oid in &orphans {
+                        // 名稱: 能對到核心群組清單的名稱就用名稱, 對不到就用未命名聊天室 (末 4 碼) 區分。
+                        let known_name = self
+                            .group_chats
+                            .iter()
+                            .find(|c| c.get("id").and_then(|v| v.as_str()) == Some(oid.as_str()))
+                            .and_then(|c| c.get("name").and_then(|v| v.as_str()))
+                            .unwrap_or("");
+                        let label = activity_chat_label(oid, known_name);
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            if ui.button("刪除這個群的設定").clicked() {
+                                delete_id = Some(oid.clone());
+                            }
+                        });
+                    }
+                    if let Some(oid) = delete_id {
+                        self.delete_orphan_chat_profile(&ctx, oid);
+                    }
+                    if let Some(m) = &self.chat_profiles_msg {
+                        ui.label(m.clone());
+                    }
+                }
             }
             ui.add_space(8.0);
             // 步驟二: Token
@@ -4662,8 +5102,61 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_image_rgba, icon_rgba, EngineOpGate};
+    use super::{chat_profiles_new_orig, chat_profiles_patch, decode_image_rgba, icon_rgba, ChatProfileForm, EngineOpGate};
+    use std::collections::HashMap;
     use std::io::Cursor;
+
+    fn profile(role: &str) -> ChatProfileForm {
+        ChatProfileForm {
+            custom: true,
+            role: role.to_string(),
+            scope: "範圍".to_string(),
+            kb_enabled: true,
+            kb_folder: String::new(),
+            suspended: false,
+        }
+    }
+
+    #[test]
+    fn chat_profiles_patch_only_sends_changed_chats() {
+        // 分群儲存補丁: 沒改的群不送、新自訂送完整物件、只改 suspended 也併進完整物件。
+        let mut orig = HashMap::new();
+        orig.insert("c-same".to_string(), profile("角色A"));
+        orig.insert("c-susp".to_string(), profile("角色B"));
+        let mut forms = orig.clone();
+        forms.get_mut("c-susp").unwrap().suspended = true;
+        forms.insert("c-new".to_string(), profile("角色C"));
+        let patch = chat_profiles_patch(&forms, &orig);
+        assert!(!patch.contains_key("c-same"), "沒變更的群不應出現在補丁裡");
+        let susp = patch.get("c-susp").expect("suspended 變更的群要送");
+        assert_eq!(susp.get("suspended").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(susp.get("rolePrompt").and_then(|v| v.as_str()), Some("角色B"), "改過的群送完整物件");
+        let new = patch.get("c-new").expect("新自訂的群要送");
+        assert_eq!(new.get("kbEnabled").and_then(|v| v.as_bool()), Some(true));
+        // 新原貌: 補丁套用後, 三個群都在、值是表單目前值
+        let new_orig = chat_profiles_new_orig(&forms, &orig, &patch);
+        assert_eq!(new_orig.len(), 3);
+        assert!(new_orig.get("c-susp").unwrap().suspended);
+    }
+
+    #[test]
+    fn chat_profiles_patch_switch_back_to_default_sends_null() {
+        // 切回用預設 (custom=false) 與表單移除都送 null 刪除; 原本就用預設的群不送任何東西。
+        let mut orig = HashMap::new();
+        orig.insert("c-back".to_string(), profile("角色A"));
+        orig.insert("c-gone".to_string(), profile("角色B"));
+        let mut forms = HashMap::new();
+        let mut back = profile("角色A");
+        back.custom = false;
+        forms.insert("c-back".to_string(), back);
+        forms.insert("c-fresh".to_string(), ChatProfileForm::default());
+        let patch = chat_profiles_patch(&forms, &orig);
+        assert!(patch.get("c-back").map(|v| v.is_null()).unwrap_or(false), "切回用預設要送 null");
+        assert!(patch.get("c-gone").map(|v| v.is_null()).unwrap_or(false), "原貌有、表單沒有要送 null");
+        assert!(!patch.contains_key("c-fresh"), "從未自訂的群不送");
+        let new_orig = chat_profiles_new_orig(&forms, &orig, &patch);
+        assert!(new_orig.is_empty(), "刪除後新原貌不應再有這兩個群");
+    }
 
     #[test]
     fn engine_op_gate_blocks_reentry_until_end() {

@@ -5,7 +5,7 @@ import { Logger } from "./logger.mjs";
 import { createSecretStore } from "./secrets.mjs";
 import { SettingsStore, SECRET_NAMES } from "./config.mjs";
 import { createAiClient } from "./ai.mjs";
-import { KnowledgeBase } from "./kb.mjs";
+import { KbPool } from "./kb.mjs";
 import { HelperBot } from "./bot.mjs";
 import { syncJevCoreConfig } from "./jev.mjs";
 import { MessageSenderRegistry } from "./msgregistry.mjs";
@@ -29,14 +29,16 @@ for (const [envName, secretName] of [["HELPER_AI_OPENAI_KEY", SECRET_NAMES.opena
 }
 
 const ai = createAiClient({ logger }); // logger 讓 AI 上游的原始錯誤細節只進 log, 不回給使用者
-const kb = new KnowledgeBase({ folder: settings.get().kb.folder, indexPath: join(dataDir, "kb-index.json"), logger });
+const kbPool = new KbPool({ dataDir, logger, globalFolder: settings.get().kb.folder });
+const kb = kbPool.globalKb();
 if (settings.get().kb.folder) void kb.scan(); // 背景分段掃描, 不擋控制台啟動與 bot 連線
+kbPool.syncFromSettings(settings.get()); // 預熱各群專屬索引 (背景掃描)
 
 // 訊息寄件者登記簿持久化在 data 目錄: 重啟後仍認得機器人先前發過的訊息, 引用續答不中斷
 const registry = new MessageSenderRegistry({ path: join(dataDir, "message-senders.json"), logger });
 // 管理員通知的事件紀錄要先建好再交給 bot (bot 是事件來源); 待發清單與教材庫同批建立
 const adminEvents = new AdminEventStore({ path: join(dataDir, "admin-events.json"), logger });
-const bot = new HelperBot({ settings, secrets, ai, kb, logger, registry, dailyStatePath: join(dataDir, "daily-state.json"), adminEvents });
+const bot = new HelperBot({ settings, secrets, ai, kb, kbPool, logger, registry, dailyStatePath: join(dataDir, "daily-state.json"), adminEvents });
 // Jev 接通: 啟動時先把核心 config.yaml 的 jev 區段與目前設定/金鑰對齊 (上次執行期間改的存檔當下
 // 就已同步, 這裡是補上「程式沒開時設定被改」或核心設定檔後來才產生的情況), 並刷新 bot 的 Jev 狀態,
 // 防詐騙頁顯示的狀態才誠實。同步失敗只記 log, 不擋啟動。
@@ -46,7 +48,7 @@ await bot.refreshJevState().catch(() => {});
 // 發送群組訊息的待發清單/紀錄: 本機 JSON 存放, 實際送出由 App 殼負責; 教材庫是可重複取用的圖片/檔案存放
 const outbox = new OutboxStore({ path: join(dataDir, "outbox.json"), logger });
 const materials = new MaterialsStore({ dir: join(dataDir, "materials") });
-const server = createConsoleServer({ settings, secrets, ai, kb, bot, logger, lineEnv: { dataDir }, outbox, adminEvents, materials });
+const server = createConsoleServer({ settings, secrets, ai, kb, kbPool, bot, logger, lineEnv: { dataDir }, outbox, adminEvents, materials });
 const port = Number(process.env.HELPER_PORT || 3790);
 await listenConsole(server, port);
 logger.info("啟動", "控制台已啟動", { url: `http://127.0.0.1:${port}`, botName: settings.get().botName || "(尚未設定)" });

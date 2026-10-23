@@ -216,6 +216,10 @@ a.btn { text-decoration: none; }
     <div class="hint">三家都填了 Key 也可以, 用哪一家由下面的單選決定。Key 只存在這台電腦的機密存放區, 不會寫進設定檔, 也不會顯示出來 (只看得到末 4 碼)。</div>
     <div id="providers"></div>
     <label class="checkline"><input type="checkbox" id="aiFallback"> 啟用自動備援 (使用中的 AI 失敗時, 自動改用下一家)</label>
+    <h3>機器人定位與範圍</h3>
+    <div style="margin-top:6px"><span class="pill">全域的預設設定</span></div>
+    <div class="hint">各群自己的設定在白名單清單那邊改。</div>
+    <div class="hint">已有本群自訂的群組不會用這份，也不會和本群設定合併。</div>
     <label for="rolePrompt">角色定位</label>
     <textarea id="rolePrompt" style="min-height:64px"></textarea>
     <div class="hint">清空後儲存，會自動回復成出廠預設的角色定位。例：也可以改成「你是華葳集成的資訊小老師，專門陪同事學電腦」這類你想要的身分描述。</div>
@@ -310,6 +314,26 @@ a.btn { text-decoration: none; }
 const $ = (id) => document.getElementById(id);
 const PROVIDERS = ["openai", "groq", "minimax"];
 let settings = null;
+let chatProfilesState = {};
+let chatProfilesSnapshot = {};
+let chatProfilesGlobalRole = "";
+let chatProfilesGlobalScope = "";
+let kbChatsState = {};
+let currentWhitelistChats = [];
+const chatProfileEditors = new Map();
+function deepCloneObj(v) { return JSON.parse(JSON.stringify(v || {})); }
+function profileStatusText(profile) {
+  if (!profile) return "用預設";
+  if (profile.suspended) return "本群自訂・已停用待確認";
+  return "本群自訂";
+}
+function profilesEqual(a, b) {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  const norm = (x) => ({ rolePrompt: x.rolePrompt || "", scopePrompt: x.scopePrompt || "", kbEnabled: x.kbEnabled !== false, kbFolder: x.kbFolder || "", suspended: !!x.suspended });
+  const na = norm(a); const nb = norm(b);
+  return na.rolePrompt === nb.rolePrompt && na.scopePrompt === nb.scopePrompt && na.kbEnabled === nb.kbEnabled && na.kbFolder === nb.kbFolder && na.suspended === nb.suspended;
+}
 function providerCard(p) {
   const d = document.createElement("div");
   d.className = "provider"; d.id = "prov-" + p.id;
@@ -334,6 +358,11 @@ async function loadAll() {
   settings = await sRes.json();
   const status = await stRes.json();
   const s = settings;
+  chatProfilesState = deepCloneObj(s.ai && s.ai.chatProfiles ? s.ai.chatProfiles : {});
+  chatProfilesSnapshot = deepCloneObj(s.ai && s.ai.chatProfiles ? s.ai.chatProfiles : {});
+  chatProfilesGlobalRole = (s.ai && s.ai.rolePrompt) || "";
+  chatProfilesGlobalScope = (s.ai && s.ai.scopePrompt) || "";
+  try { kbChatsState = (status.bot && status.bot.kbChats) || {}; } catch { kbChatsState = {}; }
   document.title = (s.botName || "機器人") + " 控制台";
   $("appName").textContent = s.botName || "機器人";
   $("botName").value = s.botName || "";
@@ -483,6 +512,196 @@ function chatRowEl(c) {
   row.append(main, action);
   return { row, action };
 }
+function buildChatProfileEditor(c, profile) {
+  const chatId = c.id;
+  let editorSuspended = !!(profile && profile.suspended);
+  let markedDelete = false;
+  const editor = document.createElement("div");
+  editor.className = "profile-editor";
+  editor.style.display = "none";
+  editor.style.padding = "10px 4px 14px";
+  editor.style.borderBottom = "1px solid var(--line)";
+  const banner = document.createElement("div");
+  banner.className = "hint";
+  banner.style.display = editorSuspended ? "" : "none";
+  const bannerText = document.createElement("span");
+  bannerText.textContent = "這個群之前有一份自訂設定，目前停用中。";
+  const restoreBtn = document.createElement("button");
+  restoreBtn.type = "button"; restoreBtn.className = "ghost"; restoreBtn.textContent = "恢復使用"; restoreBtn.style.marginLeft = "8px";
+  const discardBtn = document.createElement("button");
+  discardBtn.type = "button"; discardBtn.className = "ghost"; discardBtn.textContent = "捨棄這份設定"; discardBtn.style.marginLeft = "6px";
+  banner.append(bannerText, restoreBtn, discardBtn);
+  editor.appendChild(banner);
+  const modeWrap = document.createElement("div");
+  const radioName = "cp-mode-" + chatId;
+  const labelDefault = document.createElement("label");
+  labelDefault.className = "checkline";
+  const radioDefault = document.createElement("input");
+  radioDefault.type = "radio"; radioDefault.name = radioName; radioDefault.value = "default";
+  labelDefault.append(radioDefault, document.createTextNode(" 跟著全域預設"));
+  const labelCustom = document.createElement("label");
+  labelCustom.className = "checkline";
+  const radioCustom = document.createElement("input");
+  radioCustom.type = "radio"; radioCustom.name = radioName; radioCustom.value = "custom";
+  labelCustom.append(radioCustom, document.createTextNode(" 本群自訂"));
+  if (profile) { radioCustom.checked = true; } else { radioDefault.checked = true; }
+  modeWrap.append(labelDefault, labelCustom);
+  editor.appendChild(modeWrap);
+  const customBox = document.createElement("div");
+  customBox.style.display = profile ? "" : "none";
+  const replaceNote = document.createElement("div");
+  replaceNote.className = "hint";
+  replaceNote.textContent = "這個群用自己的設定，全域預設在這個群不生效。";
+  customBox.appendChild(replaceNote);
+  const roleLabel = document.createElement("label");
+  roleLabel.textContent = "本群角色定位";
+  const roleTa = document.createElement("textarea");
+  roleTa.className = "cp-role"; roleTa.style.minHeight = "64px";
+  roleTa.value = profile ? (profile.rolePrompt || "") : chatProfilesGlobalRole;
+  const scopeLabel = document.createElement("label");
+  scopeLabel.textContent = "本群回答範圍";
+  const scopeTa = document.createElement("textarea");
+  scopeTa.className = "cp-scope";
+  scopeTa.value = profile ? (profile.scopePrompt || "") : chatProfilesGlobalScope;
+  customBox.append(roleLabel, roleTa, scopeLabel, scopeTa);
+  const kbLabel = document.createElement("label");
+  kbLabel.className = "checkline";
+  const kbCheck = document.createElement("input");
+  kbCheck.type = "checkbox"; kbCheck.className = "cp-kb-enabled";
+  kbCheck.checked = profile ? (profile.kbEnabled !== false) : true;
+  kbLabel.append(kbCheck, document.createTextNode(" 這個群可以讀知識庫"));
+  customBox.appendChild(kbLabel);
+  const kbFolderLabel = document.createElement("label");
+  kbFolderLabel.textContent = "知識庫資料夾";
+  const kbFolderInput = document.createElement("input");
+  kbFolderInput.type = "text"; kbFolderInput.className = "cp-kb-folder";
+  kbFolderInput.value = profile ? (profile.kbFolder || "") : "";
+  const kbFolderHint = document.createElement("div");
+  kbFolderHint.className = "hint";
+  kbFolderHint.textContent = "留空＝用全域知識庫資料夾。";
+  const kbNote = document.createElement("div");
+  kbNote.className = "hint";
+  kbNote.textContent = "關閉後，這個群問公司問題時不會查知識庫，也不會因為查不到資料而通知管理員；AI 會依一般知識回答，不知道會誠實說不知道。";
+  customBox.append(kbFolderLabel, kbFolderInput, kbFolderHint, kbNote);
+  try {
+    const kbInfo = kbChatsState && kbChatsState[chatId] ? kbChatsState[chatId] : null;
+    if (kbInfo) {
+      const kbStatusLine = document.createElement("div");
+      kbStatusLine.className = "hint"; kbStatusLine.className = "hint cp-kb-status";
+      if (kbInfo.scanning) { kbStatusLine.textContent = "知識庫狀態：整理中"; }
+      else { kbStatusLine.textContent = "知識庫狀態：" + (kbInfo.files ?? 0) + " 個檔案、" + (kbInfo.chunks ?? 0) + " 段"; }
+      customBox.appendChild(kbStatusLine);
+    }
+  } catch {}
+  editor.appendChild(customBox);
+  function syncMode() {
+    if (radioCustom.checked) { markedDelete = false; customBox.style.display = ""; }
+    else { customBox.style.display = "none"; }
+  }
+  radioDefault.addEventListener("change", syncMode);
+  radioCustom.addEventListener("change", syncMode);
+  restoreBtn.addEventListener("click", () => {
+    editorSuspended = false; markedDelete = false;
+    banner.style.display = "none";
+    radioCustom.checked = true; syncMode();
+  });
+  discardBtn.addEventListener("click", () => {
+    markedDelete = true; editorSuspended = false;
+    banner.style.display = "none";
+    radioDefault.checked = true; syncMode(); markedDelete = true;
+  });
+  const entry = {
+    chatId,
+    getPending() {
+      const snap = chatProfilesSnapshot[chatId];
+      if (markedDelete) { return snap ? null : undefined; }
+      if (radioDefault.checked) { return snap ? null : undefined; }
+      const obj = { rolePrompt: roleTa.value, scopePrompt: scopeTa.value, kbEnabled: !!kbCheck.checked, kbFolder: kbFolderInput.value.trim(), suspended: !!editorSuspended };
+      if (profilesEqual(obj, snap)) return undefined;
+      return obj;
+    },
+    isSuspended() { return editorSuspended; }
+  };
+  chatProfileEditors.set(chatId, entry);
+  return editor;
+}
+function renderOrphanProfiles(container) {
+  container.innerHTML = "";
+  const whitelistIds = new Set((currentWhitelistChats || []).map((x) => x.id));
+  const orphanIds = Object.keys(chatProfilesState || {}).filter((id) => !whitelistIds.has(id));
+  if (!orphanIds.length) { container.style.display = "none"; return; }
+  container.style.display = "";
+  const heading = document.createElement("h3");
+  heading.textContent = "已不在白名單的群組設定";
+  container.appendChild(heading);
+  const hintEl = document.createElement("div");
+  hintEl.className = "hint";
+  hintEl.textContent = "這些群組已經不在白名單，設定還保留著，不會生效。";
+  container.appendChild(hintEl);
+  for (const oid of orphanIds) {
+    const rowEl = document.createElement("div");
+    rowEl.className = "chatrow";
+    const mainEl = document.createElement("div");
+    const nameEl = document.createElement("div");
+    nameEl.className = "cname";
+    const last4 = oid ? oid.slice(-4) : "";
+    nameEl.textContent = "未命名聊天室（末 4 碼）" + last4;
+    const subEl = document.createElement("div");
+    subEl.className = "csub";
+    subEl.textContent = profileStatusText(chatProfilesState[oid]);
+    mainEl.append(nameEl, subEl);
+    const actEl = document.createElement("div");
+    actEl.className = "caction";
+    const delBtn = document.createElement("button");
+    delBtn.type = "button"; delBtn.className = "ghost"; delBtn.textContent = "刪除這個群的設定";
+    delBtn.addEventListener("click", async () => {
+      delBtn.disabled = true;
+      try {
+        const rr = await (await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ai: { chatProfiles: { [oid]: null } } }) })).json();
+        if (rr && rr.ok === false) { delBtn.disabled = false; return; }
+        delete chatProfilesState[oid]; delete chatProfilesSnapshot[oid];
+        try {
+          const sRes2 = await fetch("/api/settings"); const s2 = await sRes2.json();
+          if (s2 && s2.ai) { chatProfilesState = deepCloneObj(s2.ai.chatProfiles || {}); chatProfilesSnapshot = deepCloneObj(s2.ai.chatProfiles || {}); }
+        } catch {}
+        loadWhitelist();
+      } catch { delBtn.disabled = false; }
+    });
+    actEl.appendChild(delBtn);
+    rowEl.append(mainEl, actEl);
+    container.appendChild(rowEl);
+  }
+}
+async function saveChatProfiles(btn, msg) {
+  const patch = {};
+  for (const entry of chatProfileEditors.values()) {
+    const pending = entry.getPending();
+    if (pending !== undefined) patch[entry.chatId] = pending;
+  }
+  if (!Object.keys(patch).length) { msg.textContent = "沒有變更需要儲存"; msg.style.color = ""; return; }
+  btn.disabled = true; msg.textContent = "儲存中…"; msg.style.color = "";
+  try {
+    const r = await (await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ai: { chatProfiles: patch } }) })).json();
+    if (r.ok) {
+      for (const k of Object.keys(patch)) {
+        if (patch[k] === null) { delete chatProfilesState[k]; delete chatProfilesSnapshot[k]; }
+        else { chatProfilesState[k] = deepCloneObj(patch[k]); chatProfilesSnapshot[k] = deepCloneObj(patch[k]); }
+      }
+      const okText = r.message || "已儲存，馬上生效";
+      msg.textContent = okText;
+      msg.style.color = "var(--dark)";
+      await loadWhitelist();
+      const newMsg = $("chatProfilesMsg");
+      if (newMsg) { newMsg.textContent = okText; newMsg.style.color = "var(--dark)"; }
+      const globalMsg = $("whitelistMsg");
+      if (globalMsg) { globalMsg.textContent = okText; globalMsg.style.color = "var(--dark)"; }
+    } else {
+      msg.textContent = "儲存失敗:" + (r.message || "");
+      msg.style.color = "var(--err)";
+    }
+  } catch { msg.textContent = "儲存失敗: 連不上控制台服務, 請重新整理頁面再試"; msg.style.color = "var(--err)"; }
+  btn.disabled = false;
+}
 // 已儲存白名單逐筆清單 + 移除: 名稱/類型/人數由後端對照核心快照解析, 讀不到名稱顯示「未命名群組」。
 async function loadWhitelist() {
   const box = $("wlList");
@@ -490,14 +709,40 @@ async function loadWhitelist() {
   try {
     const r = await (await fetch("/api/line/whitelist")).json();
     if (!r.ok) { box.innerHTML = ""; return; }
-    if (!r.chats.length) { box.innerHTML = '<div class="hint">目前白名單是空的: 還沒有任何群組被加入。</div>'; return; }
+    currentWhitelistChats = r.chats || [];
+    chatProfileEditors.clear();
+    if (!r.chats.length) {
+      box.innerHTML = "";
+      const emptyEl = document.createElement("div");
+      emptyEl.className = "hint"; emptyEl.textContent = "目前白名單是空的: 還沒有任何群組被加入。";
+      box.appendChild(emptyEl);
+      const orphanBox0 = document.createElement("div");
+      orphanBox0.id = "orphanProfiles"; orphanBox0.style.marginTop = "10px";
+      box.appendChild(orphanBox0);
+      renderOrphanProfiles(orphanBox0);
+      return;
+    }
     box.innerHTML = "";
     const title = document.createElement("div");
     title.className = "hint";
     title.textContent = "目前白名單 (已儲存):";
     box.appendChild(title);
     for (const c of r.chats) {
+      const itemWrap = document.createElement("div");
       const { row, action } = chatRowEl(c);
+      const mainEl = row.children[0];
+      const statusEl = document.createElement("div");
+      statusEl.className = "csub cp-status";
+      statusEl.textContent = profileStatusText(chatProfilesState[c.id]);
+      if (mainEl) mainEl.appendChild(statusEl);
+      const profileForEdit = chatProfilesState[c.id] || null;
+      const editor = buildChatProfileEditor(c, profileForEdit);
+      const toggleBtn = document.createElement("button");
+      toggleBtn.type = "button"; toggleBtn.className = "ghost"; toggleBtn.textContent = "設定這個群";
+      toggleBtn.style.marginRight = "6px";
+      toggleBtn.addEventListener("click", () => {
+        editor.style.display = editor.style.display === "none" ? "" : "none";
+      });
       const b = document.createElement("button");
       b.type = "button"; b.className = "ghost"; b.textContent = "移除";
       b.addEventListener("click", async () => {
@@ -506,13 +751,39 @@ async function loadWhitelist() {
           const rr = await (await fetch("/api/line/config-remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chatId: c.id }) })).json();
           $("whitelistMsg").textContent = rr.message || "";
           $("whitelistMsg").style.color = rr.ok ? "var(--dark)" : "var(--err)";
-          if (rr.ok) { loadLineCfg(); }
+          if (rr.ok) {
+            if (chatProfilesState[c.id] || chatProfilesSnapshot[c.id]) {
+              try {
+                const sr = await (await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ai: { chatProfiles: { [c.id]: { suspended: true } } } }) })).json();
+                if (sr && sr.ok) {
+                  if (chatProfilesState[c.id]) chatProfilesState[c.id].suspended = true;
+                  if (chatProfilesSnapshot[c.id]) chatProfilesSnapshot[c.id].suspended = true;
+                  if (!chatProfilesState[c.id] && chatProfilesSnapshot[c.id]) chatProfilesState[c.id] = deepCloneObj(chatProfilesSnapshot[c.id]);
+                }
+              } catch {}
+            }
+            loadLineCfg();
+          }
         } catch { $("whitelistMsg").textContent = "移除失敗: 連不上控制台服務"; $("whitelistMsg").style.color = "var(--err)"; }
         b.disabled = false;
       });
-      action.appendChild(b);
-      box.appendChild(row);
+      action.append(toggleBtn, b);
+      itemWrap.append(row, editor);
+      box.appendChild(itemWrap);
     }
+    const saveWrap = document.createElement("div");
+    saveWrap.style.marginTop = "12px";
+    const saveProfilesBtn = document.createElement("button");
+    saveProfilesBtn.type = "button"; saveProfilesBtn.id = "btnSaveChatProfiles"; saveProfilesBtn.textContent = "儲存各群設定";
+    const saveProfilesMsg = document.createElement("span");
+    saveProfilesMsg.className = "test-result"; saveProfilesMsg.id = "chatProfilesMsg";
+    saveProfilesBtn.addEventListener("click", () => saveChatProfiles(saveProfilesBtn, saveProfilesMsg));
+    saveWrap.append(saveProfilesBtn, saveProfilesMsg);
+    box.appendChild(saveWrap);
+    const orphanBox = document.createElement("div");
+    orphanBox.id = "orphanProfiles"; orphanBox.style.marginTop = "10px";
+    box.appendChild(orphanBox);
+    renderOrphanProfiles(orphanBox);
   } catch { box.innerHTML = ""; }
 }
 async function loadLog() {

@@ -7,6 +7,7 @@ import { evaluateTrigger, markAnswered, markTriggered, createTriggerState, local
 import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, scamVerdictText, scamWarningText, PerMinuteLimiter } from "./scam.mjs";
 import { SECRET_NAMES, DEFAULT_CREATOR_REPLY, DEFAULT_ROLE_PROMPT } from "./config.mjs";
+import { resolveChatSettings, buildScopeGuardSection, classifyAnswerKind, guidanceForChat } from "./chatprofile.mjs";
 import { matchNotifyRules, planTargets, NOTIFY_EVENT_KINDS } from "./adminnotify.mjs";
 import { isValidJevToken } from "./jev.mjs";
 
@@ -228,11 +229,12 @@ export const DECRYPT_MISSED_MIN_COUNT = 2;
 export const DECRYPT_SEEN_IDS_CAP = 300;
 
 export class HelperBot {
-  constructor({ settings, secrets, ai, kb, logger, registry, reconnectDelaysMs, dailyStatePath = "", decryptMissedOptions, adminEvents = null } = {}) {
+  constructor({ settings, secrets, ai, kb, kbPool, logger, registry, reconnectDelaysMs, dailyStatePath = "", decryptMissedOptions, adminEvents = null } = {}) {
     this.settings = settings; // SettingsStore
     this.secrets = secrets;
     this.ai = ai;
-    this.kb = kb;
+    this.kbPool = kbPool ?? null;
+    this.kb = kb ?? (this.kbPool ? this.kbPool.globalKb() : kb);
     this.logger = logger;
     // 訊息寄件者登記簿: 認定被引用的訊息是不是機器人自己發的 (引用續答觸發用)
     this.registry = registry ?? new MessageSenderRegistry({ logger });
@@ -484,6 +486,11 @@ export class HelperBot {
     return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
   cfg() { return this.settings.get(); }
+  kbInstanceFor(resolved, chatId) {
+    if (!resolved?.kbEnabled) return null;
+    if (this.kbPool) return this.kbPool.forFolder(chatId, resolved.kbFolder);
+    return this.kb ?? null;
+  }
   rollStats() {
     const d = localDateKey();
     if (this.stats.date !== d) this.stats = { date: d, answered: 0, triggered: 0, scamChecked: 0, scamWarned: 0, scamScanned: 0 };
@@ -503,6 +510,7 @@ export class HelperBot {
       aiActive: s.ai.active,
       aiModel: s.ai.providers[s.ai.active]?.model ?? "",
       kb: this.kb ? this.kb.status() : null,
+      kbChats: this.kbPool ? this.kbPool.chatStatuses() : {},
       scam: {
         enabled: s.scam.enabled, threshold: s.scam.threshold, checkedToday: this.stats.scamChecked, warnedToday: this.stats.scamWarned, scannedToday: this.stats.scamScanned,
         // Jev 誠實狀態 (防詐騙頁顯示用): state 四態 + 最近成功時間 + 最近失敗的白話原因
@@ -1261,6 +1269,7 @@ export class HelperBot {
   }
 
   async handleTrigger(m, s) {
+    const chatCfg = resolveChatSettings(s, m.channelId);
     // 引用續答: 引用的是機器人自己的訊息時, 視同被名字觸發 (認定方式見 isQuotedSelf)
     const quotedSelf = m.replyTo ? await this.isQuotedSelf(m) : false;
     const verdict = evaluateTrigger({ text: m.text, senderId: m.senderId, selfId: this.selfId, settings: s, state: this.triggerState, quotedSelf });
@@ -1285,7 +1294,7 @@ export class HelperBot {
       // 只打名字回引導訊息不記冷卻 (2026-10-20 驗收修復): 引導只是打招呼, 若它也吃掉 20 秒冷卻,
       // 使用者照引導馬上補上真正的問題 (同一分鐘內) 會被冷卻靜默擋下, 看起來像機器人壞掉。
       // 冷卻只記在真正的問答觸發上 (下方 markTriggered), 防連珠炮洗版的效果不變。
-      await this.sendText(m.channelId, guidanceText(s.botName), m.messageId).catch(() => {});
+      await this.sendText(m.channelId, guidanceForChat(s.botName, chatCfg), m.messageId).catch(() => {});
       this.recordActivity({ kind: "name_only", m });
       return;
     }
@@ -1319,11 +1328,12 @@ export class HelperBot {
       await this.sendText(m.channelId, scamVerdictText(v), m.messageId).catch(() => {});
       return;
     }
-    // 知識庫優先
-    const hits = this.kb ? this.kb.search(question, 3) : [];
+    // 知識庫優先 (照本群設定: 關閉的群不查、專屬資料夾只查該群那一份)
+    const kbInst = this.kbInstanceFor(chatCfg, m.channelId);
+    const hits = kbInst ? kbInst.search(question, 3) : [];
     const companyLike = COMPANY_HINTS.some((h) => question.includes(h));
     this.logger?.info("知識庫", hits.length ? "知識庫命中" : "知識庫未命中", { id: m.messageId, chunks: hits.map((h) => h.chunkId) });
-    if (!hits.length && companyLike) {
+    if (!hits.length && companyLike && chatCfg.kbEnabled) {
       const missText = kbMissText();
       await this.sendText(m.channelId, missText, m.messageId).catch(() => {});
       markAnswered(this.triggerState);
@@ -1341,11 +1351,10 @@ export class HelperBot {
     const nameLine = s.botName ? `你的名字是「${s.botName}」, 同事這樣叫你時就是在叫你。` : "";
     // 人設注入 (第 3 項): 非空欄位逐項寫入 system prompt, 年紀由出生日自動計算, 並附空欄位誠實回答規則
     const personaSection = buildPersonaSection(s.persona);
-    // 回答範圍注入 (2026-10-21): scopePrompt 非空才有段落; 清空 = 不限制範圍 (見 buildScopeSection)
-    const scopeSection = buildScopeSection(s.ai?.scopePrompt);
-    // 角色定位 (2026-10-21 改為可編輯欄位): 以 ai.rolePrompt 取代舊寫死首句, 放在組裝後的最前面;
-    // 欄位異常為空時退回出廠預設 (正常路徑下儲存時已自動回復預設, 這裡是最後防線)。
-    const roleSection = typeof s.ai?.rolePrompt === "string" && s.ai.rolePrompt.trim() ? s.ai.rolePrompt.trim() : DEFAULT_ROLE_PROMPT;
+    // 回答範圍注入: 用本群解析後的 scopePrompt + 把關規則; 清空 = 不限制範圍 (見 buildScopeGuardSection)
+    const scopeSection = buildScopeGuardSection(chatCfg.scopePrompt);
+    // 角色定位: 用本群解析後的 rolePrompt (resolver 已處理空退預設), 放在組裝後的最前面
+    const roleSection = typeof chatCfg.rolePrompt === "string" && chatCfg.rolePrompt.trim() ? chatCfg.rolePrompt.trim() : DEFAULT_ROLE_PROMPT;
     const messages = [
       { role: "system", content: `${roleSection}\n${s.ai.systemPrompt}\n${nameLine}${scopeSection ? `\n${scopeSection}` : ""}\n${personaSection}\n${LINE_FORMAT_RULE}` },
       ...mem,
@@ -1397,7 +1406,7 @@ export class HelperBot {
     const count = markAnswered(this.triggerState);
     this.stats.answered++;
     this.persistDaily();
-    this.recordActivity({ kind: aiFailedKind || "answered", m, answerChars: answer.length, ms: aiMs, answerText: aiFailedKind ? null : answer });
+    this.recordActivity({ kind: aiFailedKind || classifyAnswerKind(answer) || "answered", m, answerChars: answer.length, ms: aiMs, answerText: aiFailedKind ? null : answer });
     // 管理員通知 (答不出來 / 自己出狀況): AI 連不上或忙碌要讓管理員知道; 回答根本送不出去是另一種
     if (aiFailedKind === "ai_failed") {
       this.raiseAdminEvent("unanswered", {
