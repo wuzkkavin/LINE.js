@@ -181,8 +181,15 @@ export function createConsoleServer({ settings, secrets, ai, kb, kbPool, bot, lo
         return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, event: r.event } : { ok: false, message: r.errors.join("；") });
       }
       // 管理員候選名單 (第四階段): 白名單群組近期發言者 + OpenChat 管理員, 供「管理員名單」勾選
+      // 可選 query 參數 chat (修復版6): 有給時只回該聊天室的候選 (供聊天室管理頁勾選本室管理員)
+      // 可選 query 參數 all=1 (修復版6 擴充, 選人原則「人多的情境先行」): 預設只列近期在該室
+      // 發言過的人 + 該室社群管理員; all=1 放寬為曾記錄過的本室發言者全部 + 該室社群管理員。
+      // 平台事實 (已查證): 機器人 API 沒有列出群組完整成員名單的接口, all 模式涵蓋的是
+      // 「曾在本室出現過的人 + 社群管理員」, 從未出現過的人列不出來, 回應不假裝是全員名單。
       if (req.method === "GET" && path === "/api/admin-candidates") {
-        const candidates = bot ? await bot.adminCandidates().catch(() => []) : [];
+        const chat = url.searchParams.get("chat") ?? "";
+        const all = url.searchParams.get("all") === "1";
+        const candidates = bot ? await bot.adminCandidates(chat, { all }).catch(() => []) : [];
         return json(res, 200, { ok: true, candidates });
       }
       // 教材庫 (第三階段): 「發送群組訊息」可重複取用的圖片/檔案, 存 helper 資料目錄

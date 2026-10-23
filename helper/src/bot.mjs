@@ -6,8 +6,8 @@ import { dirname } from "node:path";
 import { evaluateTrigger, markAnswered, markTriggered, createTriggerState, localDateKey } from "./trigger.mjs";
 import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, scamVerdictText, scamWarningText, PerMinuteLimiter } from "./scam.mjs";
-import { SECRET_NAMES, DEFAULT_CREATOR_REPLY, DEFAULT_ROLE_PROMPT } from "./config.mjs";
-import { resolveChatSettings, buildScopeGuardSection, classifyAnswerKind, guidanceForChat, isChattyEnabled, CONFIDENTIALITY_RULE } from "./chatprofile.mjs";
+import { SECRET_NAMES, DEFAULT_ROLE_PROMPT } from "./config.mjs";
+import { resolveChatSettings, buildScopeGuardSection, classifyAnswerKind, guidanceForChat, isChattyEnabled, getChatAdmins, CONFIDENTIALITY_RULE } from "./chatprofile.mjs";
 import { ChattyTracker, CHATTY_INSTRUCTIONS, parseChattyReply, CHATTY_REPLY_MAX_TOKENS } from "./chatty.mjs";
 import { matchNotifyRules, planTargets, NOTIFY_EVENT_KINDS } from "./adminnotify.mjs";
 import { isValidJevToken } from "./jev.mjs";
@@ -134,8 +134,9 @@ export function splitLongText(text, limit = TEXT_SEND_LIMIT) {
   return chunks.filter((c) => c.length);
 }
 
-// --- 創造者意圖判定 (修復批次一, 第 2 項) ---
-// 命中就直接回 settings.creatorReply, 不呼叫 AI。判定分兩層, 目的是降低誤觸:
+// --- 創造者意圖判定 (修復批次一, 第 2 項; 修復版6 起僅供既有測試與 isConfidentialIntent 內部參考) ---
+// 修復版6 起命中機敏意圖改回委婉拒答 (見 isConfidentialIntent 與 CONFIDENTIAL_DEFLECTION), 不再回 creatorReply。
+// 本函式邏輯保留不改弱: 命中判定分兩層, 目的是降低誤觸:
 // 1. 「版權 / copyright」是強訊號: 在跟機器人的對話裡問版權, 幾乎就是問機器人本身, 直接命中。
 // 2. 其他創造者關鍵詞 (誰開發、作者是誰…) 太常見, 必須同時提到機器人本身才命中:
 //    機器人名字/別名、你、這個機器人、此機器人、機器人。主詞是外部事物時不命中,
@@ -153,6 +154,57 @@ export function isCreatorIntent(text, settings = {}) {
   const names = [settings.botName, ...(settings.aliases ?? [])].filter((s) => typeof s === "string" && s.trim()).map((s) => s.trim());
   if (names.some((n) => text.includes(n))) return true;
   return BOT_REF_WORDS.some((w) => text.includes(w));
+}
+
+// --- 機敏意圖判定 (修復版6, 老吳 2026-10-24 定案並擴充) ---
+// 機敏四類: 創作者資訊、版權宣告、版權屬性、機器人是用何技術建立的 (技術/實作細節)。
+// 命中就回固定的委婉拒答 CONFIDENTIAL_DEFLECTION, 不呼叫 AI、不附來源、不證實不否認。
+// 判定比舊版創造者判定更嚴格: 一般版權問題與一般技術問題不得誤攔, 說明見各段註解。
+export const CONFIDENTIAL_DEFLECTION = "這部分我不方便透露唷。我們聊聊電腦方面的事吧——有什麼想問的嗎？";
+
+// 版權類關鍵詞 (修復版6): 含這些詞還不夠, 必須同時指涉本程式/機器人本身才命中。
+const CONFIDENTIAL_COPYRIGHT_KEYWORDS = ["版權", "copyright", "著作權", "授權條款", "版權宣告"];
+// 版權類的自我指涉詞: 機器人名字/別名另外比對; 「你的版權」「版權是誰」這類問法另在函式內處理。
+const CONFIDENTIAL_SELF_WORDS = ["程式", "機器人", "小幫手", "這個系統", "這支程式", "這個程式", "本程式", "本系統", "你的版權", "你的著作權"];
+// 技術類關鍵詞 (修復版6 擴充): 單獨出現不攔, 必須與自我指涉詞共現才命中。
+const CONFIDENTIAL_TECH_KEYWORDS = ["技術", "程式語言", "框架", "架構", "原始碼", "原始程式碼", "source code", "程式碼", "用什麼做的", "用什麼寫的", "用什麼開發", "怎麼做的", "怎麼寫的", "如何開發", "怎麼開發"];
+// 技術類的自我指涉詞: 含 botName/別名 (函式內比對)、「你」與各式指稱本程式的說法。
+const CONFIDENTIAL_TECH_REF_WORDS = ["你", "這支程式", "這個程式", "這套程式", "本程式", "機器人", "小幫手", "你的", "這個系統", "本系統"];
+
+export function isConfidentialIntent(text, settings = {}) {
+  if (typeof text !== "string" || !text.trim()) return false;
+  const lower = text.toLowerCase();
+  const names = [settings.botName, ...(settings.aliases ?? [])].filter((s) => typeof s === "string" && s.trim()).map((s) => s.trim());
+  const hasName = names.some((n) => text.includes(n));
+  // (a) 創造者類: 沿用 isCreatorIntent 的創造者關鍵詞邏輯 (關鍵詞 + 提到機器人本身)。
+  // 注意不直接沿用其「版權一律命中」的舊強訊號: 版權類改走下方 (b) 的嚴格判定,
+  // 否則「請問圖片版權怎麼判斷？」這類一般版權問題會被誤攔 (修復版6 明定不攔)。
+  if (CREATOR_KEYWORDS.some((k) => text.includes(k)) && (hasName || BOT_REF_WORDS.some((w) => text.includes(w)))) return true;
+  // (b) 版權類: 版權關鍵詞 + 指涉本程式/機器人本身才命中。
+  if (CONFIDENTIAL_COPYRIGHT_KEYWORDS.some((k) => lower.includes(k))) {
+    if (hasName) return true;
+    if (CONFIDENTIAL_SELF_WORDS.some((w) => text.includes(w))) return true;
+    // 省略主詞的問法 (在跟機器人的對話裡就是問機器人本身): 「版權是誰/屬於誰/歸誰」開頭、
+    // 且沒有「某事物的版權是誰」這種明確外部主詞時命中; 有外部主詞 (如 Excel 的版權是誰) 不命中。
+    const bareZh = /^\s*版權(是誰|屬於誰|歸誰|到底是誰)/.test(text);
+    const externalZh = /[^\s，,、:：]{1,20}的版權(是誰|屬於誰|歸誰)/.test(text);
+    if (bareZh && !externalZh) return true;
+    const bareEn = /^\s*who\b[^.?!]*\bcopyright\b/i.test(text) || /^\s*whose\b[^.?!]*\bcopyright\b/i.test(text);
+    const externalEn = /\b(image|photo|picture|song|music|book|article|excel|word|powerpoint)\b/i.test(text);
+    if (bareEn && !externalEn) return true;
+  }
+  // (c) 技術類: 技術詞 + 指涉本程式/機器人本身共現才命中; 問別的產品/一般技術不攔
+  // (例: 「Python 是什麼程式語言？」沒有自我指涉、「LINE 是哪家公司開發的？」主詞是別的產品, 都不命中)。
+  // 「開發」一詞另外處理: 它同時是創造者關鍵詞, 上方 (a) 已涵蓋有自我指涉的情況;
+  // 這裡把「開發」也算技術詞, 讓「你這支程式怎麼開發的」這類問法同樣命中。
+  const techHit = CONFIDENTIAL_TECH_KEYWORDS.some((k) => lower.includes(k)) || text.includes("開發");
+  if (techHit && (hasName || CONFIDENTIAL_TECH_REF_WORDS.some((w) => text.includes(w)))) {
+    // 守門: 主詞明確是別的產品時不攔 — 問句以外部產品名開頭且沒有點名機器人/「你」指稱自己時,
+    // 例如「LINE 是哪家公司開發的？」不含 hasName 與「你」, 本來就不會走到這裡;
+    // 「Excel 是誰開發的」同理 (無自我指涉)。走到這裡代表已有自我指涉, 視為問機器人本身。
+    return true;
+  }
+  return false;
 }
 
 // --- 機器人人設 (修復批次一, 第 3 項) ---
@@ -228,6 +280,10 @@ export const DECRYPT_MISSED_GRACE_MS = 120_000;
 export const DECRYPT_MISSED_MIN_COUNT = 2;
 // 每聊天室記住的「已收到事件」訊息 ID 上限 (漏接比對用; 只存 ID, 不存內容)。
 export const DECRYPT_SEEN_IDS_CAP = 300;
+
+// 管理員候選的「近期」時間窗 (修復版6 擴充): 預設候選名單只列最近 30 天內在該室發言過的人
+// (與訊息登記簿的保留期同為 30 天); all 模式不套此窗, 列出曾記錄過的全部本室發言者。
+export const ADMIN_CANDIDATE_RECENT_MS = 30 * 24 * 60 * 60 * 1000;
 
 export class HelperBot {
   constructor({ settings, secrets, ai, kb, kbPool, logger, registry, reconnectDelaysMs, dailyStatePath = "", decryptMissedOptions, adminEvents = null, chattyOptions = null } = {}) {
@@ -413,14 +469,32 @@ export class HelperBot {
         for (const id of ids) union.add(id);
       }
       const mergedRule = { notifyAdminIds: notifyAll ? [] : [...union] };
+      // 收件人解析 (修復版6): 這個聊天室有自己的管理員 -> 通知該室全部自訂管理員
+      // (規則只決定事件要不要通知, 不再以全域名單挑人); 沒有 -> 沿用全域邏輯 (mergedRule 篩 notify.admins)。
       // @ 可行性: 有在這個聊天室發言紀錄 = hasSpoken true; 完全查不到這個聊天室的發言紀錄時
       // 不給 presence (planTargets 預設可 @, 送出端真的被核心擋下時殼端會改用寫名字並註明)。
-      const speakers = this.chatSpeakers.get(chatId);
-      const presence = {};
-      if (speakers) {
-        for (const a of notify.admins ?? []) presence[a.id] = { hasSpoken: speakers.has(a.id) };
+      // presence 只針對實際收件池的 id 由 chatSpeakers 計算。
+      const chatAdmins = getChatAdmins(s, chatId);
+      let targets;
+      let pool;
+      if (chatAdmins.length > 0) {
+        pool = "chat";
+        const speakers = this.chatSpeakers.get(chatId);
+        const presence = {};
+        if (speakers) {
+          for (const a of chatAdmins) presence[a.id] = { hasSpoken: speakers.has(a.id) };
+        }
+        targets = planTargets({ rule: { notifyAdminIds: [] }, admins: chatAdmins, presence });
+      } else {
+        pool = "global";
+        const speakers = this.chatSpeakers.get(chatId);
+        const presence = {};
+        if (speakers) {
+          for (const a of notify.admins ?? []) presence[a.id] = { hasSpoken: speakers.has(a.id) };
+        }
+        targets = planTargets({ rule: mergedRule, admins: notify.admins ?? [], presence });
       }
-      const targets = planTargets({ rule: mergedRule, admins: notify.admins ?? [], presence });
+      this.logger?.debugLog("管理員通知", "收件人解析", { kind, chat: chatId, pool, count: targets.length });
       const now = new Date();
       const p2 = (n) => String(n).padStart(2, "0");
       const timeText = `${p2(now.getHours())}:${p2(now.getMinutes())}`;
@@ -465,7 +539,16 @@ export class HelperBot {
 
   // 管理員候選名單: ① 白名單群組近期發言者 (noteSpeaker 累積) ② OpenChat 管理員查詢。
   // 回 [{ id, name, chats: [聊天室名], source }] — 殼端「管理員名單」勾選清單的來源, 不用手打代號。
-  async adminCandidates() {
+  // 給 chatId 時 (修復版6) 只回該室候選: 只取該室的 chatSpeakers 與該室的社群管理員查詢結果;
+  // chatId 形狀不合法 (比照 linecfg 的格式) 回空陣列不報錯。不給時行為與先前完全相同。
+  // 選人原則 (修復版6 擴充, 老吳 2026-10-24 定案「人多的情境先行」):
+  // 預設 (all=false) 只列近期窗內在該室發言過的人 + 該室社群管理員, 人多時先看這份短名單;
+  // all=true 才放寬為「曾記錄過的本室發言者」全部 (chatSpeakers 不套時間窗) + 該室社群管理員, 去重、形狀相同。
+  // 平台事實 (已查證): 機器人 API 沒有列出群組完整成員名單的接口, 所以 all 模式涵蓋的也只是
+  // 「曾在本室出現過的人 + 社群管理員」, 從未出現過的人列不出來 — 回應不要假裝是全員名單。
+  async adminCandidates(chatId = "", { all = false } = {}) {
+    const specific = typeof chatId === "string" ? chatId : "";
+    if (specific && !/^[crums][0-9a-f]{32}$/.test(specific)) return [];
     const byId = new Map();
     const add = (id, name, chatName, source) => {
       if (!id) return;
@@ -475,15 +558,35 @@ export class HelperBot {
       if (source === "openchat-admin") cur.source = "openchat-admin";
       byId.set(id, cur);
     };
-    for (const [chatId, speakers] of this.chatSpeakers) {
-      const chatName = this.chatNames.get(chatId) ?? "";
+    if (specific) {
+      const speakers = this.chatSpeakers.get(specific);
+      const chatName = this.chatNames.get(specific) ?? "";
+      if (speakers) {
+        const cutoff = Date.now() - ADMIN_CANDIDATE_RECENT_MS;
+        for (const [id, info] of speakers) {
+          // 預設只列近期窗內的發言者; all 模式不套時間窗, 曾記錄過的都列。
+          // lastAt 缺失或非數字 (形狀不齊的舊紀錄) 不排除, 避免把人默默漏掉。
+          if (!all && typeof info?.lastAt === "number" && info.lastAt < cutoff) continue;
+          add(id, info.name, chatName, "speaker");
+        }
+      }
+      if (this.connected) {
+        try {
+          const frame = await this.queryChatAdmins(specific);
+          for (const a of frame?.admins ?? []) add(a.userId, a.displayName ?? "", chatName, "openchat-admin");
+        } catch { /* 不是 OpenChat 或查不到: 略過, 發言者來源已涵蓋 */ }
+      }
+      return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
+    }
+    for (const [cid, speakers] of this.chatSpeakers) {
+      const chatName = this.chatNames.get(cid) ?? "";
       for (const [id, info] of speakers) add(id, info.name, chatName, "speaker");
     }
     if (this.connected) {
-      for (const chatId of [...this.botChats]) {
+      for (const cid of [...this.botChats]) {
         try {
-          const frame = await this.queryChatAdmins(chatId);
-          const chatName = this.chatNames.get(chatId) ?? "";
+          const frame = await this.queryChatAdmins(cid);
+          const chatName = this.chatNames.get(cid) ?? "";
           for (const a of frame?.admins ?? []) add(a.userId, a.displayName ?? "", chatName, "openchat-admin");
         } catch { /* 不是 OpenChat 或查不到: 略過, 發言者來源已涵蓋 */ }
       }
@@ -1401,20 +1504,21 @@ export class HelperBot {
     markTriggered(this.triggerState, m.senderId);
     this.stats.triggered++;
     const question = verdict.question;
-    // 創造者意圖: 直接回固定答覆, 不呼叫 AI、不附來源; 冷卻與每日上限已在 evaluateTrigger/markAnswered 照常計入。
+    // 機敏意圖 (修復版6): 創作者/版權/技術實作等機敏問題改回委婉拒答, 不呼叫 AI、不附來源、
+    // 不再讀 settings.creatorReply; 冷卻與每日上限已在 evaluateTrigger/markAnswered 照常計入。
     // 判定文字用 question (已去掉觸發名字); 例外: 「AI寶的作者是誰」去掉名字後 question 會以「的」開頭,
     // 那是所有格殘留 (主詞就是機器人本身), 補回名字再判定, 否則會漏判。
-    const creatorText = question.startsWith("的") ? `${s.botName ?? ""}${question}` : question;
-    if (isCreatorIntent(creatorText, s)) {
-      const reply = typeof s.creatorReply === "string" && s.creatorReply.trim() ? s.creatorReply : DEFAULT_CREATOR_REPLY;
-      await this.sendText(m.channelId, reply, m.messageId).catch((e) => this.logger?.error("機器人回覆", "創造者固定答覆送出失敗", { error: String(e?.message ?? e) }));
+    const confidentialText = question.startsWith("的") ? `${s.botName ?? ""}${question}` : question;
+    if (isConfidentialIntent(confidentialText, s)) {
+      const reply = CONFIDENTIAL_DEFLECTION;
+      await this.sendText(m.channelId, reply, m.messageId).catch((e) => this.logger?.error("機器人回覆", "機敏委婉拒答送出失敗", { error: String(e?.message ?? e) }));
       markAnswered(this.triggerState);
       this.stats.answered++;
       this.persistDaily();
       this.recordActivity({ kind: "answered", m, answerChars: reply.length, answerText: reply });
       const mem0 = this.memory.get(m.channelId) ?? [];
       this.memory.set(m.channelId, [...mem0, { role: "user", content: question }, { role: "assistant", content: reply }].slice(-(s.ai.memoryTurns ?? 6) * 2));
-      this.logger?.info("機器人回覆", "已回覆創造者固定答覆 (未呼叫 AI)", { id: m.messageId });
+      this.logger?.info("機器人回覆", "已回覆機敏委婉拒答", { id: m.messageId });
       return true;
     }
     // 手動防詐騙判讀

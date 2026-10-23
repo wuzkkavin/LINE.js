@@ -14,7 +14,7 @@ import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, ruleFallb
 import { createConsoleServer } from "../src/server.mjs";
 import { parseApiSection, applyApiConfig, applyCoreApiConfig, readCoreApiStatus, isValidChatId, removeApiChat } from "../src/linecfg.mjs";
 import { MessageSenderRegistry } from "../src/msgregistry.mjs";
-import { HelperBot, isCreatorIntent, calculateAge, buildPersonaSection, buildScopeSection, cleanAnswerText, QUOTE_HISTORY_PAGES, answerFilename, splitLongText, TEXT_SEND_LIMIT, LINE_FORMAT_RULE } from "../src/bot.mjs";
+import { HelperBot, isCreatorIntent, isConfidentialIntent, CONFIDENTIAL_DEFLECTION, calculateAge, buildPersonaSection, buildScopeSection, cleanAnswerText, QUOTE_HISTORY_PAGES, answerFilename, splitLongText, TEXT_SEND_LIMIT, LINE_FORMAT_RULE } from "../src/bot.mjs";
 import { coreEndpoints, fetchCoreChannels, shapeChatList } from "../src/corechats.mjs";
 import { WebSocketServer } from "ws";
 import { createAiClient as aiFactory } from "../src/ai.mjs";
@@ -536,7 +536,7 @@ test("console: 設定 API 遮罩、頁面有粉圓字體與動態標題, 診斷�
   assert.ok(html.includes("Huninn"));
   assert.ok(html.includes("名字由你自訂"));
   assert.ok(html.includes("回答時附上參考來源"), "知識庫區應有參考來源開關");
-  assert.ok(html.includes("創造者問題的固定回覆"), "機器人區應有創造者固定回覆欄位");
+  assert.ok(html.includes("委婉拒答") && html.includes("機敏"), "機器人區應有機敏委婉拒答說明 (修復版6 起取代創造者固定回覆欄位)");
   assert.ok(html.includes("機器人人設") && html.includes("出生日"), "機器人區應有人設欄位組");
   const view = await (await fetch(base + "/api/settings")).json();
   assert.ok(!JSON.stringify(view).includes("sk-CONSOLE-KEY-5555qrst"));
@@ -1037,26 +1037,74 @@ async function startBotHarness(t, { settingsOver = {}, kbFolder = "", aiHandler 
   return { bot, settings, aiBodies, inject, injectRaw, waitSent, sentFrames };
 }
 
-test("bot: 創造者問題直接回固定答覆 (不呼叫 AI); Excel 誰開發的照常問 AI; 所有格問句也命中", async (t) => {
+test("confidential: 機敏意圖判定 (修復版6) — 創作者/版權/技術命中, 一般版權與一般技術不命中", () => {
+  const s = { botName: "AI寶", aliases: ["阿寶"] };
+  // 創作者類 (沿用既有創造者判定)
+  assert.equal(isConfidentialIntent("你是誰創造的？", s), true);
+  assert.equal(isConfidentialIntent("AI寶 的作者是誰", s), true);
+  assert.equal(isConfidentialIntent("這個機器人的開發者是誰？", s), true);
+  // 版權類: 指涉機器人本身才命中
+  assert.equal(isConfidentialIntent("AI寶，你的版權是誰的？", s), true);
+  assert.equal(isConfidentialIntent("版權屬於誰", s), true);
+  assert.equal(isConfidentialIntent("請問圖片版權怎麼判斷？", s), false, "一般版權問題不應命中");
+  assert.equal(isConfidentialIntent("Excel 的版權是誰的", s), false, "問別的產品的版權不應命中");
+  // 技術類: 技術詞 + 指涉機器人本身才命中
+  assert.equal(isConfidentialIntent("AI寶 你是用什麼技術做的？", s), true);
+  assert.equal(isConfidentialIntent("你是用哪個程式語言寫的？", s), true);
+  assert.equal(isConfidentialIntent("你的原始碼可以看嗎？", s), true);
+  assert.equal(isConfidentialIntent("這支程式的架構是什麼？", s), true);
+  assert.equal(isConfidentialIntent("Python 是什麼程式語言？", s), false, "一般技術問題不應命中");
+  assert.equal(isConfidentialIntent("Excel 的樞紐分析怎麼做？", s), false, "一般技術問題不應命中");
+  assert.equal(isConfidentialIntent("LINE 是哪家公司開發的？", s), false, "問別的產品不應命中");
+  // 既有不命中行為不變
+  assert.equal(isConfidentialIntent("Excel 是誰開發的", s), false);
+  assert.equal(isConfidentialIntent("Excel 怎麼凍結窗格？", s), false);
+  assert.equal(isConfidentialIntent("", s), false);
+  // 委婉拒答常數本身不得含創作者姓名或版權字樣
+  assert.ok(!CONFIDENTIAL_DEFLECTION.includes("吳治綱"), "拒答常數不得含創作者姓名");
+  assert.ok(!/版權|copyright/i.test(CONFIDENTIAL_DEFLECTION), "拒答常數不得含版權字樣");
+});
+
+test("bot: 機敏問題回委婉拒答 (修復版6, 不呼叫 AI、不再用 creatorReply); 一般問題照常問 AI", async (t) => {
   const h = await startBotHarness(t);
   h.inject("m1", "u-a", "AI寶，你是誰創造的？");
-  const sent1 = await h.waitSent((f) => f.replyTo === "m1", "creator reply");
-  assert.equal(sent1.text, DEFAULT_CREATOR_REPLY);
-  assert.equal(h.aiBodies.length, 0, "創造者問題不應呼叫 AI");
+  const sent1 = await h.waitSent((f) => f.replyTo === "m1", "confidential deflection");
+  assert.equal(sent1.text, CONFIDENTIAL_DEFLECTION);
+  assert.ok(!sent1.text.includes(DEFAULT_CREATOR_REPLY), "拒答不得含舊 creatorReply 內容");
+  assert.ok(!sent1.text.includes("吳治綱"), "拒答不得含創作者姓名");
+  assert.equal(h.aiBodies.length, 0, "機敏問題不應呼叫 AI");
   h.inject("m2", "u-b", "AI寶，Excel 是誰開發的？");
   const sent2 = await h.waitSent((f) => f.replyTo === "m2", "excel reply");
   assert.equal(sent2.text, "這是一般回答。");
   assert.equal(h.aiBodies.length, 1, "外部主詞問題應照常呼叫 AI");
   h.inject("m3", "u-c", "AI寶的作者是誰");
-  const sent3 = await h.waitSent((f) => f.replyTo === "m3", "possessive creator reply");
-  assert.equal(sent3.text, DEFAULT_CREATOR_REPLY);
+  const sent3 = await h.waitSent((f) => f.replyTo === "m3", "possessive confidential deflection");
+  assert.equal(sent3.text, CONFIDENTIAL_DEFLECTION);
   assert.equal(h.aiBodies.length, 1, "所有格問句命中後不應再呼叫 AI");
-  // 自訂 creatorReply 後照新值回
+  // 就算設定裡有自訂 creatorReply, 修復版6 起也不再使用, 照樣回委婉拒答
   h.settings.update({ creatorReply: "我是老吳做的機器人" });
   h.inject("m4", "u-d", "AI寶，版權屬於誰？");
-  const sent4 = await h.waitSent((f) => f.replyTo === "m4", "custom creator reply");
-  assert.equal(sent4.text, "我是老吳做的機器人");
+  const sent4 = await h.waitSent((f) => f.replyTo === "m4", "copyright deflection despite custom creatorReply");
+  assert.equal(sent4.text, CONFIDENTIAL_DEFLECTION);
   assert.equal(h.aiBodies.length, 1);
+  // 版權指涉機器人本身 -> 拒答; 一般版權問題 -> 照常問 AI
+  h.inject("m5", "u-e", "AI寶，你的版權是誰的？");
+  const sent5 = await h.waitSent((f) => f.replyTo === "m5", "own copyright deflection");
+  assert.equal(sent5.text, CONFIDENTIAL_DEFLECTION);
+  assert.equal(h.aiBodies.length, 1);
+  h.inject("m6", "u-f", "AI寶，請問圖片版權怎麼判斷？");
+  const sent6 = await h.waitSent((f) => f.replyTo === "m6", "generic copyright goes to AI");
+  assert.equal(sent6.text, "這是一般回答。");
+  assert.equal(h.aiBodies.length, 2, "一般版權問題應照常呼叫 AI");
+  // 技術指涉機器人本身 -> 拒答; 一般技術問題 -> 照常問 AI
+  h.inject("m7", "u-g", "AI寶，你是用什麼技術做的？");
+  const sent7 = await h.waitSent((f) => f.replyTo === "m7", "tech deflection");
+  assert.equal(sent7.text, CONFIDENTIAL_DEFLECTION);
+  assert.equal(h.aiBodies.length, 2);
+  h.inject("m8", "u-h", "AI寶，Python 是什麼程式語言？");
+  const sent8 = await h.waitSent((f) => f.replyTo === "m8", "generic tech goes to AI");
+  assert.equal(sent8.text, "這是一般回答。");
+  assert.equal(h.aiBodies.length, 3, "一般技術問題應照常呼叫 AI");
 });
 
 test("bot: 系統事件 (CHATEVENT) 不觸發問答 — 寬鬆模式含名字也不回; 一般提問照常", async (t) => {

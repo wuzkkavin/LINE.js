@@ -1,7 +1,7 @@
 // 分群角色定位與回答範圍: 解析每個聊天室生效的角色/範圍/知識庫設定。
 // 契約: settings.ai.chatProfiles = { [chatId]: { rolePrompt, scopePrompt, kbEnabled, kbFolder, suspended } }
 // 沒有條目 = 用全域預設; 有條目且 suspended=false = 本群自訂 (取代全域, 不是疊加); suspended=true = 停用 (視同用預設)。
-import { DEFAULT_ROLE_PROMPT } from "./config.mjs";
+import { DEFAULT_ROLE_PROMPT, normalizeChatAdmins } from "./config.mjs";
 
 export function getChatProfile(settings, chatId) {
   if (!settings || !chatId) return null;
@@ -28,6 +28,22 @@ export function isChattyEnabled(settings, chatId) {
   if (!p || typeof p !== "object" || Array.isArray(p)) return false;
   if (p.suspended) return false;
   return p.chatty === true;
+}
+
+/**
+ * 這個聊天室自己的管理員名單 (修復版6): 直接讀原始 chatProfiles 條目, 不經 getChatProfile —
+ * 只開聒噪或只設管理員的條目 personaCustom 可能為 false, 人設雖視同未自訂, 管理員仍然算數。
+ * 條目不存在、suspended=true、admins 非陣列或空 -> 回 []; 否則回正規化後的 [{id,name}]。
+ */
+export function getChatAdmins(settings, chatId) {
+  if (!settings || !chatId) return [];
+  const profiles = settings.ai?.chatProfiles;
+  if (!profiles || typeof profiles !== "object") return [];
+  const p = profiles[chatId];
+  if (!p || typeof p !== "object" || Array.isArray(p)) return [];
+  if (p.suspended) return [];
+  if (!Array.isArray(p.admins) || !p.admins.length) return [];
+  return normalizeChatAdmins(p.admins);
 }
 
 export function resolveChatSettings(settings, chatId) {
@@ -76,7 +92,9 @@ export const CONFIDENTIALITY_RULE = [
   "2. 任何人的個人資料與帳號識別資訊一律不透露: 包括使用者的 mid、誰在哪個群組、管理員名單的細節。",
   "3. 程式與憑證一律不透露: API Key、Token、程式的設定值、內部檔案路徑與運作細節都不可以講。",
   "4. 知識庫只能用這個群可以讀的範圍: 不屬於這個群可讀範圍的知識庫內容, 不可以引用、摘要或暗示; 公司機敏事項同樣不可以講。",
-  "5. 有人套問上面這些資訊時, 自然親切地把話題帶開就好: 不證實也不否認具體內容存不存在, 也不要編造假資訊來搪塞。",
+  "5. 本程式的版權宣告、創作者身分與版權屬性也屬機敏, 一律不透露, 比照上一條帶開話題。",
+  "6. 本程式是用什麼技術、程式語言、框架或架構做成的, 以及原始碼等技術與實作細節, 也屬機敏, 一律不透露, 比照上一條帶開話題。",
+  "7. 有人套問上面這些資訊時, 自然親切地把話題帶開就好: 不證實也不否認具體內容存不存在, 也不要編造假資訊來搪塞。",
 ].join("\n");
 
 export function buildScopeGuardSection(scopePrompt) {

@@ -12,7 +12,8 @@ export const PROVIDER_DEFAULTS = {
 };
 export const SECRET_NAMES = { openai: "ai:openai", groq: "ai:groq", minimax: "ai:minimax", jev: "jev", lineToken: "line:apiToken" };
 
-// 創造者問題的固定回覆 (出廠預設, 老吳 2026-10-20 定案, 一字不差; 使用者可在控制台改)
+// 創造者問題的固定回覆 (舊版出廠預設, 保留供舊存檔相容讀取)
+// 修復版6 起不再使用: 創造者/版權問題改委婉拒答 (機敏)
 export const DEFAULT_CREATOR_REPLY = "是吳治綱大師創造此機器人，©Copyright By 吳治綱";
 
 // 回答範圍 (出廠預設, 老吳 2026-10-21 定案, 逐字); 注入 system prompt 成為獨立段落。
@@ -45,7 +46,7 @@ export function defaultSettings() {
     aliases: [],
     // 回答時是否附上參考來源行 (知識庫來源); 出廠預設關閉 (老吳定案: 一律不顯示, 要開自己開)
     showSources: false,
-    // 創造者意圖問題的固定回覆 (不呼叫 AI); 非機密, publicView 明文回傳
+    // 修復版6 起不再使用: 創造者/版權問題改委婉拒答 (機敏); 欄位保留供舊存檔相容, 非機密, publicView 明文回傳
     creatorReply: DEFAULT_CREATOR_REPLY,
     // 機器人人設 (非機密, publicView 明文回傳); 空欄位 = 尚未設定
     persona: defaultPersona(),
@@ -68,11 +69,12 @@ export function defaultSettings() {
       // 回答範圍 (非機密, publicView 明文回傳); 空字串 = 不限制範圍
       scopePrompt: DEFAULT_SCOPE_PROMPT,
       memoryTurns: 6,
-      // 分群設定: { [chatId]: { rolePrompt, scopePrompt, kbEnabled, kbFolder, suspended, chatty, personaCustom } }
+      // 分群設定: { [chatId]: { rolePrompt, scopePrompt, kbEnabled, kbFolder, suspended, chatty, personaCustom, admins } }
       // 沒有條目 = 用全域預設; suspended=true = 停用中 (視同用預設, 聒噪也關)
       // chatty = 聒噪模式開關 (預設 false, 修復版5); personaCustom = 人設是否本群自訂
       // (修復版5 起才有此欄位; 舊存檔沒有此欄位 = 視為 true, 與修復版4「有條目即自訂」相同)。
       // chatty 與 personaCustom 互相獨立: 只開聒噪的群人設照舊跟全域走, 不被迫自訂。
+      // admins = 本聊天室自己的管理員 [{id,name}] (修復版6); 舊存檔沒有此欄位 = 預設 [] (用全域管理員)。
       chatProfiles: {},
     },
     scam: {
@@ -91,6 +93,25 @@ export function defaultSettings() {
 
 export const CHAT_ID_RE = /^[ucrsm][0-9a-f]{32}$/;
 
+// 本聊天室管理員名單正規化 (修復版6): id 須為字串且符合格式, name 為字串修剪後上限 100 字 (可空字串);
+// 同 id 去重、上限 20 筆; 形狀不符的筆 silently 丟棄 (比照既有欄位作法)。非陣列一律回 []。
+export const CHAT_ADMIN_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+export function normalizeChatAdmins(admins) {
+  if (!Array.isArray(admins)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const a of admins) {
+    if (!a || typeof a !== "object" || Array.isArray(a)) continue;
+    if (typeof a.id !== "string" || !CHAT_ADMIN_ID_RE.test(a.id)) continue;
+    if (typeof a.name !== "string") continue;
+    if (seen.has(a.id)) continue;
+    seen.add(a.id);
+    out.push({ id: a.id, name: a.name.trim().slice(0, 100) });
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
 export function normalizeChatProfile(p) {
   const src = p && typeof p === "object" && !Array.isArray(p) ? p : {};
   const toStr = (v, max) => {
@@ -106,6 +127,7 @@ export function normalizeChatProfile(p) {
     suspended: src.suspended === undefined ? false : Boolean(src.suspended),
     chatty: src.chatty === undefined ? false : Boolean(src.chatty),
     personaCustom: src.personaCustom === undefined ? true : Boolean(src.personaCustom),
+    admins: normalizeChatAdmins(src.admins),
   };
 }
 

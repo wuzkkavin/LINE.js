@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SettingsStore, DEFAULT_ROLE_PROMPT } from "../src/config.mjs";
-import { getChatProfile, resolveChatSettings, buildScopeGuardSection, SCOPE_GUARD_RULE, classifyAnswerKind, guidanceForChat, isChattyEnabled, CONFIDENTIALITY_RULE } from "../src/chatprofile.mjs";
+import { getChatProfile, getChatAdmins, resolveChatSettings, buildScopeGuardSection, SCOPE_GUARD_RULE, classifyAnswerKind, guidanceForChat, isChattyEnabled, CONFIDENTIALITY_RULE } from "../src/chatprofile.mjs";
 import { guidanceText } from "../src/bot.mjs";
 import { KbPool } from "../src/kb.mjs";
 
@@ -81,7 +81,7 @@ test("SettingsStore: chatProfiles 存讀來回一致", async () => {
   store.update({ ai: { chatProfiles: { [CHAT_B]: { rolePrompt: "B角色", scopePrompt: "B範圍", kbEnabled: false, kbFolder: "/tmp/b-kb", suspended: false } } } });
   const store2 = new SettingsStore({ path });
   // 修復版5 起多了 chatty (預設 false) 與 personaCustom (舊存檔缺此欄位預設 true)
-  assert.deepEqual(store2.get().ai.chatProfiles[CHAT_B], { rolePrompt: "B角色", scopePrompt: "B範圍", kbEnabled: false, kbFolder: "/tmp/b-kb", suspended: false, chatty: false, personaCustom: true });
+  assert.deepEqual(store2.get().ai.chatProfiles[CHAT_B], { rolePrompt: "B角色", scopePrompt: "B範圍", kbEnabled: false, kbFolder: "/tmp/b-kb", suspended: false, chatty: false, personaCustom: true, admins: [] });
   // 預設應有 chatProfiles 空物件
   assert.deepEqual(new SettingsStore({ path: join(dir, "fresh.json") }).get().ai.chatProfiles, {});
 });
@@ -159,6 +159,56 @@ test("chatty (修復版5): 只開聒噪的群人設仍走全域, isChattyEnabled
   assert.equal(resolveChatSettings(s, CHAT_C).source, "chat");
 });
 
+test("getChatAdmins (修復版6): 無條目/停用/非陣列回空, personaCustom=false 也有管理員, 形狀正規化去重上限", () => {
+  const s = baseSettings();
+  // 無條目 -> []
+  assert.deepEqual(getChatAdmins(s, CHAT_A), []);
+  // 舊存檔無 admins 欄位 -> []
+  s.ai.chatProfiles[CHAT_A] = { rolePrompt: "舊版角色", scopePrompt: "", kbEnabled: true, kbFolder: "", suspended: false };
+  assert.deepEqual(getChatAdmins(s, CHAT_A), []);
+  // admins 非陣列或空 -> []
+  s.ai.chatProfiles[CHAT_A] = { suspended: false, admins: "u-1" };
+  assert.deepEqual(getChatAdmins(s, CHAT_A), []);
+  s.ai.chatProfiles[CHAT_A] = { suspended: false, admins: [] };
+  assert.deepEqual(getChatAdmins(s, CHAT_A), []);
+  // personaCustom=false (只設管理員的條目) 仍讀得到管理員, 且人設解析仍走全域 (admins-only 不影響人設)
+  s.ai.chatProfiles[CHAT_A] = { rolePrompt: "", scopePrompt: "", kbEnabled: true, kbFolder: "", suspended: false, chatty: false, personaCustom: false, admins: [{ id: "u-chat1", name: "本室管理員甲" }, { id: "u-chat2", name: "" }] };
+  assert.deepEqual(getChatAdmins(s, CHAT_A), [{ id: "u-chat1", name: "本室管理員甲" }, { id: "u-chat2", name: "" }]);
+  assert.equal(resolveChatSettings(s, CHAT_A).source, "global", "admins-only 條目 (personaCustom=false) 人設仍應走全域");
+  assert.equal(getChatProfile(s, CHAT_A), null);
+  // suspended -> []
+  s.ai.chatProfiles[CHAT_B] = { suspended: true, admins: [{ id: "u-x", name: "停用管理員" }] };
+  assert.deepEqual(getChatAdmins(s, CHAT_B), [], "suspended 的條目管理員應回空");
+  // 形狀正規化: 無效 id/非字串 name 丟棄、同 id 去重、name 修剪並截斷 100 字
+  s.ai.chatProfiles[CHAT_C] = { suspended: false, admins: [
+    { id: "u-ok", name: "  阿明  " },
+    { id: "u-ok", name: "重複應被去重" },
+    { id: "bad id!", name: "格式不符" },
+    { id: 123, name: "id 非字串" },
+    { id: "u-noname", name: 42 },
+    { id: "u-long", name: "長".repeat(150) },
+    "不是物件",
+    null,
+  ] };
+  const normalized = getChatAdmins(s, CHAT_C);
+  assert.deepEqual(normalized.map((a) => a.id), ["u-ok", "u-long"]);
+  assert.equal(normalized[0].name, "阿明");
+  assert.equal(normalized[1].name.length, 100);
+  // 上限 20 筆
+  const many = { ai: { chatProfiles: { [CHAT_A]: { suspended: false, admins: Array.from({ length: 25 }, (_, i) => ({ id: `u-${i}`, name: `管理員${i}` })) } } } };
+  assert.equal(getChatAdmins(many, CHAT_A).length, 20, "管理員上限 20 筆");
+});
+
+test("SettingsStore: chatProfiles admins 存讀正規化來回一致", async () => {
+  const dir = await tmp();
+  const path = join(dir, "settings.json");
+  const store = new SettingsStore({ path });
+  store.update({ ai: { chatProfiles: { [CHAT_B]: { admins: [{ id: "u-b1", name: " 乙群管理員 " }, { id: "u-b1", name: "重複" }, { id: "bad!", name: "丟棄" }] } } } });
+  const store2 = new SettingsStore({ path });
+  assert.deepEqual(store2.get().ai.chatProfiles[CHAT_B].admins, [{ id: "u-b1", name: "乙群管理員" }]);
+  assert.deepEqual(getChatAdmins(store2.get(), CHAT_B), [{ id: "u-b1", name: "乙群管理員" }]);
+});
+
 test("CONFIDENTIALITY_RULE: 四類不可透露 + 套話應對齊備", () => {
   assert.ok(CONFIDENTIALITY_RULE.includes("其他群組"), "應含別群保密");
   assert.ok(CONFIDENTIALITY_RULE.includes("mid") && CONFIDENTIALITY_RULE.includes("管理員名單"), "應含個人資料與帳號識別");
@@ -166,6 +216,9 @@ test("CONFIDENTIALITY_RULE: 四類不可透露 + 套話應對齊備", () => {
   assert.ok(CONFIDENTIALITY_RULE.includes("知識庫") && CONFIDENTIALITY_RULE.includes("機敏"), "應含知識庫範圍與公司機敏");
   assert.ok(CONFIDENTIALITY_RULE.includes("不證實也不否認") && CONFIDENTIALITY_RULE.includes("帶開"), "應含套話應對: 不證實不否認、帶開話題");
   assert.ok(CONFIDENTIALITY_RULE.includes("不要編造假資訊"), "應含不編造假資訊");
+  // 修復版6 增列: 版權宣告/創作者/版權屬性 + 技術/實作細節同列機敏
+  assert.ok(CONFIDENTIALITY_RULE.includes("版權宣告") && CONFIDENTIALITY_RULE.includes("創作者身分") && CONFIDENTIALITY_RULE.includes("版權屬性"), "應含版權宣告、創作者身分與版權屬性列機敏");
+  assert.ok(CONFIDENTIALITY_RULE.includes("技術") && CONFIDENTIALITY_RULE.includes("程式語言") && CONFIDENTIALITY_RULE.includes("架構") && CONFIDENTIALITY_RULE.includes("原始碼"), "應含技術/實作細節列機敏 (技術、程式語言、架構、原始碼)");
 });
 
 test("buildScopeGuardSection: 空 -> 空字串, 非空含三點把關語意", () => {
