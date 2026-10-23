@@ -163,9 +163,11 @@ struct NotifyRuleForm {
 }
 
 /// 分群設定表單 (settings.ai.chatProfiles 的一個群一包; 契約見規格書《分群角色定位與回答範圍》):
-/// custom=false 表示這個群跟著全域預設 (沒有條目, 或使用者在畫面切回用預設待刪除);
-/// custom=true 表示本群自訂 (取代全域, 不是疊加)。suspended=true 是「移出白名單後保留但停用」,
-/// 重新加入後要由使用者在展開編輯區按「恢復使用」才生效。
+/// custom=false 表示這個群的人設跟著全域預設; custom=true 表示本群自訂 (取代全域, 不是疊加)。
+/// suspended=true 是「移出白名單後保留但停用」, 重新加入後要由使用者在展開編輯區按「恢復使用」才生效。
+/// chatty 是聒噪模式開關 (修復版5), 與 custom 互相獨立: 只開聒噪的群也存一包
+/// (personaCustom=false), 人設照舊跟全域走。條目要不要存在由 has_entry 決定:
+/// 人設自訂、聒噪開啟、停用保留, 三者任一成立就存一包, 全不成立才刪除條目。
 #[derive(Clone, Default, PartialEq)]
 struct ChatProfileForm {
     custom: bool,
@@ -174,36 +176,49 @@ struct ChatProfileForm {
     kb_enabled: bool,
     kb_folder: String,
     suspended: bool,
+    chatty: bool,
 }
 
 impl ChatProfileForm {
-    /// 送給 helper 的完整物件 (欄位名照共用契約: rolePrompt/scopePrompt/kbEnabled/kbFolder/suspended)。
+    /// 這包設定需不需要以條目存在 (false = 刪掉條目, 這個群完全用預設且聒噪關閉)。
+    fn has_entry(&self) -> bool {
+        self.custom || self.chatty || self.suspended
+    }
+
+    /// 送給 helper 的完整物件 (欄位名照共用契約: rolePrompt/scopePrompt/kbEnabled/kbFolder/suspended/chatty/personaCustom)。
+    /// personaCustom 就是表單的 custom (人設是否本群自訂), 與 chatty 分開送, helper 端才分得出
+    /// 「只開聒噪」與「人設自訂」是兩件事。
     fn to_value(&self) -> Value {
         serde_json::json!({
             "rolePrompt": self.role,
             "scopePrompt": self.scope,
             "kbEnabled": self.kb_enabled,
             "kbFolder": self.kb_folder,
-            "suspended": self.suspended
+            "suspended": self.suspended,
+            "chatty": self.chatty,
+            "personaCustom": self.custom
         })
     }
 
-    /// 從 settings.ai.chatProfiles 的一包解析回表單; 缺欄位照契約預設 (kbEnabled 預設 true)。
+    /// 從 settings.ai.chatProfiles 的一包解析回表單; 缺欄位照契約預設
+    /// (kbEnabled 預設 true; personaCustom 缺值 = true, 與修復版4「有條目即人設自訂」相同;
+    /// chatty 缺值 = false)。
     fn from_value(v: &Value) -> Self {
         Self {
-            custom: true,
+            custom: v.get("personaCustom").and_then(|x| x.as_bool()).unwrap_or(true),
             role: v.get("rolePrompt").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             scope: v.get("scopePrompt").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             kb_enabled: v.get("kbEnabled").and_then(|x| x.as_bool()).unwrap_or(true),
             kb_folder: v.get("kbFolder").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             suspended: v.get("suspended").and_then(|x| x.as_bool()).unwrap_or(false),
+            chatty: v.get("chatty").and_then(|x| x.as_bool()).unwrap_or(false),
         }
     }
 }
 
 /// 組「儲存各群設定」的補丁: 只含與載入原貌不同的群。
-/// 切回用預設 (custom=false) 或表單裡已不存在的原有群 = 傳 null 刪除; 新自訂/改過欄位的群 = 完整物件
-/// (suspended 的變更也併進完整物件一起送, 伺服器端照契約合併欄位)。
+/// 不再需要條目 (人設用預設、聒噪關閉、未停用, 見 has_entry) 或表單裡已不存在的原有群 = 傳 null 刪除;
+/// 需要條目且改過欄位的群 = 完整物件 (suspended/chatty 的變更也併進完整物件一起送, 伺服器端照契約合併欄位)。
 fn chat_profiles_patch(forms: &HashMap<String, ChatProfileForm>, orig: &HashMap<String, ChatProfileForm>) -> serde_json::Map<String, Value> {
     let mut patch = serde_json::Map::new();
     for (id, o) in orig {
@@ -211,7 +226,7 @@ fn chat_profiles_patch(forms: &HashMap<String, ChatProfileForm>, orig: &HashMap<
             None => {
                 patch.insert(id.clone(), Value::Null);
             }
-            Some(f) if !f.custom => {
+            Some(f) if !f.has_entry() => {
                 patch.insert(id.clone(), Value::Null);
             }
             Some(f) if f != o => {
@@ -224,7 +239,7 @@ fn chat_profiles_patch(forms: &HashMap<String, ChatProfileForm>, orig: &HashMap<
         if orig.contains_key(id) {
             continue;
         }
-        if f.custom {
+        if f.has_entry() {
             patch.insert(id.clone(), f.to_value());
         }
     }
@@ -3288,6 +3303,8 @@ impl App {
                         let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                         let (label, color) = match kind {
                             "answered" => ("已回答", self.palette.ok),
+                            "chatty" => ("接話", self.palette.ok),
+                            "chatty_pass" => ("選擇不接話", self.palette.idle),
                             "declined" => ("婉拒（範圍外）", self.palette.idle),
                             "clarify" => ("反問確認", self.palette.warn),
                             "name_only" => ("引導說明", self.palette.idle),
@@ -3593,6 +3610,7 @@ impl App {
                     kb_enabled: true,
                     kb_folder: String::new(),
                     suspended: false,
+                    chatty: false,
                 },
             );
         }
@@ -3611,6 +3629,7 @@ impl App {
                 if ui.button("捨棄這份設定").clicked() {
                     f.custom = false;
                     f.suspended = false;
+                    f.chatty = false;
                 }
             });
             ui.label(egui::RichText::new("按下方「儲存各群設定」後才會生效。").weak().small());
@@ -3647,6 +3666,11 @@ impl App {
             });
             ui.label(egui::RichText::new("留空＝用全域知識庫資料夾。").weak().small());
         }
+        // 聒噪模式 (修復版5): 與人設用哪一套互相獨立, 兩種模式都顯示這個開關。
+        ui.add_space(8.0);
+        ui.separator();
+        ui.checkbox(&mut f.chatty, "聒噪模式: 不用叫名字, 我也會自己找話題接話");
+        ui.label(egui::RichText::new("打開後, 我會看著這個群最近的對話, 自己判斷有沒有自然合適的話可以接; 沒有合適的話就保持安靜, 不會每則都回。打開後 AI 用量會增加。叫名字或引用問我時, 還是照平常方式優先回答; 別的群的事、個人資料跟公司機密, 我一樣不會說出去。").weak().small());
         // 知識庫整理狀態不分模式都顯示一行: 該群有自己的狀態就顯示該群的, 沒有就顯示全域的。
         if let Some(entry) = kb_chats.get(chat_id) {
             ui.label(egui::RichText::new(format!("這個群的知識庫: {}", kb_status_line(entry))).weak().small());
@@ -3842,13 +3866,15 @@ impl App {
                         c.get("memberCount").and_then(|v| v.as_i64()),
                         resolved,
                     );
-                    // 狀態小字: 這個群目前用哪一套設定, 一眼可分。
-                    let state_txt = match self.form.chat_profiles.get(&id).map(|f| (f.custom, f.suspended)) {
+                    // 狀態小字: 這個群目前用哪一套設定, 一眼可分; 聒噪開著的再加註記。
+                    let prof = self.form.chat_profiles.get(&id);
+                    let state_txt = match prof.map(|f| (f.custom, f.suspended)) {
                         Some((true, true)) => "本群自訂・已停用待確認",
                         Some((true, false)) => "本群自訂",
                         _ => "用預設",
                     };
-                    let sub = format!("{sub_base}・{state_txt}");
+                    let chatty_mark = if prof.map(|f| f.chatty).unwrap_or(false) { "・聒噪開" } else { "" };
+                    let sub = format!("{sub_base}・{state_txt}{chatty_mark}");
                     let mut toggle_expand = false;
                     let mut remove_clicked = false;
                     chat_list_row(ui, &name, &sub, |ui| {
@@ -5114,7 +5140,41 @@ mod tests {
             kb_enabled: true,
             kb_folder: String::new(),
             suspended: false,
+            chatty: false,
         }
+    }
+
+    #[test]
+    fn chat_profiles_patch_chatty_only_entry_lifecycle() {
+        // 修復版5: 只開聒噪 (人設仍用預設) 也要存成一包 (personaCustom=false, chatty=true);
+        // 把聒噪關掉且人設用預設時, 條目要刪掉 (送 null); 人設自訂的群只改聒噪要送完整物件。
+        let chatty_only = ChatProfileForm { custom: false, chatty: true, ..Default::default() };
+        let orig = HashMap::new();
+        let mut forms = HashMap::new();
+        forms.insert("c-chatty".to_string(), chatty_only);
+        let patch = chat_profiles_patch(&forms, &orig);
+        let v = patch.get("c-chatty").expect("只開聒噪的群要送出條目");
+        assert_eq!(v.get("chatty").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(v.get("personaCustom").and_then(|x| x.as_bool()), Some(false), "只開聒噪時人設必須標記為用預設");
+        let new_orig = chat_profiles_new_orig(&forms, &orig, &patch);
+        assert!(new_orig.get("c-chatty").unwrap().chatty);
+        let mut forms2 = new_orig.clone();
+        forms2.get_mut("c-chatty").unwrap().chatty = false;
+        let patch2 = chat_profiles_patch(&forms2, &new_orig);
+        assert!(patch2.get("c-chatty").map(|v| v.is_null()).unwrap_or(false), "聒噪關掉且人設用預設時應刪除條目");
+        let mut orig3 = HashMap::new();
+        orig3.insert("c-cust".to_string(), profile("角色A"));
+        let mut forms3 = orig3.clone();
+        forms3.get_mut("c-cust").unwrap().chatty = true;
+        let patch3 = chat_profiles_patch(&forms3, &orig3);
+        let v3 = patch3.get("c-cust").expect("人設自訂的群改聒噪要送完整物件");
+        assert_eq!(v3.get("personaCustom").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(v3.get("chatty").and_then(|x| x.as_bool()), Some(true));
+        // from_value: 舊存檔沒有 chatty/personaCustom 時, 人設視為自訂、聒噪視為關閉 (修復版4 行為不變)
+        let legacy = ChatProfileForm::from_value(&serde_json::json!({ "rolePrompt": "舊角色" }));
+        assert!(legacy.custom && !legacy.chatty);
+        let co = ChatProfileForm::from_value(&serde_json::json!({ "chatty": true, "personaCustom": false }));
+        assert!(!co.custom && co.chatty);
     }
 
     #[test]

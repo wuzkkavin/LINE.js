@@ -325,14 +325,15 @@ function deepCloneObj(v) { return JSON.parse(JSON.stringify(v || {})); }
 function profileStatusText(profile) {
   if (!profile) return "用預設";
   if (profile.suspended) return "本群自訂・已停用待確認";
-  return "本群自訂";
+  const base = profile.personaCustom === false ? "用預設" : "本群自訂";
+  return profile.chatty ? base + "・聒噪開" : base;
 }
 function profilesEqual(a, b) {
   if (!a && !b) return true;
   if (!a || !b) return false;
-  const norm = (x) => ({ rolePrompt: x.rolePrompt || "", scopePrompt: x.scopePrompt || "", kbEnabled: x.kbEnabled !== false, kbFolder: x.kbFolder || "", suspended: !!x.suspended });
+  const norm = (x) => ({ rolePrompt: x.rolePrompt || "", scopePrompt: x.scopePrompt || "", kbEnabled: x.kbEnabled !== false, kbFolder: x.kbFolder || "", suspended: !!x.suspended, chatty: !!x.chatty, personaCustom: x.personaCustom !== false });
   const na = norm(a); const nb = norm(b);
-  return na.rolePrompt === nb.rolePrompt && na.scopePrompt === nb.scopePrompt && na.kbEnabled === nb.kbEnabled && na.kbFolder === nb.kbFolder && na.suspended === nb.suspended;
+  return na.rolePrompt === nb.rolePrompt && na.scopePrompt === nb.scopePrompt && na.kbEnabled === nb.kbEnabled && na.kbFolder === nb.kbFolder && na.suspended === nb.suspended && na.chatty === nb.chatty && na.personaCustom === nb.personaCustom;
 }
 function providerCard(p) {
   const d = document.createElement("div");
@@ -544,11 +545,13 @@ function buildChatProfileEditor(c, profile) {
   const radioCustom = document.createElement("input");
   radioCustom.type = "radio"; radioCustom.name = radioName; radioCustom.value = "custom";
   labelCustom.append(radioCustom, document.createTextNode(" 本群自訂"));
-  if (profile) { radioCustom.checked = true; } else { radioDefault.checked = true; }
+  // 人設是否自訂看 personaCustom (修復版5): 只開聒噪的條目 personaCustom=false, 人設仍是「跟著全域預設」
+  const personaCustom = !!(profile && profile.personaCustom !== false);
+  if (personaCustom) { radioCustom.checked = true; } else { radioDefault.checked = true; }
   modeWrap.append(labelDefault, labelCustom);
   editor.appendChild(modeWrap);
   const customBox = document.createElement("div");
-  customBox.style.display = profile ? "" : "none";
+  customBox.style.display = personaCustom ? "" : "none";
   const replaceNote = document.createElement("div");
   replaceNote.className = "hint";
   replaceNote.textContent = "這個群用自己的設定，全域預設在這個群不生效。";
@@ -557,12 +560,12 @@ function buildChatProfileEditor(c, profile) {
   roleLabel.textContent = "本群角色定位";
   const roleTa = document.createElement("textarea");
   roleTa.className = "cp-role"; roleTa.style.minHeight = "64px";
-  roleTa.value = profile ? (profile.rolePrompt || "") : chatProfilesGlobalRole;
+  roleTa.value = personaCustom ? (profile.rolePrompt || "") : chatProfilesGlobalRole;
   const scopeLabel = document.createElement("label");
   scopeLabel.textContent = "本群回答範圍";
   const scopeTa = document.createElement("textarea");
   scopeTa.className = "cp-scope";
-  scopeTa.value = profile ? (profile.scopePrompt || "") : chatProfilesGlobalScope;
+  scopeTa.value = personaCustom ? (profile.scopePrompt || "") : chatProfilesGlobalScope;
   customBox.append(roleLabel, roleTa, scopeLabel, scopeTa);
   const kbLabel = document.createElement("label");
   kbLabel.className = "checkline";
@@ -594,6 +597,18 @@ function buildChatProfileEditor(c, profile) {
     }
   } catch {}
   editor.appendChild(customBox);
+  // 聒噪模式 (修復版5): 與人設用哪一套互相獨立, 放在 customBox 外面, 兩種模式都看得到。
+  const chattyLabel = document.createElement("label");
+  chattyLabel.className = "checkline";
+  const chattyCheck = document.createElement("input");
+  chattyCheck.type = "checkbox"; chattyCheck.className = "cp-chatty";
+  chattyCheck.checked = !!(profile && profile.chatty);
+  chattyLabel.append(chattyCheck, document.createTextNode(" 聒噪模式: 不用叫名字, 我也會自己找話題接話"));
+  editor.appendChild(chattyLabel);
+  const chattyHint = document.createElement("div");
+  chattyHint.className = "hint";
+  chattyHint.textContent = "打開後, 我會看著這個群最近的對話, 自己判斷有沒有自然合適的話可以接; 沒有合適的話就保持安靜, 不會每則都回。打開後 AI 用量會增加。叫名字或引用問我時, 還是照平常方式優先回答; 別的群的事、個人資料跟公司機密, 我一樣不會說出去。";
+  editor.appendChild(chattyHint);
   function syncMode() {
     if (radioCustom.checked) { markedDelete = false; customBox.style.display = ""; }
     else { customBox.style.display = "none"; }
@@ -603,11 +618,14 @@ function buildChatProfileEditor(c, profile) {
   restoreBtn.addEventListener("click", () => {
     editorSuspended = false; markedDelete = false;
     banner.style.display = "none";
-    radioCustom.checked = true; syncMode();
+    // 恢復的是「停用前的那一套」: 本來人設用預設的不要被誤切成自訂
+    if (personaCustom) { radioCustom.checked = true; } else { radioDefault.checked = true; }
+    syncMode();
   });
   discardBtn.addEventListener("click", () => {
     markedDelete = true; editorSuspended = false;
     banner.style.display = "none";
+    chattyCheck.checked = false;
     radioDefault.checked = true; syncMode(); markedDelete = true;
   });
   const entry = {
@@ -615,8 +633,13 @@ function buildChatProfileEditor(c, profile) {
     getPending() {
       const snap = chatProfilesSnapshot[chatId];
       if (markedDelete) { return snap ? null : undefined; }
-      if (radioDefault.checked) { return snap ? null : undefined; }
-      const obj = { rolePrompt: roleTa.value, scopePrompt: scopeTa.value, kbEnabled: !!kbCheck.checked, kbFolder: kbFolderInput.value.trim(), suspended: !!editorSuspended };
+      const chatty = !!chattyCheck.checked;
+      // 人設用預設且聒噪關閉 = 不需要條目 (有舊條目就刪除)
+      if (radioDefault.checked && !chatty) { return snap ? null : undefined; }
+      // 人設用預設但聒噪開啟: 存一包 personaCustom=false 的條目, 人設欄位放中性值 (解析時整包跟全域走)
+      const obj = radioDefault.checked
+        ? { rolePrompt: "", scopePrompt: "", kbEnabled: true, kbFolder: "", suspended: !!editorSuspended, chatty: true, personaCustom: false }
+        : { rolePrompt: roleTa.value, scopePrompt: scopeTa.value, kbEnabled: !!kbCheck.checked, kbFolder: kbFolderInput.value.trim(), suspended: !!editorSuspended, chatty, personaCustom: true };
       if (profilesEqual(obj, snap)) return undefined;
       return obj;
     },

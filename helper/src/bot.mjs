@@ -7,7 +7,8 @@ import { evaluateTrigger, markAnswered, markTriggered, createTriggerState, local
 import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { extractScamTarget, isManualScamAsk, judgeScam, prefilterScam, scamVerdictText, scamWarningText, PerMinuteLimiter } from "./scam.mjs";
 import { SECRET_NAMES, DEFAULT_CREATOR_REPLY, DEFAULT_ROLE_PROMPT } from "./config.mjs";
-import { resolveChatSettings, buildScopeGuardSection, classifyAnswerKind, guidanceForChat } from "./chatprofile.mjs";
+import { resolveChatSettings, buildScopeGuardSection, classifyAnswerKind, guidanceForChat, isChattyEnabled, CONFIDENTIALITY_RULE } from "./chatprofile.mjs";
+import { ChattyTracker, CHATTY_INSTRUCTIONS, parseChattyReply, CHATTY_REPLY_MAX_TOKENS } from "./chatty.mjs";
 import { matchNotifyRules, planTargets, NOTIFY_EVENT_KINDS } from "./adminnotify.mjs";
 import { isValidJevToken } from "./jev.mjs";
 
@@ -229,7 +230,7 @@ export const DECRYPT_MISSED_MIN_COUNT = 2;
 export const DECRYPT_SEEN_IDS_CAP = 300;
 
 export class HelperBot {
-  constructor({ settings, secrets, ai, kb, kbPool, logger, registry, reconnectDelaysMs, dailyStatePath = "", decryptMissedOptions, adminEvents = null } = {}) {
+  constructor({ settings, secrets, ai, kb, kbPool, logger, registry, reconnectDelaysMs, dailyStatePath = "", decryptMissedOptions, adminEvents = null, chattyOptions = null } = {}) {
     this.settings = settings; // SettingsStore
     this.secrets = secrets;
     this.ai = ai;
@@ -245,6 +246,10 @@ export class HelperBot {
     // 只存記憶體 (重啟清空); 名稱取訊息自帶的 senderName, 不另外查核心。
     this.chatSpeakers = new Map();
     this.triggerState = createTriggerState();
+    // 聒噪模式 (修復版5): 每群的近期對話脈絡與節奏護欄狀態, 只存記憶體 (重啟歸零)。
+    // chattyOptions.now 可注入假時間供測試; 正式運行用系統時鐘。
+    this.chatty = new ChattyTracker();
+    this.chattyNow = typeof chattyOptions?.now === "function" ? chattyOptions.now : () => Date.now();
     this.scamLimiter = new PerMinuteLimiter(10);
     this.memory = new Map(); // chatId -> [{role, content}]
     this.ws = null;
@@ -1119,6 +1124,16 @@ export class HelperBot {
     if (m.messageId && m.senderId) this.registry.register(m.messageId, m.senderId, m.channelId ?? "");
     // 發言者登記 (管理員候選名單/@ 可行性): 只記 id 與顯示名, 不記內容
     this.noteSpeaker(m);
+    // 聒噪模式 (修復版5): 開啟的群記近期對話脈絡 (只記文字, 含 AI寶 自己的話 —
+    // 核心會把自己送出的訊息也推回來, 在這裡統一記一份; 解密失敗的佔位文字不是
+    // 真話, 不記)。候選訊息的脈絡快照要在記入本則之前先取: 評估時本則是「群友
+    // 剛講的話」, 快照裡的才是「近期對話」。系統事件不記、也不當候選。
+    const isSystemEvent = m.contentType === "CHATEVENT" || m.contentType === "18";
+    const chattyOn = isChattyEnabled(s, m.channelId);
+    const chattyHistory = chattyOn && !isSystemEvent && m.senderId !== this.selfId && m.decryptFailed !== true
+      ? this.chatty.context(m.channelId, this.chattyNow())
+      : null;
+    if (chattyOn && !isSystemEvent) this.recordChattyContext(m, s);
     if (m.senderId === this.selfId) { this.logger?.debugLog("觸發判斷", "忽略自己發的訊息", { id: m.messageId }); return; }
     // 系統事件不觸發 (2026-10-21 第二段追加): 成員加入/離開等系統通知在核心是
     // contentType CHATEVENT (或原始碼 "18"), 內文是核心組好的顯示字串 (例如
@@ -1129,10 +1144,90 @@ export class HelperBot {
     if (m.contentType === "CHATEVENT" || m.contentType === "18") { this.logger?.debugLog("觸發判斷", "系統事件訊息, 不觸發", { id: m.messageId }); return; }
     // 管理員通知的關鍵字掃描: 與觸發/防詐騙獨立, 命中只記錄事件 (送出由 App 殼負責), 不影響問答
     this.checkKeywordRules(m);
-    // 兩件事並行評估: 防詐騙自動掃描 + 名字觸發; 先處理觸發問答, 詐騙警告獨立進行
-    const triggerPromise = this.handleTrigger(m, s);
+    // 防詐騙自動掃描與觸發問答並行進行; 觸發問答要先有結果, 才知道這則訊息
+    // 要不要輪到聒噪接話評估 (優先序: 正常路徑優先, 同一則不得兩路都回)。
     const scamPromise = this.handleAutoScam(m, s);
-    await Promise.allSettled([triggerPromise, scamPromise]);
+    let handled = false;
+    try {
+      handled = await this.handleTrigger(m, s);
+    } catch (e) {
+      // handleTrigger 內部多數路徑已自行攔截錯誤; 這裡是最後防線, 行為與舊版
+      // Promise.allSettled 吞錯一致 (錯誤進 log, 不讓單則訊息打斷整條主線)。
+      this.logger?.error("觸發判斷", "觸發處理發生未預期錯誤", { id: m.messageId, error: String(e?.message ?? e) });
+    }
+    if (!handled) {
+      await this.handleChatty(m, s, chattyHistory).catch((e) => this.logger?.error("聒噪接話", "接話流程發生錯誤, 本則安靜略過", { id: m.messageId, error: String(e?.message ?? e) }));
+    }
+    await Promise.allSettled([scamPromise]);
+  }
+
+  // 聒噪脈絡登記 (修復版5): 呼叫端已確認該群有開聒噪且不是系統事件;
+  // 解密失敗的佔位文字不是說話內容, 不記進脈絡。
+  recordChattyContext(m, s) {
+    if (m.decryptFailed === true) return;
+    if (typeof m.text !== "string" || !m.text) return;
+    const self = !!this.selfId && m.senderId === this.selfId;
+    this.chatty.record(m.channelId, {
+      senderId: m.senderId ?? "",
+      senderName: self ? (this.selfName || s.botName || "") : (m.senderName ?? ""),
+      text: m.text,
+      self,
+    }, this.chattyNow());
+  }
+
+  // 聒噪接話 (修復版5): 只在正常路徑沒有回應時評估。接不接由 AI 判斷 (附近期
+  // 脈絡與該群人設), 護欄先行 (不夠格連 AI 都不呼叫, 省用量); AI 回安靜標記就
+  // 整則吞掉、只在活動紀錄留「選擇不接話」; AI 呼叫失敗同樣安靜 — 接話是閒聊
+  // 參與, 絕不在群裡留錯誤或備援訊息。不套用回答範圍 (閒聊不是正式提問),
+  // 保密規則照附; 不計入正式回答的每日上限, 受接話自己的護欄管制。
+  async handleChatty(m, s, history) {
+    if (!history) return; // 沒開聒噪的群在 onMessage 就不會給脈絡快照
+    if (m.decryptFailed === true) return;
+    if (typeof m.text !== "string" || !m.text.trim()) return; // 非文字/空訊息不當候選
+    // 疑似詐騙的訊息不拿去接話 (安全篩選, 不是接話判斷; 防詐騙監控本體在
+    // handleAutoScam 每則必看, 不受聒噪開關影響)。
+    if (prefilterScam(m.text)?.hit) { this.logger?.debugLog("聒噪接話", "預篩命中疑似詐騙, 不接話", { id: m.messageId }); return; }
+    const nowMs = this.chattyNow();
+    const gate = this.chatty.check(m.channelId, m.senderId, nowMs);
+    if (!gate.ok) { this.logger?.debugLog("聒噪接話", "護欄擋下, 不送 AI 評估", { id: m.messageId, reason: gate.reason }); return; }
+    this.chatty.noteEval(m.channelId, nowMs);
+    const chatCfg = resolveChatSettings(s, m.channelId);
+    const roleSection = typeof chatCfg.rolePrompt === "string" && chatCfg.rolePrompt.trim() ? chatCfg.rolePrompt.trim() : DEFAULT_ROLE_PROMPT;
+    const nameLine = s.botName ? `你的名字是「${s.botName}」, 同事這樣叫你時就是在叫你。` : "";
+    const personaSection = buildPersonaSection(s.persona);
+    const messages = [
+      { role: "system", content: `${roleSection}\n${s.ai.systemPrompt}\n${nameLine}\n${personaSection}\n${CONFIDENTIALITY_RULE}\n${CHATTY_INSTRUCTIONS}\n${LINE_FORMAT_RULE}` },
+      ...history.map((e) => e.self
+        ? { role: "assistant", content: e.text }
+        : { role: "user", content: `${e.senderName || "同事"}：${e.text}` }),
+      { role: "user", content: `${m.senderName || "同事"}：${m.text}` },
+    ];
+    const startedAt = Date.now();
+    let raw;
+    try {
+      const r = await this.chatWithAi(messages, { temperature: 0.6, maxTokens: CHATTY_REPLY_MAX_TOKENS });
+      raw = r.content;
+    } catch (e) {
+      this.logger?.warn("聒噪接話", "AI 評估失敗, 本則安靜略過", { id: m.messageId, error: String(e?.message ?? e) });
+      return;
+    }
+    const parsed = parseChattyReply(raw);
+    if (parsed.pass) {
+      this.recordActivity({ kind: "chatty_pass", m });
+      this.logger?.debugLog("聒噪接話", "AI 選擇不接話", { id: m.messageId });
+      return;
+    }
+    const answer = cleanAnswerText(parsed.text);
+    if (!answer) { this.recordActivity({ kind: "chatty_pass", m }); return; }
+    // 接話像真人插話: 不引用原訊息 (不帶 replyTo); 送出走 sendText 既有節流。
+    const sent = await this.sendText(m.channelId, answer).then(() => true).catch((e) => {
+      this.logger?.error("聒噪接話", "接話送出失敗", { id: m.messageId, error: String(e?.message ?? e) });
+      return false;
+    });
+    if (!sent) return;
+    this.chatty.noteSent(m.channelId, m.senderId, this.chattyNow());
+    this.recordActivity({ kind: "chatty", m, answerChars: answer.length, ms: Date.now() - startedAt, answerText: answer });
+    this.logger?.info("聒噪接話", "已接話", { id: m.messageId, chars: answer.length });
   }
 
   async handleAutoScam(m, s) {
@@ -1281,14 +1376,19 @@ export class HelperBot {
       // 活動面板 (第 12 項): 被冷卻/每日上限擋下的也要留一筆, 管理員才看得出「有在擋」
       if (verdict.reason === "cooldown") this.recordActivity({ kind: "cooldown", m });
       if (verdict.reason === "daily_limit") this.recordActivity({ kind: "daily_limit", m });
+      let noticeSent = false;
       if (verdict.limitReached) {
         const last = this.triggerState.limitNoticeByUser.get(m.senderId) ?? 0;
         if (Date.now() - last > 3600000) {
           this.triggerState.limitNoticeByUser.set(m.senderId, Date.now());
           await this.sendText(m.channelId, limitText(s.botName), m.messageId).catch(() => {});
+          noticeSent = true;
         }
       }
-      return;
+      // 回傳值 (修復版5 聒噪優先序): 有叫到名字 (matchedName) 的訊息視同已由正常
+      // 路徑處理 — 就算這次被冷卻/上限擋下或沒有問句, 正常路徑的「不回」是刻意
+      // 決定, 不輪到聒噪接話; 完全沒叫名字的一般訊息才回 false 交給接話評估。
+      return Boolean(verdict.matchedName) || noticeSent;
     }
     if (verdict.reason === "name_only") {
       // 只打名字回引導訊息不記冷卻 (2026-10-20 驗收修復): 引導只是打招呼, 若它也吃掉 20 秒冷卻,
@@ -1296,7 +1396,7 @@ export class HelperBot {
       // 冷卻只記在真正的問答觸發上 (下方 markTriggered), 防連珠炮洗版的效果不變。
       await this.sendText(m.channelId, guidanceForChat(s.botName, chatCfg), m.messageId).catch(() => {});
       this.recordActivity({ kind: "name_only", m });
-      return;
+      return true;
     }
     markTriggered(this.triggerState, m.senderId);
     this.stats.triggered++;
@@ -1315,18 +1415,18 @@ export class HelperBot {
       const mem0 = this.memory.get(m.channelId) ?? [];
       this.memory.set(m.channelId, [...mem0, { role: "user", content: question }, { role: "assistant", content: reply }].slice(-(s.ai.memoryTurns ?? 6) * 2));
       this.logger?.info("機器人回覆", "已回覆創造者固定答覆 (未呼叫 AI)", { id: m.messageId });
-      return;
+      return true;
     }
     // 手動防詐騙判讀
     if (isManualScamAsk(question)) {
       const target = extractScamTarget(question) || m.text;
       this.scamLimiter.limit = s.scam.perMinute ?? 10;
-      if (!this.scamLimiter.tryTake()) { await this.sendText(m.channelId, "判讀次數暫時到上限了, 請等一分鐘再問我。", m.messageId).catch(() => {}); return; }
+      if (!this.scamLimiter.tryTake()) { await this.sendText(m.channelId, "判讀次數暫時到上限了, 請等一分鐘再問我。", m.messageId).catch(() => {}); return true; }
       this.logger?.info("防詐騙", "手動判讀請求", { id: m.messageId, targetLen: target.length });
       const v = await this.judgeForManual(target, m);
       this.stats.scamChecked++;
       await this.sendText(m.channelId, scamVerdictText(v), m.messageId).catch(() => {});
-      return;
+      return true;
     }
     // 知識庫優先 (照本群設定: 關閉的群不查、專屬資料夾只查該群那一份)
     const kbInst = this.kbInstanceFor(chatCfg, m.channelId);
@@ -1345,7 +1445,7 @@ export class HelperBot {
         chatId: m.channelId, chatName: this.chatNames.get(m.channelId) ?? "",
         detail: "有同事問了公司相關的問題，但我在知識庫裡查不到，已經回覆他先問資訊部。這一題我沒有回答出來，如果有相關文件，請管理員放進知識庫資料夾。",
       });
-      return;
+      return true;
     }
     const mem = this.memory.get(m.channelId) ?? [];
     const nameLine = s.botName ? `你的名字是「${s.botName}」, 同事這樣叫你時就是在叫你。` : "";
@@ -1356,7 +1456,9 @@ export class HelperBot {
     // 角色定位: 用本群解析後的 rolePrompt (resolver 已處理空退預設), 放在組裝後的最前面
     const roleSection = typeof chatCfg.rolePrompt === "string" && chatCfg.rolePrompt.trim() ? chatCfg.rolePrompt.trim() : DEFAULT_ROLE_PROMPT;
     const messages = [
-      { role: "system", content: `${roleSection}\n${s.ai.systemPrompt}\n${nameLine}${scopeSection ? `\n${scopeSection}` : ""}\n${personaSection}\n${LINE_FORMAT_RULE}` },
+      // 保密規則 (老吳 2026-10-23 定案): 程式固定附加, 所有群所有情況都附上,
+      // 不依賴回答範圍欄位有沒有填; 聒噪接話路徑同樣附上 (見 handleChatty)。
+      { role: "system", content: `${roleSection}\n${s.ai.systemPrompt}\n${nameLine}${scopeSection ? `\n${scopeSection}` : ""}\n${personaSection}\n${CONFIDENTIALITY_RULE}\n${LINE_FORMAT_RULE}` },
       ...mem,
     ];
     if (hits.length) {
@@ -1428,5 +1530,6 @@ export class HelperBot {
     const turns = [...mem, { role: "user", content: question }, { role: "assistant", content: answer }].slice(-(s.ai.memoryTurns ?? 6) * 2);
     this.memory.set(m.channelId, turns);
     this.logger?.info("機器人回覆", "已回覆", { id: m.messageId, chars: answer.length, today: count, kbHits: hits.length, delivery });
+    return true;
   }
 }

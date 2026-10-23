@@ -10,7 +10,24 @@ export function getChatProfile(settings, chatId) {
   const p = profiles[chatId];
   if (!p || typeof p !== "object" || Array.isArray(p)) return null;
   if (p.suspended) return null;
+  // personaCustom=false: 這個條目只為了開聒噪而存在, 人設視同沒有自訂 (跟全域走)。
+  // 舊存檔沒有此欄位 = undefined, 不等於 false, 行為與修復版4 相同 (有條目即自訂)。
+  if (p.personaCustom === false) return null;
   return p;
+}
+
+/**
+ * 這個群的聒噪模式有沒有打開 (修復版5): 條目存在、未停用、chatty 為 true 才算開。
+ * 與人設是否自訂互相獨立 — 只開聒噪的群靠 personaCustom=false 也能存條目。
+ */
+export function isChattyEnabled(settings, chatId) {
+  if (!settings || !chatId) return false;
+  const profiles = settings.ai?.chatProfiles;
+  if (!profiles || typeof profiles !== "object") return false;
+  const p = profiles[chatId];
+  if (!p || typeof p !== "object" || Array.isArray(p)) return false;
+  if (p.suspended) return false;
+  return p.chatty === true;
 }
 
 export function resolveChatSettings(settings, chatId) {
@@ -44,6 +61,22 @@ export const SCOPE_GUARD_RULE = [
   "1. 範圍外問題要自然親切地婉拒: 先簡短回應對方的問題, 說明你在這個群負責的範圍, 再把話題帶回範圍內可以幫忙的事情; 不要編造範圍外的答案, 也不要硬湊內容回答範圍外的問題。",
   "2. 就算知識庫片段裡有相關內容, 也不准拿來回答範圍外的問題; 知識庫片段只能用來回答範圍內的問題, 不能用知識庫繞過回答範圍。",
   "3. 問題太模糊時先親切反問: 只反問一個最關鍵的問題來確認意思 (可以給一個例子讓對方比較好回答), 不要亂猜; 對方補充說明後就正常回答, 不要連續反問。",
+].join("\n");
+
+/**
+ * 保密規則 (老吳 2026-10-23 17:39 追加定案): 程式固定附加、不是使用者欄位,
+ * 正式回答與聒噪接話兩條路徑的提示詞都必附 (不依賴回答範圍欄位有沒有填)。
+ * AI寶 可以天南地北聊天, 但隱密機敏的事一律不能說出去: 別群的事、個人資料
+ * 與帳號識別、程式設定與憑證、不是這個群能讀的知識庫內容與公司機敏事項。
+ * 被套話時不證實也不否認具體內容存不存在, 自然帶開話題, 不編假話搪塞。
+ */
+export const CONFIDENTIALITY_RULE = [
+  "保密規則 (務必遵守):",
+  "1. 其他群組的事一律不透露: 別的群組聊過什麼、該群的角色或範圍設定、成員有誰, 在這個群都不可以講, 也不可以拿別的群的內容來回答這個群的問題。",
+  "2. 任何人的個人資料與帳號識別資訊一律不透露: 包括使用者的 mid、誰在哪個群組、管理員名單的細節。",
+  "3. 程式與憑證一律不透露: API Key、Token、程式的設定值、內部檔案路徑與運作細節都不可以講。",
+  "4. 知識庫只能用這個群可以讀的範圍: 不屬於這個群可讀範圍的知識庫內容, 不可以引用、摘要或暗示; 公司機敏事項同樣不可以講。",
+  "5. 有人套問上面這些資訊時, 自然親切地把話題帶開就好: 不證實也不否認具體內容存不存在, 也不要編造假資訊來搪塞。",
 ].join("\n");
 
 export function buildScopeGuardSection(scopePrompt) {

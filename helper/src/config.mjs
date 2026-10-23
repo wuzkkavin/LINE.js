@@ -68,8 +68,11 @@ export function defaultSettings() {
       // 回答範圍 (非機密, publicView 明文回傳); 空字串 = 不限制範圍
       scopePrompt: DEFAULT_SCOPE_PROMPT,
       memoryTurns: 6,
-      // 分群設定: { [chatId]: { rolePrompt, scopePrompt, kbEnabled, kbFolder, suspended } }
-      // 沒有條目 = 用全域預設; suspended=true = 停用中 (視同用預設)
+      // 分群設定: { [chatId]: { rolePrompt, scopePrompt, kbEnabled, kbFolder, suspended, chatty, personaCustom } }
+      // 沒有條目 = 用全域預設; suspended=true = 停用中 (視同用預設, 聒噪也關)
+      // chatty = 聒噪模式開關 (預設 false, 修復版5); personaCustom = 人設是否本群自訂
+      // (修復版5 起才有此欄位; 舊存檔沒有此欄位 = 視為 true, 與修復版4「有條目即自訂」相同)。
+      // chatty 與 personaCustom 互相獨立: 只開聒噪的群人設照舊跟全域走, 不被迫自訂。
       chatProfiles: {},
     },
     scam: {
@@ -101,6 +104,8 @@ export function normalizeChatProfile(p) {
     kbEnabled: src.kbEnabled === undefined ? true : Boolean(src.kbEnabled),
     kbFolder: toStr(src.kbFolder, 1024),
     suspended: src.suspended === undefined ? false : Boolean(src.suspended),
+    chatty: src.chatty === undefined ? false : Boolean(src.chatty),
+    personaCustom: src.personaCustom === undefined ? true : Boolean(src.personaCustom),
   };
 }
 

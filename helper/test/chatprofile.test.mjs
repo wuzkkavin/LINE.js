@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SettingsStore, DEFAULT_ROLE_PROMPT } from "../src/config.mjs";
-import { getChatProfile, resolveChatSettings, buildScopeGuardSection, SCOPE_GUARD_RULE, classifyAnswerKind, guidanceForChat } from "../src/chatprofile.mjs";
+import { getChatProfile, resolveChatSettings, buildScopeGuardSection, SCOPE_GUARD_RULE, classifyAnswerKind, guidanceForChat, isChattyEnabled, CONFIDENTIALITY_RULE } from "../src/chatprofile.mjs";
 import { guidanceText } from "../src/bot.mjs";
 import { KbPool } from "../src/kb.mjs";
 
@@ -80,7 +80,8 @@ test("SettingsStore: chatProfiles 存讀來回一致", async () => {
   const store = new SettingsStore({ path });
   store.update({ ai: { chatProfiles: { [CHAT_B]: { rolePrompt: "B角色", scopePrompt: "B範圍", kbEnabled: false, kbFolder: "/tmp/b-kb", suspended: false } } } });
   const store2 = new SettingsStore({ path });
-  assert.deepEqual(store2.get().ai.chatProfiles[CHAT_B], { rolePrompt: "B角色", scopePrompt: "B範圍", kbEnabled: false, kbFolder: "/tmp/b-kb", suspended: false });
+  // 修復版5 起多了 chatty (預設 false) 與 personaCustom (舊存檔缺此欄位預設 true)
+  assert.deepEqual(store2.get().ai.chatProfiles[CHAT_B], { rolePrompt: "B角色", scopePrompt: "B範圍", kbEnabled: false, kbFolder: "/tmp/b-kb", suspended: false, chatty: false, personaCustom: true });
   // 預設應有 chatProfiles 空物件
   assert.deepEqual(new SettingsStore({ path: join(dir, "fresh.json") }).get().ai.chatProfiles, {});
 });
@@ -135,6 +136,36 @@ test("SettingsStore: chatProfiles 欄位截斷與型別正規化, 合併欄位�
   assert.equal(pc.suspended, false);
   assert.equal(pc.scopePrompt, "");
   assert.equal(pc.kbFolder, "");
+});
+
+test("chatty (修復版5): 只開聒噪的群人設仍走全域, isChattyEnabled 認開關不認人設", () => {
+  const s = baseSettings();
+  // 只開聒噪: personaCustom=false, 角色欄位留空
+  s.ai.chatProfiles[CHAT_A] = { rolePrompt: "", scopePrompt: "", kbEnabled: true, kbFolder: "", suspended: false, chatty: true, personaCustom: false };
+  assert.equal(isChattyEnabled(s, CHAT_A), true);
+  assert.equal(getChatProfile(s, CHAT_A), null, "只開聒噪的條目不應被當成人設自訂");
+  const r = resolveChatSettings(s, CHAT_A);
+  assert.equal(r.source, "global", "只開聒噪的群人設應沿用全域");
+  assert.equal(r.rolePrompt, "全域角色標記");
+  // 沒開聒噪的群
+  assert.equal(isChattyEnabled(s, CHAT_B), false);
+  // 停用中的條目: 聒噪一併視為關
+  s.ai.chatProfiles[CHAT_B] = { rolePrompt: "", scopePrompt: "", kbEnabled: true, kbFolder: "", suspended: true, chatty: true, personaCustom: false };
+  assert.equal(isChattyEnabled(s, CHAT_B), false, "suspended 的群聒噪應視為關閉");
+  // 舊存檔形狀 (沒有 chatty/personaCustom 欄位): chatty 視為關、人設視為自訂 (修復版4 行為不變)
+  s.ai.chatProfiles[CHAT_C] = { rolePrompt: "舊版角色", scopePrompt: "", kbEnabled: true, kbFolder: "", suspended: false };
+  assert.equal(isChattyEnabled(s, CHAT_C), false);
+  assert.equal(getChatProfile(s, CHAT_C)?.rolePrompt, "舊版角色");
+  assert.equal(resolveChatSettings(s, CHAT_C).source, "chat");
+});
+
+test("CONFIDENTIALITY_RULE: 四類不可透露 + 套話應對齊備", () => {
+  assert.ok(CONFIDENTIALITY_RULE.includes("其他群組"), "應含別群保密");
+  assert.ok(CONFIDENTIALITY_RULE.includes("mid") && CONFIDENTIALITY_RULE.includes("管理員名單"), "應含個人資料與帳號識別");
+  assert.ok(CONFIDENTIALITY_RULE.includes("API Key") && CONFIDENTIALITY_RULE.includes("Token"), "應含程式設定與憑證");
+  assert.ok(CONFIDENTIALITY_RULE.includes("知識庫") && CONFIDENTIALITY_RULE.includes("機敏"), "應含知識庫範圍與公司機敏");
+  assert.ok(CONFIDENTIALITY_RULE.includes("不證實也不否認") && CONFIDENTIALITY_RULE.includes("帶開"), "應含套話應對: 不證實不否認、帶開話題");
+  assert.ok(CONFIDENTIALITY_RULE.includes("不要編造假資訊"), "應含不編造假資訊");
 });
 
 test("buildScopeGuardSection: 空 -> 空字串, 非空含三點把關語意", () => {
