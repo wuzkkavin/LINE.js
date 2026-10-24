@@ -10,8 +10,50 @@ pub const ENGINE_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/engine
 pub const ENGINE_EMBEDDED: bool = env!("AIBAO_ENGINE_EMBEDDED").as_bytes()[0] == b'1';
 pub const ENGINE_ID: &str = env!("AIBAO_ENGINE_ID");
 
+/// 預設連接埠 (核心 3789、控制台 3790)。執行期實際連接埠可能不同:
+/// 使用者在總覽按「改用空閒連接埠」後, 殼改用空閒埠並存進 shell-settings,
+/// 之後 helper_api、chatview、engine 探測一律讀執行期連接埠, 不再寫死預設值。
 pub const CORE_PORT: u16 = 3789;
 pub const HELPER_PORT: u16 = 3790;
+
+/// 執行期連接埠 (啟動時由 shell-settings 帶入, 預設即上列常數; 改埠按鈕先改這裡
+/// 再重啟引擎, 引擎監督者與子行程經環境變數拿到同一組埠)。
+static RUNTIME_PORTS: std::sync::RwLock<(u16, u16)> = std::sync::RwLock::new((CORE_PORT, HELPER_PORT));
+
+pub fn core_port() -> u16 {
+    runtime_ports().0
+}
+
+pub fn helper_port() -> u16 {
+    runtime_ports().1
+}
+
+pub fn runtime_ports() -> (u16, u16) {
+    *RUNTIME_PORTS.read().unwrap()
+}
+
+pub fn set_runtime_ports(core: u16, helper: u16) {
+    *RUNTIME_PORTS.write().unwrap() = (core, helper);
+}
+
+/// 挑一對空閒連接埠 (改用空閒連接埠用): 從 3801 起掃描, 核心與控制台各取第一個
+/// 當下 bind 得上的埠 (bind 後立即放掉; 引擎真正啟動前仍有被別人搶走的極小窗口,
+/// 若重啟後又撞佔用, 提示會再出現、使用者可再按一次)。掃不到回 None。
+pub fn pick_free_port_pair() -> Option<(u16, u16)> {
+    use std::net::TcpListener;
+    let free = |p: u16| TcpListener::bind(("127.0.0.1", p)).is_ok();
+    for core in 3801..=3999u16 {
+        if !free(core) {
+            continue;
+        }
+        for helper in (core + 1)..=4000u16 {
+            if free(helper) {
+                return Some((core, helper));
+            }
+        }
+    }
+    None
+}
 
 /// 佔用者明細: 逐埠列出 listen 行程的 PID 與映像名稱 (取得到才列), 附在 Foreign 說明後面 —
 /// 只說「不明程式」使用者無從辨認 (2026-10-20 補充要求): 有了 PID 與程式名, 就能在工作管理員對上號,
@@ -20,7 +62,7 @@ fn occupant_detail() -> String {
     #[cfg(windows)]
     {
         let mut parts: Vec<String> = Vec::new();
-        for port in [CORE_PORT, HELPER_PORT] {
+        for port in [core_port(), helper_port()] {
             let pids = crate::platform::listening_pids(port);
             if pids.is_empty() {
                 parts.push(format!("埠 {port}: 查不到 listen 行程"));
@@ -47,7 +89,12 @@ fn occupant_detail() -> String {
 
 /// 埠被外來程式佔用時的白話訊息 (顯示在主視窗狀態區, 要讓使用者知道下一步怎麼做)。
 /// 注意分界: 「不認識的程式」才是 Foreign; 舊版 AI寶 (無身分標記的自家舊世代) 歸 Legacy, 由殼收編並負責結束, 不走這段訊息。
-pub const FOREIGN_PORT_MESSAGE: &str = "連接埠被其他程式佔用了: 在這台電腦上回應的服務, 無法確認是 AI寶 (可能是其他程式, 也可能是沒被辨識出來的 AI寶 服務)。AI寶 先不啟動、也不會去動對方的程式。下方有佔用者的行程資訊, 請先在工作管理員確認並關閉佔用連接埠 3789 或 3790 的程式, 再重新開啟 AI寶。";
+/// 訊息裡的埠號用執行期連接埠 (改用空閒連接埠後, 佔用的就是新埠, 不能再寫死 3789/3790)。
+/// 總覽的佔用提示用此前綴判斷 Failed 是否為佔用 (見 page_overview)。
+pub fn foreign_port_message() -> String {
+    let (core, helper) = runtime_ports();
+    format!("連接埠被其他程式佔用了: 在這台電腦上回應的服務, 無法確認是 AI寶 (可能是其他程式, 也可能是沒被辨識出來的 AI寶 服務)。AI寶 先不啟動、也不會去動對方的程式。下方有佔用者的行程資訊, 請先在工作管理員確認並關閉佔用連接埠 {core} 或 {helper} 的程式, 再重新開啟 AI寶。")
+}
 
 /// 收編舊世代引擎時的 log/狀態用語 (不是錯誤: 是同產品舊版, 殼接手管理與結束)。
 pub const LEGACY_ADOPTED_MESSAGE: &str = "偵測到舊版 AI寶 的服務還在執行 (舊世代), 已由本程式接手管理; 之後按「結束服務並關閉程式」會一併把它清乾淨。";
@@ -111,7 +158,7 @@ fn running_stack_version() -> StackVersion {
     }
     #[cfg(windows)]
     {
-        for port in [CORE_PORT, HELPER_PORT] {
+        for port in [core_port(), helper_port()] {
             for pid in crate::platform::listening_pids(port) {
                 if let Some(p) = crate::platform::process_image_path(pid) {
                     let v = stack_version_of_image(&p);
@@ -350,13 +397,13 @@ impl EngineManager {
     /// 任一埠還有服務在回應就算「還活著」。舊版是 ports_alive() 用 AND (雙埠都要有回應),
     /// 結果核心先死、helper 還在 (或反過來) 的半殘狀態會被誤判成「都停了」 — 結束序列加嚴時改為逐埠判定。
     fn any_service_alive() -> bool {
-        http_status(CORE_PORT, "/").is_some() || http_status(HELPER_PORT, "/api/status").is_some()
+        http_status(core_port(), "/").is_some() || http_status(helper_port(), "/api/status").is_some()
     }
 
     /// 分類核心埠 (3789): 現行與舊世代的核心都是 LINE.js 網頁 (GET / 回 HTML);
     /// 回 JSON 或其他形狀的是不明程式; 連不上是 None。
     fn classify_core() -> SvcClass {
-        match probe_port(CORE_PORT, "/") {
+        match probe_port(core_port(), "/") {
             PortProbe::Body(text) => {
                 let head: String = text.chars().take(512).collect::<String>().to_lowercase();
                 if head.contains("<html") || head.contains("<!doctype") {
@@ -374,7 +421,7 @@ impl EngineManager {
     /// 目前世代: {service:"aibao-helper", capabilities, bot, ...}; 舊世代 (4a54c35 網頁版與 1314fb3 第一代殼同形):
     /// {version, bot, serverTime} 無 service 欄位。有回應但兩種形狀都不是 (例如 CI 的 stub 只有 {version, bot}、缺 serverTime) → Foreign。
     fn classify_helper() -> SvcClass {
-        match probe_port(HELPER_PORT, "/api/status") {
+        match probe_port(helper_port(), "/api/status") {
             PortProbe::Body(text) => {
                 let v: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -467,7 +514,7 @@ impl EngineManager {
         let (core_cls, helper_cls) = Self::probe_classes_confirmed(4, Duration::from_millis(700));
         if core_cls == SvcClass::Foreign || helper_cls == SvcClass::Foreign {
             let detail = occupant_detail();
-            let msg = format!("{FOREIGN_PORT_MESSAGE}\n{detail}");
+            let msg = format!("{}\n{detail}", foreign_port_message());
             self.state = EngineState::Failed(msg.clone());
             shell::log_line(&format!("偵測到連接埠被不明程式佔用 (世代分類=Foreign, 多輪確認後定案), 已擋下並提示使用者。{detail}"));
             return Err(msg);
@@ -498,7 +545,11 @@ impl EngineManager {
         {
             let job = crate::platform::JobHandle::new_kill_on_close()
                 .map_err(|e| format!("建立行程管理 (Job Object) 失敗: {e}"))?;
-            let spawned = crate::platform::spawn_engine_suspended(&exe, &[("HWLINEHELPER_NO_BROWSER", "1")])
+            let spawned = crate::platform::spawn_engine_suspended(&exe, &[
+                ("HWLINEHELPER_NO_BROWSER", "1"),
+                ("HWLINE_CORE_PORT", &core_port().to_string()),
+                ("HELPER_PORT", &helper_port().to_string()),
+            ])
                 .map_err(|e| format!("啟動引擎失敗: {e}"))?;
             crate::platform::assign_and_resume(&job, &spawned)
                 .map_err(|e| format!("引擎納管失敗: {e}"))?;
@@ -511,6 +562,8 @@ impl EngineManager {
         {
             let child = std::process::Command::new(&exe)
                 .env("HWLINEHELPER_NO_BROWSER", "1")
+                .env("HWLINE_CORE_PORT", core_port().to_string())
+                .env("HELPER_PORT", helper_port().to_string())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -532,7 +585,7 @@ impl EngineManager {
                         // 一樣走多輪確認: 監督者剛退場的瞬間最容易撞上退場窗口的 Flapping/跨界誤判
                         let (core_cls, helper_cls) = Self::probe_classes_confirmed(2, Duration::from_millis(600));
                         if core_cls == SvcClass::Foreign || helper_cls == SvcClass::Foreign {
-                            self.state = EngineState::Failed(format!("{FOREIGN_PORT_MESSAGE}\n{}", occupant_detail()));
+                            self.state = EngineState::Failed(format!("{}\n{}", foreign_port_message(), occupant_detail()));
                         } else {
                             self.state = EngineState::ExternalRunning;
                         }
@@ -550,14 +603,14 @@ impl EngineManager {
                     if core_up && helper_cls == SvcClass::Current {
                         self.state = EngineState::Running;
                         self.starting_foreign_strikes = 0;
-                        shell::log_line("引擎就緒: 核心 3789 與 helper 3790 皆回應 (身分驗證通過)");
+                        shell::log_line(&format!("引擎就緒: 核心 {} 與 helper {} 皆回應 (身分驗證通過)", core_port(), helper_port()));
                     } else if helper_cls == SvcClass::Foreign {
                         // 自己的 helper 還在啟動窗口時, 3790 可能短暫是別的東西在退場 (或回應形狀未定);
                         // 連續 3 次探測都由完整 body 證明是 Foreign 才定案, 不因單次命中就鎖死。
                         self.starting_foreign_strikes += 1;
                         if self.starting_foreign_strikes >= 3 {
                             let detail = occupant_detail();
-                            self.state = EngineState::Failed(format!("{FOREIGN_PORT_MESSAGE}\n{detail}"));
+                            self.state = EngineState::Failed(format!("{}\n{detail}", foreign_port_message()));
                             shell::log_line(&format!("引擎啟動時發現連接埠被不明程式佔用 (世代分類=Foreign, 連續探測確認)。{detail}"));
                             return;
                         }
@@ -658,7 +711,9 @@ impl EngineManager {
             let detail = Self::residual_detail();
             shell::log_line(&format!("結束被擋下: 埠上有不明程式 (非 AI寶 服務), 不動它也不關窗。現況: {detail}"));
             return StopOutcome::BlockedForeign(format!(
-                "沒有把服務停下來: 連接埠 3789 或 3790 上回應的服務無法確認是 AI寶, 本程式不會去結束別人的程式, 視窗先不關。現況: {detail}。請先到工作管理員結束佔用該連接埠的程式, 再重新開啟 AI寶。"
+                "沒有把服務停下來: 連接埠 {} 或 {} 上回應的服務無法確認是 AI寶, 本程式不會去結束別人的程式, 視窗先不關。現況: {detail}。請先到工作管理員結束佔用該連接埠的程式, 再重新開啟 AI寶。",
+                core_port(),
+                helper_port()
             ));
         }
 
@@ -747,7 +802,7 @@ impl EngineManager {
             // 這裡專門處理不在我們 Job 裡的行程: 收編/舊世代的 listener 與 engine 目錄底下的殘留監督者。
             let engine_root = shell::data_dir().join("engine");
             let mut targets: Vec<u32> = Vec::new();
-            for port in [CORE_PORT, HELPER_PORT] {
+            for port in [core_port(), helper_port()] {
                 for pid in crate::platform::listening_pids(port) {
                     if let Some(p) = crate::platform::process_image_path(pid) {
                         images.push(p);
@@ -832,7 +887,7 @@ impl EngineManager {
                 format!("埠 {port}: {cls:?} (行程 {})", descs.join(", "))
             }
         };
-        format!("{}; {}", fmt(CORE_PORT, core_cls), fmt(HELPER_PORT, helper_cls))
+        format!("{}; {}", fmt(core_port(), core_cls), fmt(helper_port(), helper_cls))
     }
 
     pub fn state_label(&self) -> &'static str {

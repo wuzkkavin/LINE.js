@@ -1,4 +1,4 @@
-// helper 本機 API 客戶端 (http://127.0.0.1:3790/api/*): 殼的設定/狀態/診斷全走這裡,
+// helper 本機 API 客戶端 (http://127.0.0.1:<控制台連接埠>/api/*, 預設 3790): 殼的設定/狀態/診斷全走這裡,
 // 不重寫 helper 業務邏輯 (規格書 v3 第 3 節)。端點合約見 helper/src/server.mjs。
 //
 // 消費級基線 (2026-10-20 老吳裁示): UI 只准看到白話訊息, 不准出現狀態碼/Network Error
@@ -8,7 +8,7 @@
 // 帶 helper 的白話 message 就優先用它。
 use std::time::Duration;
 
-use crate::engine::HELPER_PORT;
+use crate::engine::helper_port;
 use crate::shell;
 
 const ERR_UNREACHABLE: &str = "連不上 AI寶 的服務, 它可能還在啟動或短暫忙碌。請稍等幾秒再試一次; 如果一直失敗, 請到「總覽」頁按「一鍵修復」。";
@@ -23,7 +23,7 @@ fn agent(timeout_secs: u64) -> ureq::Agent {
 }
 
 fn url(path: &str) -> String {
-    format!("http://127.0.0.1:{HELPER_PORT}{path}")
+    format!("http://127.0.0.1:{}{path}", helper_port())
 }
 
 enum CallErr {
@@ -120,12 +120,12 @@ pub fn get_status() -> Result<serde_json::Value, String> {
 /// 群組篩選 (2026-10-23): chat 給了就帶 ?chat=<chatId>, 由 helper 端做純顯示層
 /// 篩選 (邏輯在 helper/src/activityfilter.mjs, 附單元測試); chatId 只含英數字
 /// 與連字號, 直接拼進 query 即可。
-/// 核心聊天頁自我檢查 (修復版6後續修復): 直接對核心 3789 根頁面做一次 GET,
+/// 核心聊天頁自我檢查 (修復版6後續修復): 直接對核心根頁面做一次 GET,
 /// 只回狀態碼、不解析內容。給「聊天室畫面」頁區分「核心網頁連不上」
 /// 與「核心網頁通、但嵌入顯示有問題」兩種情況, 不再讓使用者對著空白猜。
 pub fn core_page_check() -> Result<u16, String> {
-    use crate::engine::CORE_PORT;
-    match agent(5).get(&format!("http://127.0.0.1:{CORE_PORT}/")).call() {
+    use crate::engine::core_port;
+    match agent(5).get(&format!("http://127.0.0.1:{}/", core_port())).call() {
         Ok(resp) => Ok(resp.status()),
         Err(ureq::Error::Status(code, _)) => Ok(code),
         Err(e) => Err(format!("{e}")),

@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::core_ws;
-use crate::engine::CORE_PORT;
+use crate::engine::core_port;
 
 /// 有人剛進群的鑰匙交接窗口: 這段時間內不要發送 (規格護欄; 撞上就順延到窗口結束)。
 pub const JOIN_GUARD_MS: i64 = 120_000;
@@ -192,10 +192,10 @@ impl PageChannel {
         // 必須用 ClientRequestBuilder (它自動帶 Sec-WebSocket-Key 握手標頭);
         // 手組 http::Request 會缺標頭被拒 — core_ws::connect_ws 的既有定版教訓。
         let req = tungstenite::client::ClientRequestBuilder::new(
-            format!("ws://127.0.0.1:{CORE_PORT}/ws").parse().map_err(|e| format!("WS 位址錯誤: {e:?}"))?,
+            format!("ws://127.0.0.1:{}/ws", core_port()).parse().map_err(|e| format!("WS 位址錯誤: {e:?}"))?,
         )
-        .with_header("Host", format!("127.0.0.1:{CORE_PORT}"))
-        .with_header("Origin", format!("http://127.0.0.1:{CORE_PORT}"))
+        .with_header("Host", format!("127.0.0.1:{}", core_port()))
+        .with_header("Origin", format!("http://127.0.0.1:{}", core_port()))
         .with_header("Cookie", cookie);
         let (mut socket, _resp) = tungstenite::connect(req).map_err(|e| format!("連不上 LINE 核心: {e}"))?;
         if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
@@ -330,9 +330,9 @@ pub fn upload_media(bytes: &[u8], content_type: &str) -> Result<String, String> 
     let cookie = core_ws::fetch_cookie()?;
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(3)).timeout_read(Duration::from_secs(30)).build();
     let resp = agent
-        .post(&format!("http://127.0.0.1:{CORE_PORT}/media/upload"))
+        .post(&format!("http://127.0.0.1:{}/media/upload", core_port()))
         .set("Cookie", &cookie)
-        .set("Origin", &format!("http://127.0.0.1:{CORE_PORT}"))
+        .set("Origin", &format!("http://127.0.0.1:{}", core_port()))
         .set("Content-Type", content_type)
         .send_bytes(bytes);
     match resp {
@@ -361,9 +361,9 @@ pub fn upload_file(bytes: &[u8], filename: &str) -> Result<String, String> {
     let cookie = core_ws::fetch_cookie()?;
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(3)).timeout_read(Duration::from_secs(60)).build();
     let resp = agent
-        .post(&format!("http://127.0.0.1:{CORE_PORT}/file/upload"))
+        .post(&format!("http://127.0.0.1:{}/file/upload", core_port()))
         .set("Cookie", &cookie)
-        .set("Origin", &format!("http://127.0.0.1:{CORE_PORT}"))
+        .set("Origin", &format!("http://127.0.0.1:{}", core_port()))
         .set("Content-Type", "application/octet-stream")
         .set("X-Filename", &crate::helper_api::percent_encode(filename))
         .send_bytes(bytes);

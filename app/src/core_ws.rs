@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::engine::CORE_PORT;
+use crate::engine::core_port;
 use crate::shell;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,7 +97,7 @@ pub(crate) fn fetch_cookie() -> Result<String, String> {
         .timeout_read(Duration::from_secs(3))
         .build();
     let resp = agent
-        .get(&format!("http://127.0.0.1:{CORE_PORT}/"))
+        .get(&format!("http://127.0.0.1:{}/", core_port()))
         .call()
         .map_err(|e| format!("連不上核心服務: {e}"))?;
     let cookie = resp
@@ -126,7 +126,7 @@ pub fn fetch_profile_picture(picture_id: &str) -> Result<Vec<u8>, String> {
         .timeout_read(Duration::from_secs(5))
         .build();
     let resp = agent
-        .get(&format!("http://127.0.0.1:{CORE_PORT}/media/{picture_id}"))
+        .get(&format!("http://127.0.0.1:{}/media/{picture_id}", core_port()))
         .set("Cookie", &cookie)
         .call()
         .map_err(|e| format!("向核心取頭像失敗: {e}"))?;
@@ -187,10 +187,10 @@ pub fn spawn_login_thread(state: SharedLogin, commands: Receiver<WsCommand>, rep
 /// 2026-10-20 雲端探針實測: 用手組 http::Request 會缺 sec-websocket-key 被核心拒絕。
 fn connect_ws(cookie: &str) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, String> {
     let req = tungstenite::client::ClientRequestBuilder::new(
-        format!("ws://127.0.0.1:{CORE_PORT}/ws").parse().map_err(|e| format!("WS 位址錯誤: {e:?}"))?,
+        format!("ws://127.0.0.1:{}/ws", core_port()).parse().map_err(|e| format!("WS 位址錯誤: {e:?}"))?,
     )
-    .with_header("Host", format!("127.0.0.1:{CORE_PORT}"))
-    .with_header("Origin", format!("http://127.0.0.1:{CORE_PORT}"))
+    .with_header("Host", format!("127.0.0.1:{}", core_port()))
+    .with_header("Origin", format!("http://127.0.0.1:{}", core_port()))
     .with_header("Cookie", cookie.to_string());
     let (socket, _resp) = tungstenite::connect(req).map_err(|e| format!("WS 連線被拒: {e}"))?;
     Ok(socket)

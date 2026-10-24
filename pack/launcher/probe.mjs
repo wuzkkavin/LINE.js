@@ -79,16 +79,19 @@ export function buildChildSpec(role, ctx) {
   if (!ctx || !ctx.exePath || !ctx.dataDir) {
     throw new Error('buildChildSpec 需要傳入含有 exePath 與 dataDir 的 ctx');
   }
-  const { exePath, dataDir, extraArgs = [] } = ctx;
+  const { exePath, dataDir, extraArgs = [], helperPort } = ctx;
   if (role === 'core') {
     return { file: exePath, args: ['--role', 'core'], cwd: dataDir, env: {} };
   }
   if (role === 'helper') {
+    // helper 埠: 監督者經 helperPort 傳入 (殼改用空閒連接埠時); 未傳時沿用預設 3790
+    // (舊測試與舊呼叫不帶此參數, 行為不變)。注意: 這裡的 env 會蓋掉子行程繼承的
+    // HELPER_PORT, 所以改埠一定要走這個參數, 不能只靠外層環境變數。
     return {
       file: exePath,
       args: ['--role', 'helper'],
       cwd: dataDir,
-      env: { HELPER_DATA_DIR: dataDir, HELPER_PORT: '3790' },
+      env: { HELPER_DATA_DIR: dataDir, HELPER_PORT: String(helperPort || 3790) },
     };
   }
   if (role === 'cli') {

@@ -25,6 +25,22 @@ test("first-run config uses configured port; existing personal values take prece
   assert.equal((await loadConfig(root)).server.port, 6789);
 });
 
+test("HWLINE_CORE_PORT env overrides the file port; invalid env is ignored", async (t) => {
+  const { root } = await fixture(t);
+  const prev = process.env.HWLINE_CORE_PORT;
+  try {
+    process.env.HWLINE_CORE_PORT = "3811";
+    assert.equal((await loadConfig(root)).server.port, 3811);
+    process.env.HWLINE_CORE_PORT = "not-a-port";
+    assert.equal((await loadConfig(root)).server.port, 4567);
+    process.env.HWLINE_CORE_PORT = "70000";
+    assert.equal((await loadConfig(root)).server.port, 4567);
+  } finally {
+    if (prev === undefined) delete process.env.HWLINE_CORE_PORT;
+    else process.env.HWLINE_CORE_PORT = prev;
+  }
+});
+
 test("limits above security ceilings and malformed hosts are rejected", async (t) => {
   const { root, config } = await fixture(t);
   for (const [section, key, value] of [

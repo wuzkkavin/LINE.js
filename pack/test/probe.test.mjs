@@ -108,6 +108,16 @@ test('buildChildSpec：helper 角色帶專用環境變數', () => {
   });
 });
 
+test('buildChildSpec：helper 角色可用 helperPort 改埠 (殼改用空閒連接埠時)', () => {
+  const ctx = { exePath: '/tmp/fake.exe', dataDir: '/tmp/data-dir', helperPort: 3812 };
+  assert.deepEqual(buildChildSpec('helper', ctx), {
+    file: ctx.exePath,
+    args: ['--role', 'helper'],
+    cwd: ctx.dataDir,
+    env: { HELPER_DATA_DIR: ctx.dataDir, HELPER_PORT: '3812' },
+  });
+});
+
 test('buildChildSpec：cli 角色帶額外參數', () => {
   const ctx = {
     exePath: '/tmp/fake.exe',

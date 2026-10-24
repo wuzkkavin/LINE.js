@@ -143,6 +143,12 @@ pub struct ShellSettings {
     /// serde default = false (不自動登入), 符合老吳定的出廠預設。
     #[serde(default)]
     pub auto_login: bool,
+    /// 引擎連接埠 (只有使用者在總覽按過「改用空閒連接埠」才有值; 缺省 = 預設
+    /// 3789/3790)。舊設定檔沒有此欄位時 serde default 補 None, 行為不變。
+    #[serde(default)]
+    pub core_port: Option<u16>,
+    #[serde(default)]
+    pub helper_port: Option<u16>,
 }
 
 fn default_true() -> bool {
@@ -155,7 +161,7 @@ fn default_theme() -> String {
 
 impl Default for ShellSettings {
     fn default() -> Self {
-        Self { show_window_on_start: true, tray_hint_shown: false, theme: default_theme(), auto_login: false }
+        Self { show_window_on_start: true, tray_hint_shown: false, theme: default_theme(), auto_login: false, core_port: None, helper_port: None }
     }
 }
 

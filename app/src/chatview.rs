@@ -1,4 +1,4 @@
-//! 「聊天室畫面」頁嵌入的核心聊天畫面 (http://127.0.0.1:3789)。
+//! 「聊天室畫面」頁嵌入的核心聊天畫面 (http://127.0.0.1:<核心連接埠>, 預設 3789)。
 //!
 //! 只有 Windows + MSVC 建置 (CI 正式成品的工具鏈) 才有真的 WebView2 嵌入:
 //! 以 wry 建立子視窗掛在 eframe 主視窗 (HWND) 底下, 位置/尺寸每幀跟 egui 預留的
@@ -17,7 +17,10 @@ use std::path::Path;
 
 // 只在 Windows MSVC 的 imp 模組裡使用; 其他平台編譯時標記允許未使用, 免警告。
 #[cfg_attr(not(all(windows, target_env = "msvc")), allow(dead_code))]
-pub const CHAT_URL: &str = "http://127.0.0.1:3789/";
+/// 核心聊天頁位址 (執行期核心連接埠組裝; 改用空閒連接埠後跟著變)。
+pub fn chat_url() -> String {
+    format!("http://127.0.0.1:{}/", crate::engine::core_port())
+}
 
 pub fn available() -> bool {
     cfg!(all(windows, target_env = "msvc"))
@@ -302,7 +305,7 @@ mod imp {
         // 核心根頁面會在同一個回應裡 Set-Cookie, 頁面自己就能連上 (見檔頭查證)。
         let mut context = wry::WebContext::new(Some(profile_dir.clone()));
         let webview = wry::WebViewBuilder::new_with_web_context(&mut context)
-            .with_url(super::CHAT_URL)
+            .with_url(&super::chat_url())
             .with_bounds(rect_of(bounds))
             // 修復版6後續修復: 導覽處理器只記錄、不攔截。過去導覽失敗全程無聲,
             // 現在 shell.log 會留下 WebView 實際載入的網址, 診斷包可分辨

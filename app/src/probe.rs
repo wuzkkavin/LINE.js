@@ -46,8 +46,8 @@ pub fn run_probe() -> i32 {
     let mut helper_code = None;
     while Instant::now() < deadline {
         mgr.tick();
-        core_code = engine::http_status(engine::CORE_PORT, "/");
-        helper_code = engine::http_status(engine::HELPER_PORT, "/api/status");
+        core_code = engine::http_status(engine::core_port(), "/");
+        helper_code = engine::http_status(engine::helper_port(), "/api/status");
         if core_code == Some(200) && helper_code == Some(200) {
             break;
         }
@@ -63,7 +63,7 @@ pub fn run_probe() -> i32 {
     }
     rec("ports=ok".to_string());
     // 4) helper 狀態內容 (bot 欄位存在與否)
-    if let Some(text) = engine::http_get_text(engine::HELPER_PORT, "/api/status") {
+    if let Some(text) = engine::http_get_text(engine::helper_port(), "/api/status") {
         let has_bot = text.contains("\"bot\"");
         rec(format!("helper_status_has_bot={has_bot}"));
         // 身分標記也要在 (新版 helper 才有; App 靠它分辨新舊服務)
@@ -77,21 +77,21 @@ pub fn run_probe() -> i32 {
     // list-models 不給 Key → 正確行為是 HTTP 200 + {ok:false, code:"AI_NO_KEY"}; 若回 404 就是路由不在 (實機踩過)。
     // 兩支都用 40 秒長逾時: list-models 沒帶 Key 時 helper 要先讀 Windows 認證管理員
     // (冷啟動 PowerShell + Add-Type 編譯), 10 秒在忙碌 CI 機器上會假失敗 (run 39413133498 實證)。
-    match engine::http_post_text_long(engine::HELPER_PORT, "/api/list-models", "{\"provider\":\"groq\",\"baseUrl\":\"https://api.groq.com/openai/v1\"}", 40) {
+    match engine::http_post_text_long(engine::helper_port(), "/api/list-models", "{\"provider\":\"groq\",\"baseUrl\":\"https://api.groq.com/openai/v1\"}", 40) {
         Some((200, body)) if body.contains("AI_NO_KEY") => rec("helper_list_models_route=ok".to_string()),
         Some((code, body)) => rec(format!("helper_list_models_route=fail:http{code}:{}", sanitize(&body.chars().take(120).collect::<String>()))),
         None => rec("helper_list_models_route=fail:no-response".to_string()),
     }
     // test-ai 把 baseUrl 指向必定連不上的本機埠 → 正確行為是 HTTP 200 + {ok:false, code:"AI_NETWORK"};
     // 回 404 代表 test-ai 路由不在; 回 ok:true 或其他 code 都不對。
-    match engine::http_post_text_long(engine::HELPER_PORT, "/api/test-ai", "{\"provider\":\"groq\",\"baseUrl\":\"http://127.0.0.1:9/v1\",\"model\":\"probe-stub\",\"apiKey\":\"probe\"}", 40) {
+    match engine::http_post_text_long(engine::helper_port(), "/api/test-ai", "{\"provider\":\"groq\",\"baseUrl\":\"http://127.0.0.1:9/v1\",\"model\":\"probe-stub\",\"apiKey\":\"probe\"}", 40) {
         Some((200, body)) if body.contains("AI_NETWORK") => rec("helper_test_ai_route=ok".to_string()),
         Some((code, body)) => rec(format!("helper_test_ai_route=fail:http{code}:{}", sanitize(&body.chars().take(120).collect::<String>()))),
         None => rec("helper_test_ai_route=fail:no-response".to_string()),
     }
     // 4c) 群組清單端點實測: GET /api/line/chats。此時核心未登入, 正確行為是 200 + {ok:false, code:"NOT_LOGGED_IN"};
     // 回 404 或非 JSON 代表路由不在 (同 4b 教訓)。helper 端要等核心把登入狀態定案, 給 40 秒逾時。
-    match engine::http_get_text_long(engine::HELPER_PORT, "/api/line/chats", 40) {
+    match engine::http_get_text_long(engine::helper_port(), "/api/line/chats", 40) {
         Some(body) if body.contains("NOT_LOGGED_IN") || body.contains("\"ok\":true") || body.contains("\"ok\": true") => {
             rec("helper_line_chats_route=ok".to_string())
         }
@@ -100,7 +100,7 @@ pub fn run_probe() -> i32 {
     }
     // 4d) 白名單清單端點實測 (修復項 8): GET /api/line/whitelist 必須 200 且回 chats 陣列 (逐筆, 不是計數);
     // 回 404/無 chats 代表端點不在。
-    match engine::http_get_text_long(engine::HELPER_PORT, "/api/line/whitelist", 40) {
+    match engine::http_get_text_long(engine::helper_port(), "/api/line/whitelist", 40) {
         Some(body) => {
             let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
             let wl_ok = parsed
@@ -138,7 +138,7 @@ pub fn run_probe() -> i32 {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut freed = false;
     while Instant::now() < deadline {
-        if engine::http_status(engine::CORE_PORT, "/").is_none() && engine::http_status(engine::HELPER_PORT, "/api/status").is_none() {
+        if engine::http_status(engine::core_port(), "/").is_none() && engine::http_status(engine::helper_port(), "/api/status").is_none() {
             freed = true;
             break;
         }

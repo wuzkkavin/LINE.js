@@ -21,8 +21,14 @@ import { noBrowser } from "./nobrowser.mjs";
 import { clearStopRequest, consumeStopRequest } from "./stopfile.mjs";
 import { hasUsableSession, planBrowserUrls, CONSOLE_URL } from "./openplan.mjs";
 
-const CORE_PORT = 3789;
-const HELPER_PORT = 3790;
+// 監督者探測用連接埠: 殼「改用空閒連接埠」時經環境變數傳入 (HWLINE_CORE_PORT /
+// HELPER_PORT), 未傳時沿用預設 3789/3790; 無效值一律回預設, 不讓壞值打壞探測。
+function envPort(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isSafeInteger(n) && n >= 1 && n <= 65535 ? n : fallback;
+}
+const CORE_PORT = envPort("HWLINE_CORE_PORT", 3789);
+const HELPER_PORT = envPort("HELPER_PORT", 3790);
 // 本檔案會在兩種情境執行: 開發模式直接以 node 執行本 ESM 原始檔 (import.meta.url 可用),
 // 以及被 esbuild 打成 CJS 後塞進 SEA (import.meta 為空物件, 改用 CJS 的 __filename)。
 // selfPath() 統一取得本程式路徑; repoRoot 只在開發模式使用, SEA 時其值不被引用。
@@ -151,7 +157,7 @@ async function supervise(sea, paths) {
   }
 
   const spawnRole = (role) => {
-    const spec = buildChildSpec(role, { exePath: process.execPath, dataDir: paths.root });
+    const spec = buildChildSpec(role, { exePath: process.execPath, dataDir: paths.root, helperPort: HELPER_PORT });
     // stdio 要傳已開啟的 fd; WriteStream 尚未 open 時 fd 為 null, spawn 會拒絕。
     const fd = openSync(join(paths.logsDir, `launcher-${role}.log`), "a");
     const argv = sea ? spec.args : [selfPath(), ...spec.args];

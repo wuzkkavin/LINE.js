@@ -98,8 +98,14 @@ export async function loadConfig(root = process.cwd()): Promise<Config> {
     "ANDROIDSECONDARY", "DESKTOPWIN", "DESKTOPMAC", "ANDROID", "IOS", "IOSIPAD", "WATCHOS", "WEAROS",
   ];
   if (typeof line.device !== "string" || !devices.includes(line.device)) throw new Error("CONFIG_INVALID");
+  // 殼「改用空閒連接埠」: HWLINE_CORE_PORT 環境變數可覆寫核心監聽埠 (連接埠被佔用時
+  // 殼改走空閒埠重啟引擎, 不必改寫 config.yaml)。無效值一律忽略、沿用檔案設定。
+  const envPort = Number(process.env.HWLINE_CORE_PORT);
+  const corePort = Number.isSafeInteger(envPort) && envPort >= 1 && envPort <= 65535
+    ? envPort
+    : integer(server.port, 65535);
   return {
-    server: { host: server.host, port: integer(server.port, 65535) },
+    server: { host: server.host, port: corePort },
     line: { device: line.device as Device },
     history: { defaultLimit: integer(history.defaultLimit, 100) },
     cache: {
