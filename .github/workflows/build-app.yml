@@ -489,11 +489,23 @@ jobs:
           public class Win32Pg {
             [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
             [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+            [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+            [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
           }
           "@
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
-          function Shot-App([string]$name, [hashtable]$extraEnv, [scriptblock]$whileUp = $null) {
+          function Save-Screen([string]$path) {
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $g.Dispose()
+            $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose()
+            Write-Host "screenshot $path $((Get-Item $path).Length) bytes"
+          }
+          function Shot-App([string]$name, [hashtable]$extraEnv, [scriptblock]$whileUp = $null, [int[]]$scrollSteps = @()) {
             foreach ($k in $extraEnv.Keys) { Set-Item "env:$k" $extraEnv[$k] }
             $p = Start-Process -FilePath $exe -PassThru
             try {
@@ -516,12 +528,27 @@ jobs:
                 [Win32Pg]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
                 Start-Sleep -Seconds 2
               }
-              $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-              $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-              $g = [System.Drawing.Graphics]::FromImage($bmp)
-              $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-              $bmp.Save((Join-Path $PWD "pages\page-$name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
-              Write-Host "page ${name}: screenshot $((Get-Item "pages\page-$name.png").Length) bytes"
+              Save-Screen (Join-Path $PWD "pages\page-$name.png")
+              # 捲動幀 (修復版6後續修復第二輪): CI 視窗 1000x700 只拍得到頁面上半,
+              # 下方內容全在捲動下方, 上半頁截圖不能冒充全頁證據。步數為累計位置
+              # (每 notch -120 = 內容上移、露出下方, 多幀覆蓋未知每 notch 捲動量)。
+              $step = 0
+              foreach ($n in $scrollSteps) {
+                if ($p.MainWindowHandle -ne [IntPtr]::Zero) {
+                  [Win32Pg]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+                }
+                [Win32Pg]::SetCursorPos(510, 360) | Out-Null
+                # 滾輪向下 (-120 的 uint32 包裝值, 內容上移、露出下方); 直接寫 [uint32](-120)
+                # 會被 PowerShell 範圍檢查擋下, 故寫已包裝好的正值 4294967176。
+                $wheelDown = [uint32]4294967176
+                for ($i = $step; $i -lt $n; $i++) {
+                  [Win32Pg]::mouse_event(0x0800, 0, 0, $wheelDown, [UIntPtr]::Zero)
+                  Start-Sleep -Milliseconds 100
+                }
+                $step = $n
+                Start-Sleep -Seconds 2
+                Save-Screen (Join-Path $PWD "pages\page-$name-s$n.png")
+              }
             } finally {
               foreach ($k in $extraEnv.Keys) { Remove-Item "env:$k" -ErrorAction SilentlyContinue }
               if (-not $p.HasExited) {
@@ -590,12 +617,21 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw '逐頁截圖前置失敗: 種入假 chatProfiles 失敗' }
             Write-Host '已透過 API 種入假 chatProfiles (聊天室管理頁截圖用)'
           }
-          Shot-App 'overview' @{} $seedAction
+          Shot-App 'overview' @{} $seedAction @(5,10,20,35)
+          # 總覽嵌入實景 (與聊天室畫面頁同一嵌入, 強制嵌入旗標讓未登入時也能拍到
+          # 框內的核心登入頁, 證明總覽嵌入路徑會畫; 真登入後的總覽嵌入仍須真機驗收)。
+          Shot-App 'overview-embed' @{ AIBAO_CHATVIEW_FORCE = '1' } -scrollSteps @(20,35)
           Shot-App 'chat' @{ AIBAO_START_PAGE = 'chat'; AIBAO_CHATVIEW_FORCE = '1' }
-          Shot-App 'manage' @{ AIBAO_START_PAGE = 'manage' }
+          Shot-App 'manage' @{ AIBAO_START_PAGE = 'manage' } -scrollSteps @(5,10,20,35)
           # 修復版6後續修復: 切換頁簽對照截圖——以 AIBAO_MANAGE_CHAT_ID 預選第二室,
           # 與上一張 manage 截圖 (預設第一室) 對照, 證明表單跟著頁簽換成該室存檔值。
-          Shot-App 'manage-b' @{ AIBAO_START_PAGE = 'manage'; AIBAO_MANAGE_CHAT_ID = 'c22222222222222222222222222222222' }
+          Shot-App 'manage-b' @{ AIBAO_START_PAGE = 'manage'; AIBAO_MANAGE_CHAT_ID = 'c22222222222222222222222222222222' } -scrollSteps @(20,35)
+          # 選人器三幀 (Codex 對照驗收: 分頁＋搜尋＋已選清單)。種子室 c111 的已選管理員
+          # 「截圖驗證管理員」由 manage_display_candidates 保證出現在候選名單內,
+          # 不會誤觸未確認提醒。假候選人皆為 u9 開頭測試編號, 非真實帳號。
+          Shot-App 'manage-picker' @{ AIBAO_START_PAGE = 'manage'; AIBAO_MANAGE_CANDIDATE_COUNT = '55' } -scrollSteps @(10,20,35,50)
+          Shot-App 'manage-picker-p2' @{ AIBAO_START_PAGE = 'manage'; AIBAO_MANAGE_CANDIDATE_COUNT = '55'; AIBAO_MANAGE_PAGE = '2' } -scrollSteps @(35,50)
+          Shot-App 'manage-picker-search' @{ AIBAO_START_PAGE = 'manage'; AIBAO_MANAGE_CANDIDATE_COUNT = '55'; AIBAO_MANAGE_SEARCH = '成員01' } -scrollSteps @(35,50)
           Shot-App 'send' @{ AIBAO_START_PAGE = 'send' }
           Shot-App 'ai' @{ AIBAO_START_PAGE = 'ai' }
           Shot-App 'bot' @{ AIBAO_START_PAGE = 'bot' }
@@ -604,6 +640,154 @@ jobs:
           Shot-App 'logs' @{ AIBAO_START_PAGE = 'logs' }
           Shot-App 'appsettings' @{ AIBAO_START_PAGE = 'app' }
           Shot-App 'about' @{ AIBAO_START_PAGE = 'about' }
+          # ---- 特殊態截圖 (修復版6後續修復第二輪: 總覽 Codex 化驗收) ----
+          # 共用結束流程: --quit 走具名事件 (與 HOME 無關), 等不到才強制結束並報錯;
+          # 被佔提示若等不到 Failed 落定, 只警告不紅燈 (雲端造不出條件時列未驗證)。
+          function Stop-ShotApp([System.Diagnostics.Process]$p, [string]$name) {
+            if (-not $p.HasExited) {
+              Start-Process -FilePath $exe -ArgumentList '--quit' | Out-Null
+              $dl = (Get-Date).AddSeconds(120)
+              while (-not $p.HasExited -and (Get-Date) -lt $dl) { Start-Sleep -Seconds 2 }
+              if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; throw "pages/${name}: --quit 後未結束" }
+            }
+            Start-Sleep -Seconds 2
+          }
+          function Shot-IdleOverview {
+            # 未啟用占位態: 全新 HOME、auto_login=false, 引擎根本不啟動 — 不能沿用
+            # Shot-App 的 helper-200 等待 (永遠等不到)。目標: 未啟用登入卡＋數字卡「—」
+            # ＋服務列未取得＋目前情況「服務還沒啟動」提示＋嵌入框占位文字。
+            $oldHome = $env:HWLINEHELPER_HOME
+            $idleHome = Join-Path $env:RUNNER_TEMP 'aibao-idle-data'
+            if (Test-Path $idleHome) { Remove-Item $idleHome -Recurse -Force }
+            New-Item -ItemType Directory -Force $idleHome | Out-Null
+            $env:HWLINEHELPER_HOME = $idleHome
+            @{ schema = 1; theme = 'forest'; auto_login = $false; show_window_on_start = $true; tray_hint_shown = $true } |
+              ConvertTo-Json | Set-Content (Join-Path $idleHome 'shell-settings.json') -Encoding utf8
+            $p = Start-Process -FilePath $exe -PassThru
+            try {
+              $deadline = (Get-Date).AddSeconds(120)
+              $up = $false
+              while ((Get-Date) -lt $deadline) {
+                if ($p.HasExited) { throw "pages/overview-idle: App 自行結束 (exit $($p.ExitCode))" }
+                $p.Refresh()
+                if ($p.MainWindowHandle -ne [IntPtr]::Zero) { $up = $true; break }
+                Start-Sleep -Seconds 2
+              }
+              if (-not $up) { throw "pages/overview-idle: 主視窗 120 秒未出現" }
+              Start-Sleep -Seconds 6
+              [Win32Pg]::SetWindowPos($p.MainWindowHandle, [IntPtr]::Zero, 10, 10, 1000, 700, 0x0040) | Out-Null
+              [Win32Pg]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+              Start-Sleep -Seconds 2
+              Save-Screen (Join-Path $PWD "pages\page-overview-idle.png")
+            } finally {
+              Stop-ShotApp $p 'overview-idle'
+              $env:HWLINEHELPER_HOME = $oldHome
+            }
+          }
+          function Shot-CustomPorts {
+            # 自訂連接埠管線: shell-settings 寫 core_port=3811/helper_port=3812 後啟動,
+            # 等控制台在自訂埠回 200 (不可沿用 3790 等待)。目標: 證明設定→啟動 env→
+            # 引擎監聽→殼以新埠通訊整條鏈路 (Running 狀態)。此步證明管線, 不證明點按換埠
+            # (CI 無滑鼠點按自動化; 點按換埠端到端以真機驗收為準)。
+            $oldHome = $env:HWLINEHELPER_HOME
+            $customHome = Join-Path $env:RUNNER_TEMP 'aibao-customports-data'
+            if (Test-Path $customHome) { Remove-Item $customHome -Recurse -Force }
+            New-Item -ItemType Directory -Force $customHome | Out-Null
+            $env:HWLINEHELPER_HOME = $customHome
+            @{ schema = 1; theme = 'forest'; auto_login = $true; show_window_on_start = $true; tray_hint_shown = $true; core_port = 3811; helper_port = 3812 } |
+              ConvertTo-Json | Set-Content (Join-Path $customHome 'shell-settings.json') -Encoding utf8
+            $p = Start-Process -FilePath $exe -PassThru
+            try {
+              $deadline = (Get-Date).AddSeconds(120)
+              $up = $false
+              while ((Get-Date) -lt $deadline) {
+                if ($p.HasExited) { throw "pages/overview-customports: App 自行結束 (exit $($p.ExitCode))" }
+                try {
+                  $b = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3812/api/status' -TimeoutSec 3
+                  if ($b.StatusCode -eq 200) { $up = $true; break }
+                } catch { }
+                Start-Sleep -Seconds 2
+              }
+              if (-not $up) { throw "pages/overview-customports: 控制台在自訂埠 3812 上 120 秒未就緒" }
+              Start-Sleep -Seconds 6
+              $p.Refresh()
+              if ($p.MainWindowHandle -ne [IntPtr]::Zero) {
+                [Win32Pg]::SetWindowPos($p.MainWindowHandle, [IntPtr]::Zero, 10, 10, 1000, 700, 0x0040) | Out-Null
+                [Win32Pg]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+                Start-Sleep -Seconds 2
+              }
+              Save-Screen (Join-Path $PWD "pages\page-overview-customports.png")
+            } finally {
+              Stop-ShotApp $p 'overview-customports'
+              $env:HWLINEHELPER_HOME = $oldHome
+            }
+          }
+          function Shot-OccupiedPorts {
+            # 連接埠被佔提示: 先以假服務佔住 3789/3790 (任意 HTTP 回應即可, 監督者探測
+            # 只認有回應; 非 AI寶 身分即歸 Foreign)。目標: 情況區上方出現被佔提示＋
+            # 「改用空閒連接埠」鈕。等不到 Failed 落定只警告、不紅燈。
+            $oldHome = $env:HWLINEHELPER_HOME
+            $occHome = Join-Path $env:RUNNER_TEMP 'aibao-occupied-data'
+            if (Test-Path $occHome) { Remove-Item $occHome -Recurse -Force }
+            New-Item -ItemType Directory -Force $occHome | Out-Null
+            $occJs = Join-Path $occHome 'occupier.cjs'
+            @'
+            const http = require("http");
+            for (const port of [3789, 3790]) {
+              http.createServer((req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("not-aibao"); }).listen(port, "127.0.0.1");
+            }
+            '@ | Set-Content $occJs -Encoding utf8
+            $occ = Start-Process -FilePath 'node' -ArgumentList $occJs -PassThru
+            try {
+              $deadline = (Get-Date).AddSeconds(30)
+              $occUp = $false
+              while ((Get-Date) -lt $deadline) {
+                try {
+                  $b = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3789/' -TimeoutSec 3
+                  if ($b.StatusCode -eq 200) { $occUp = $true; break }
+                } catch { }
+                Start-Sleep -Seconds 2
+              }
+              if (-not $occUp) { Write-Warning "pages/overview-occupied: 假佔用服務 30 秒未回應, 仍繼續 (提示可能拍不到)" }
+              $env:HWLINEHELPER_HOME = $occHome
+              @{ schema = 1; theme = 'forest'; auto_login = $true; show_window_on_start = $true; tray_hint_shown = $true } |
+                ConvertTo-Json | Set-Content (Join-Path $occHome 'shell-settings.json') -Encoding utf8
+              $p = Start-Process -FilePath $exe -PassThru
+              try {
+                $deadline = (Get-Date).AddSeconds(120)
+                $up = $false
+                while ((Get-Date) -lt $deadline) {
+                  if ($p.HasExited) { throw "pages/overview-occupied: App 自行結束 (exit $($p.ExitCode))" }
+                  $p.Refresh()
+                  if ($p.MainWindowHandle -ne [IntPtr]::Zero) { $up = $true; break }
+                  Start-Sleep -Seconds 2
+                }
+                if (-not $up) { throw "pages/overview-occupied: 主視窗 120 秒未出現" }
+                [Win32Pg]::SetWindowPos($p.MainWindowHandle, [IntPtr]::Zero, 10, 10, 1000, 700, 0x0040) | Out-Null
+                [Win32Pg]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+                # 等 Failed 落定 (App 日誌出現佔用字樣) 再拍, 避免拍到啟動中途;
+                # 90 秒等不到只警告、不紅燈, 截圖仍拍 (屆時狀態以圖為準)。
+                $logPath = Join-Path $occHome 'logs\shell.log'
+                $dl2 = (Get-Date).AddSeconds(90)
+                $settled = $false
+                while ((Get-Date) -lt $dl2) {
+                  if ((Test-Path $logPath) -and (Select-String -Path $logPath -Pattern '佔用' -Quiet)) { $settled = $true; break }
+                  Start-Sleep -Seconds 2
+                }
+                if (-not $settled) { Write-Warning "pages/overview-occupied: 90 秒未見佔用落定紀錄, 截圖狀態以圖為準" }
+                Start-Sleep -Seconds 2
+                Save-Screen (Join-Path $PWD "pages\page-overview-occupied.png")
+              } finally {
+                Stop-ShotApp $p 'overview-occupied'
+              }
+            } finally {
+              if (-not $occ.HasExited) { Stop-Process -Id $occ.Id -Force }
+              $env:HWLINEHELPER_HOME = $oldHome
+            }
+          }
+          Shot-IdleOverview
+          Shot-CustomPorts
+          Shot-OccupiedPorts
           Get-ChildItem pages | ForEach-Object { "shot: $($_.Name) $($_.Length) bytes" }
 
       - name: 上傳成品、探針結果、截圖與 log
