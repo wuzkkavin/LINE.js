@@ -50,6 +50,16 @@ pub struct ChatViewHost {
     // 矩形/可見旗標, 無條件重調 set_bounds + set_visible(true)。
     #[cfg(all(windows, target_env = "msvc"))]
     reveal: bool,
+    // 凍結修復 (2026-10-25): 在頁期間定期重申顯示。
+    // 機制: sync 原本只在矩形改變 / 旗標說沒顯示時才調原生 API, 其餘時間完全
+    // 信任快取的 visible 旗標; 一旦實際顯示狀態與旗標走散 (建立時序、視窗
+    // 狀態變化帶來的子視窗隱藏), 之後再也不重申, 頁面在 Chromium 眼裡一直是
+    // 隱藏的——rAF 不畫、計時器被節流、核心頁的即時訊息收得到也畫不出來,
+    // 直到下一次進頁 (reveal) 或縮小再打開 (視窗重排) 才恢復, 與回報的凍結
+    // 症狀一致。因此在頁期間每秒重申一次位置尺寸與顯示, 與旗標無關;
+    // 已顯示的視窗上重申是無視覺變化的空操作, 不重載、不導覽、不動捲動與輸入。
+    #[cfg(all(windows, target_env = "msvc"))]
+    last_assert: Option<std::time::Instant>,
 }
 
 impl ChatViewHost {
@@ -75,6 +85,7 @@ impl ChatViewHost {
         self.last_attempt = None;
         self.hwnd_missing = false;
         self.reveal = true;
+        self.last_assert = None;
         crate::shell::log_line("嵌入聊天畫面: 已銷毀 WebView, 下一幀會重新建立 (使用者按了重新載入)");
     }
 
@@ -105,6 +116,8 @@ impl ChatViewHost {
             diag_logged_at: None,
             #[cfg(all(windows, target_env = "msvc"))]
             reveal: false,
+            #[cfg(all(windows, target_env = "msvc"))]
+            last_assert: None,
         }
     }
 
@@ -216,18 +229,23 @@ impl ChatViewHost {
         // 強制重排重顯 (進頁/重新載入時): 不論快取矩形與可見旗標,
         // 無條件重調位置尺寸並重新顯示——這就是縮小再打開時觸發的動作。
         // set_visible(true) 失敗時旗標保持 false, 下一幀會再重試, 不再謊稱已顯示。
+        // 凍結修復: 在頁期間每秒再重申一次 (見 last_assert 欄位註解), 不再只信旗標。
         // (log 必須等 inner 借用結束後才能寫, 故先記在 show_err、離開 if-let 再寫。)
         let force = self.reveal;
         self.reveal = false;
+        let assert_due = self
+            .last_assert
+            .map(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+            .unwrap_or(true);
         let mut show_err: Option<String> = None;
         let mut placed = false;
         if let Some(inner) = &mut self.inner {
-            if force || inner.bounds != bounds {
+            if force || assert_due || inner.bounds != bounds {
                 if inner.webview.set_bounds(imp::rect_of(bounds)).is_ok() {
                     inner.bounds = bounds;
                 }
             }
-            if force || !inner.visible {
+            if force || assert_due || !inner.visible {
                 match inner.webview.set_visible(true) {
                     Ok(()) => inner.visible = true,
                     Err(e) => {
@@ -235,6 +253,9 @@ impl ChatViewHost {
                         show_err = Some(format!("嵌入聊天畫面: 重新顯示失敗, 下一幀會重試: {e}"));
                     }
                 }
+            }
+            if force || assert_due {
+                self.last_assert = Some(std::time::Instant::now());
             }
             placed = true;
         }

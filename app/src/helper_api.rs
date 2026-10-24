@@ -237,13 +237,10 @@ pub fn mark_admin_event_sent(id: &str, ok: bool, note: &str) -> Result<serde_jso
     post_json("/api/admin-events/sent", serde_json::json!({ "id": id, "ok": ok, "note": note }), 15)
 }
 
-/// 管理員候選名單 (白名單群組近期發言者 + OpenChat 管理員)
-pub fn get_admin_candidates() -> Result<serde_json::Value, String> {
-    with_retry("/api/admin-candidates", || once_get("/api/admin-candidates", 30))
-}
-
 /// 單一聊天室的管理員候選名單 (聊天室管理頁用): 只回該室的近期發言者與社群管理員,
-/// 回應形狀與 get_admin_candidates 相同 (candidates 陣列, 每筆含 id/name/chats/source)。
+/// 每筆含 id/name/chats/source。管理員只能從該室成員裡選, 沒有跨室聯集
+/// (備援聯集已於 2026-10-25 取消, 不帶 chat 的聯集呼叫已刪除)。
+/// 名字是該室看到的樣子: 社群群顯示社群身分、一般群顯示一般身分, 由 helper 依室給出。
 pub fn admin_candidates_chat(chat_id: &str, all: bool) -> Result<serde_json::Value, String> {
     // all=false (預設): 只回近期在這個聊天室發言過的人 + 社群管理員 (人多時先看這份短名單);
     // all=true: 按下「找沒發言過的人」才抓的較寬名單 (曾在這個聊天室出現過的人 + 社群管理員)。

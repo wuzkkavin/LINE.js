@@ -90,7 +90,6 @@ enum Page {
     SendMessages,
     AiSettings,
     BotSettings,
-    KbSettings,
     ScamSettings,
     Logs,
     AppSettings,
@@ -98,14 +97,13 @@ enum Page {
 }
 
 /// 側欄導覽順序與標籤 (圖示與頁面一一對應, 順序即 nav_icons 的索引)。
-const NAV_PAGES: [(Page, &str); 11] = [
+const NAV_PAGES: [(Page, &str); 10] = [
     (Page::Overview, "總覽"),
     (Page::ChatRoom, "聊天室畫面"),
     (Page::ChatManage, "聊天室管理"),
     (Page::SendMessages, "發送群組訊息"),
     (Page::AiSettings, "AI 設定"),
     (Page::BotSettings, "機器人與觸發"),
-    (Page::KbSettings, "知識庫"),
     (Page::ScamSettings, "防詐騙"),
     (Page::Logs, "紀錄"),
     (Page::AppSettings, "程式設定"),
@@ -125,7 +123,6 @@ fn nav_icon_bytes(page: Page) -> &'static [u8] {
         Page::SendMessages => include_bytes!("../assets/icons/nav-chat-256.png"),
         Page::AiSettings => include_bytes!("../assets/icons/nav-ai-settings-256.png"),
         Page::BotSettings => include_bytes!("../assets/icons/nav-bot-256.png"),
-        Page::KbSettings => include_bytes!("../assets/icons/nav-kb-256.png"),
         Page::ScamSettings => include_bytes!("../assets/icons/nav-scam-256.png"),
         Page::Logs => include_bytes!("../assets/icons/nav-logs-256.png"),
         Page::AppSettings => include_bytes!("../assets/icons/nav-app-settings-256.png"),
@@ -179,13 +176,14 @@ struct ChatProfileForm {
     kb_folder: String,
     suspended: bool,
     chatty: bool,
-    // 本聊天室管理員 (聊天室管理頁設定; 每筆是 (帳號, 顯示名))。與人設自訂互相獨立:
-    // 只設管理員的群也存一包 (personaCustom=false), 人設照舊跟全域走。
-    admins: Vec<(String, String)>,
+    // 本聊天室管理員 (聊天室管理頁設定; 只存帳號, 2026-10-25 老吳定案: 記 ID 不記名字)。
+    // 顯示名一律從本室最新候選名單即時解析, 不用存檔名快照, 改名後顯示自動跟著變。
+    // 與人設自訂互相獨立: 只設管理員的群也存一包 (personaCustom=false), 人設照舊跟全域走。
+    admins: Vec<String>,
 }
 
 impl ChatProfileForm {
-    /// 這包設定需不需要以條目存在 (false = 刪掉條目, 這個群完全用預設且聒噪關閉、未設管理員)。
+    /// 這包設定需不需要以條目存在 (false = 刪掉條目, 這個群完全用預設且聒噪關閉、管理員為空)。
     fn has_entry(&self) -> bool {
         self.custom || self.chatty || self.suspended || !self.admins.is_empty()
     }
@@ -202,7 +200,7 @@ impl ChatProfileForm {
             "suspended": self.suspended,
             "chatty": self.chatty,
             "personaCustom": self.custom,
-            "admins": self.admins.iter().map(|(id, name)| serde_json::json!({ "id": id, "name": name })).collect::<Vec<_>>()
+            "admins": self.admins.iter().map(|id| serde_json::json!({ "id": id })).collect::<Vec<_>>()
         })
     }
 
@@ -223,7 +221,14 @@ impl ChatProfileForm {
                 .and_then(|x| x.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|a| Some((a.get("id")?.as_str()?.to_string(), a.get("name")?.as_str()?.to_string())))
+                        .filter_map(|a| {
+                            // 只取 ID: 舊存檔裡的名字快照一律丟掉 (helper 側同款作法);
+                            // 字串形也相容 (舊格式直接給帳號字串時)。
+                            if let Some(id) = a.as_str() {
+                                return Some(id.to_string());
+                            }
+                            a.get("id")?.as_str().map(|x| x.to_string())
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -273,14 +278,11 @@ fn admin_candidate_matches(name: &str, id: &str, keyword: &str) -> bool {
 
 /// 已選管理員中「無法確認還在室內」的人: 已選帳號不在目前候選名單裡
 /// (最近沒在這個室說話、也不是社群管理員)。只陳述「不在名單、無法確認」,
-/// 不推論通知送不送得到。回傳 (帳號, 存檔名字)。
-fn admin_unconfirmed(
-    selected: &[(String, String)],
-    candidate_ids: &[String],
-) -> Vec<(String, String)> {
+/// 不推論通知送不送得到。回傳帳號 (名字由呼叫端即時解析, 不用存檔名)。
+fn admin_unconfirmed(selected: &[String], candidate_ids: &[String]) -> Vec<String> {
     selected
         .iter()
-        .filter(|(id, _)| !candidate_ids.iter().any(|c| c == id))
+        .filter(|id| !candidate_ids.iter().any(|c| c == *id))
         .cloned()
         .collect()
 }
@@ -294,103 +296,17 @@ fn admin_last4(id: &str) -> String {
     }
 }
 
-/// 總覽「目前情況」提示的處置動作 (每種提示只配一顆按鈕, 不要只給一句話讓人自己找路)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SituationAction {
-    /// 不需要按鈕 (正常、或只是等候中的狀態)。
-    None,
-    /// 服務未啟動: 按了叫起引擎。
-    StartEngine,
-    /// 引擎失敗 / 機器人未連線: 按了重新啟動引擎。
-    RestartEngine,
-    /// 未登入 / 登入異常: 按了送出登入 (登入碼在上方登入區)。
-    StartLogin,
-    /// 連接埠被佔用: 按了換空閒連接埠並重啟。
-    SwitchPorts,
-    /// 解密被擋 / 今日有警告: 按了跳到紀錄頁看詳情 (紀錄是詳情的家, 總覽只提示)。
-    ViewLogs,
-}
-
-/// 總覽「目前情況」判定 (2026-10-24 老吳: 情況區最上方要有一列白話提示, 主動告訴
-/// 使用者現在需要注意什麼)。優先順序: 連接埠被佔用 → 引擎失敗 → 引擎啟動中 →
-/// 服務未啟動 → 登入中/恢復中 (等候) → 登入異常/未登入 → 機器人未連線 →
-/// 解密被擋 → 今日有警告 → 一切正常。第一個命中即回傳, 之後的不再列。
-/// bot_connected=None (控制台狀態還沒抓到) 與 warned=None 時跳過該項, 不誤報。
-pub fn current_situation(
-    engine_state: &EngineState,
-    login_auth: &AuthState,
-    bot_connected: Option<bool>,
-    decrypt_blocking: u64,
-    warned_today: Option<u64>,
-) -> (String, SituationAction) {
-    use SituationAction::*;
-    if let EngineState::Failed(msg) = engine_state {
-        if msg.starts_with(&crate::engine::foreign_port_message()) {
-            let (core, helper) = crate::engine::runtime_ports();
-            return (
-                format!("連接埠 {core}／{helper} 已由其他程式佔用，服務無法啟動；AI寶 不會自動換埠、不會動對方程式、不會自動重試。請先關掉佔用程式，再到上方服務列手動按「啟動」；佔用解除後也不會自動啟動，要手動按才會啟動。也可以按「改用空閒連接埠」換到空閒連接埠再啟動。"),
-                SwitchPorts,
-            );
-        }
-        return (
-            "引擎啟動失敗，請按「重新啟動引擎」再試一次；一直失敗請用「一鍵修復」。".to_string(),
-            RestartEngine,
-        );
-    }
-    if matches!(engine_state, EngineState::Starting) {
-        return ("引擎啟動中，請稍候…".to_string(), None);
-    }
-    if !matches!(engine_state, EngineState::Running | EngineState::ExternalRunning) {
-        return (
-            "服務還沒啟動，機器人不會回應群組訊息。按「去啟動」把服務叫起來。".to_string(),
-            StartEngine,
-        );
-    }
-    match login_auth {
-        AuthState::Authenticating => {
-            return ("正在等你掃 QR 碼登入（登入碼在上方登入區）。".to_string(), None)
-        }
-        AuthState::Restoring => return ("正在恢復上次登入，請稍候…".to_string(), None),
-        AuthState::Error => {
-            return ("登入異常，請按「去登入」重新登入。".to_string(), StartLogin)
-        }
-        AuthState::Ready => {}
-        _ => {
-            return (
-                "還沒登入 LINE，登入後機器人才會在群組服務。按「去登入」開始登入。".to_string(),
-                StartLogin,
-            )
-        }
-    }
-    if bot_connected == Some(false) {
-        return (
-            "機器人還沒連上 LINE，訊息不會回應；通常會自動重試，一直沒連上請按「重新啟動引擎」。".to_string(),
-            RestartEngine,
-        );
-    }
-    if decrypt_blocking > 0 {
-        return (
-            format!("有 {decrypt_blocking} 則訊息我現在讀不到（鑰匙對不上），請按「看紀錄」看詳情。"),
-            ViewLogs,
-        );
-    }
-    if let Some(w) = warned_today {
-        if w > 0 {
-            return (
-                format!("今天已有 {w} 則防詐警告，請按「看紀錄」看詳情。"),
-                ViewLogs,
-            );
-        }
-    }
-    (
-        "目前正常：引擎執行中、已登入、機器人已連線。".to_string(),
-        None,
-    )
+/// QR 按鈕先啟動服務的後續送登入條件 (修復 B): 服務就緒還不夠, 必須等核心 WS
+/// 已連上且狀態已定案 (不是 Unknown), 且狀態是 Idle/Error (真的沒登入/登入失敗)
+/// 才送 auth:start。核心還在恢復登入 (Restoring) 或狀態還沒報到 (Unknown) 時
+/// 絕不搶送 — 舊版在 Unknown 時就送, 會打斷核心用已存狀態的恢復, 反而逼出新 QR。
+fn should_send_login_after_engine(engine_running: bool, connected: bool, auth: &AuthState) -> bool {
+    engine_running && connected && matches!(auth, AuthState::Idle | AuthState::Error)
 }
 
 /// 起始頁解析 (AIBAO_START_PAGE, CI 冒煙/逐頁截圖專用, 一般使用不設):
 /// 值與頁面的對照: overview 總覽、chat 聊天室畫面、manage 聊天室管理、send 發送群組訊息、
-/// ai AI 設定、bot 機器人與觸發、kb 知識庫、scam 防詐騙、logs 紀錄、app 程式設定、about 關於。
+/// ai AI 設定、bot 機器人與觸發、scam 防詐騙、logs 紀錄、app 程式設定、about 關於 (kb 已刪除, 舊值回總覽)。
 /// 舊值 login 映射到總覽 (修復版6 起 LINE 登入併入總覽, CI 相容); 不認識的值一律總覽。
 fn parse_start_page(value: Option<&str>) -> Page {
     match value {
@@ -399,7 +315,6 @@ fn parse_start_page(value: Option<&str>) -> Page {
         Some("send") => Page::SendMessages,
         Some("ai") => Page::AiSettings,
         Some("bot") => Page::BotSettings,
-        Some("kb") => Page::KbSettings,
         Some("scam") => Page::ScamSettings,
         Some("logs") => Page::Logs,
         Some("app") => Page::AppSettings,
@@ -520,8 +435,8 @@ struct SettingsForm {
     line_token_configured: bool,
     line_token_last4: String,
     line_token_input: String,
-    // 管理員通知: admins 是 (帳號, 顯示名); 名單由候選清單勾選產生 (不用手打代號), 候選來自白名單群組發言者+OpenChat 管理員 (第四階段接通)
-    notify_admins: Vec<(String, String)>,
+    // 管理員通知 (備援名單已於 2026-10-25 取消, 不再有全域備援名單欄位):
+    // 通知收件人一律是事發聊天室自己的管理員, 由 helper 依聊天室解析, App 側不選人不存人。
     notify_rules: Vec<NotifyRuleForm>,
     save_msg: Option<String>,
     // 分群設定 (聊天室管理頁編輯): chat_profiles 是目前畫面上的表單值,
@@ -597,13 +512,8 @@ struct App {
     manage_jump_admin: bool,
     // 從白名單表「設定這個聊天室」跳過來時用: 選中該室後, 下方編輯區畫到編輯卡時捲過去一次。
     manage_jump_edit: bool,
-    // 機器人與觸發頁備援管理員選人: 搜尋關鍵字 (本機即時過濾)。
-    backup_admin_search: String,
     // 聊天室畫面頁進頁紀錄: 記上次寫過紀錄時所在的頁面, 避免每一幀都刷 log。
     chat_log_last_page: Option<Page>,
-    // 總覽嵌入聊天畫面進頁追蹤 (與聊天室畫面頁分開記, 兩頁共用同一個 WebView):
-    // 進總覽時也要做一次強制重排重顯, 第一次就要畫出來。
-    overview_last_page: Option<Page>,
     // 總覽「改用空閒連接埠」挑不到埠時的錯誤行 (成功時重啟引擎, 提示由狀態變化承擔)。
     ports_msg: Option<String>,
     // 總覽服務列「登入 QR 碼」在引擎未跑時先啟動引擎、就緒後自動送一次登入;
@@ -654,8 +564,6 @@ struct App {
     admin_events: Vec<Value>,
     admin_events_slot: Slot<Value>,
     admin_events_attempted: bool,
-    candidates: Vec<Value>,
-    candidates_slot: Slot<Value>,
     // 嵌入聊天畫面 (2026-10-21 新增「聊天室畫面」頁): WebView 宿主、主視窗代碼、profile 目錄
     chatview: chatview::ChatViewHost,
     parent_hwnd: Option<isize>,
@@ -697,7 +605,7 @@ struct App {
     theme_id: theme::ThemeId,
     palette: theme::Palette,
     /// 側欄圖示紋理, 索引與 NAV_PAGES 對齊; 解碼失敗為 None (側欄退回純文字, 已記 log)。
-    nav_icons: [Option<egui::TextureHandle>; 11],
+    nav_icons: [Option<egui::TextureHandle>; 10],
     #[cfg(windows)]
     tray: Option<Tray>,
 }
@@ -1072,17 +980,19 @@ impl App {
             crate::engine::set_runtime_ports(core, helper);
             shell::log_line(&format!("連接埠沿用上次換好的空閒連接埠: 核心 {core}、控制台 {helper}"));
         }
-        // 啟動行為 (2026-10-22 老吳交代改為可選): 「開啟程式時自動登入並啟用服務」
-        // 預設關閉 — 關閉時不啟動引擎, 程式停在未登入狀態, 等使用者按「登入並啟用」。
-        // --autostart (開機自啟動) 只影響縮系統匣與否, 不再連帶自動登入。
+        // 啟動行為 (修復 B, 2026-10-25): 「開啟程式時自動登入並啟用服務」預設開啟 —
+        // 開啟程式就啟動服務, 核心用已存狀態直接恢復登入、不出 QR, 只有狀態失效才出 QR。
+        // 關閉時才停在未登入狀態, 等使用者按啟動。--autostart (開機自啟動) 只影響
+        // 縮系統匣與否, 不再連帶決定登入。
         if shell_settings.auto_login {
+            shell::log_line("自動登入已開啟: 程式開啟後直接啟動服務並恢復登入");
             let mut mgr = engine.lock().unwrap();
             if let Err(e) = mgr.start() {
                 shell::log_line(&format!("引擎啟動失敗: {e}"));
                 mgr.state = EngineState::Failed(e);
             }
         } else {
-            shell::log_line("自動登入已關閉: 程式開啟後停在未啟用狀態, 等使用者按「登入並啟用」");
+            shell::log_line("自動登入已關閉: 程式開啟後停在未啟用狀態, 等使用者按啟動");
         }
 
         let avatar_tex = decode_image_rgba(AVATAR_BYTES).map(|(rgba, w, h)| {
@@ -1091,7 +1001,7 @@ impl App {
         });
 
         // 側欄圖示: 任一顆解碼失敗只退回該顆純文字按鈕並記 log, 不 panic、不擋啟動。
-        let mut nav_icons: [Option<egui::TextureHandle>; 11] = Default::default();
+        let mut nav_icons: [Option<egui::TextureHandle>; 10] = Default::default();
         for (idx, (page, _)) in NAV_PAGES.iter().enumerate() {
             nav_icons[idx] = decode_image_rgba(nav_icon_bytes(*page)).map(|(rgba, w, h)| {
                 let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
@@ -1114,7 +1024,7 @@ impl App {
         #[cfg(not(all(windows, target_env = "msvc")))]
         let parent_hwnd: Option<isize> = None;
 
-        // 冒煙/截圖用: 以環境變數 AIBAO_START_PAGE 指定起始頁 (overview/chat/manage/send/ai/bot/kb/scam/logs/app/about);
+        // 冒煙/截圖用: 以環境變數 AIBAO_START_PAGE 指定起始頁 (overview/chat/manage/send/ai/bot/scam/logs/app/about);
         // 舊值 login 映射到總覽 (CI 相容); 沒設或不認識的值一律總覽, 一般使用不受影響。
         let start_page = parse_start_page(std::env::var("AIBAO_START_PAGE").ok().as_deref());
         if start_page != Page::Overview {
@@ -1158,9 +1068,7 @@ impl App {
             manage_candidates_all: false,
             manage_jump_admin: false,
             manage_jump_edit: false,
-            backup_admin_search: String::new(),
             chat_log_last_page: None,
-            overview_last_page: None,
             ports_msg: None,
             login_after_engine: false,
             chat_check_slot: Arc::new(Mutex::new(None)),
@@ -1199,8 +1107,6 @@ impl App {
             admin_events: Vec::new(),
             admin_events_slot: Arc::new(Mutex::new(None)),
             admin_events_attempted: false,
-            candidates: Vec::new(),
-            candidates_slot: Arc::new(Mutex::new(None)),
             chatview: chatview::ChatViewHost::new(),
             parent_hwnd,
             webview_profile_dir: shell::data_dir().join("webview2-profile-v2"),
@@ -1660,6 +1566,25 @@ fn card<R>(ui: &mut egui::Ui, pal: theme::Palette, title: &str, body: impl FnOnc
         .corner_radius(10.0)
         .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
+            ui.label(egui::RichText::new(title).strong().color(pal.primary).size(17.0));
+            ui.add_space(6.0);
+            body(ui)
+        })
+        .inner
+}
+
+/// 全寬卡: 與 card 同款式, 但寬度撐滿容器 (總覽服務狀態卡用)。
+/// egui 的 Frame 預設只撐到內容寬 (舊總覽卡片因此看起來偏窄), 這裡把內容最小寬
+/// 釘成容器寬扣掉內距, 卡片才會跟容器一樣寬。
+fn full_card<R>(ui: &mut egui::Ui, pal: theme::Palette, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let avail = ui.available_width();
+    egui::Frame::default()
+        .fill(pal.card)
+        .stroke(egui::Stroke::new(1.0, pal.border))
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.set_min_width((avail - 28.0).max(0.0));
             ui.label(egui::RichText::new(title).strong().color(pal.primary).size(17.0));
             ui.add_space(6.0);
             body(ui)
@@ -2170,7 +2095,7 @@ impl eframe::App for App {
                         self.confirm_quit = true;
                     }
                     ui.label(
-                        egui::RichText::new(format!("引擎: {}", self.engine_snap.label))
+                        egui::RichText::new(format!("服務: {}", self.engine_snap.label))
                             .size(12.0)
                             .weak(),
                     );
@@ -2191,7 +2116,7 @@ impl eframe::App for App {
         // 畫在程式表面之上, 不先藏好就會殘留在別的頁面、或蓋住「確認結束」這類程式
         // 自己的對話框。(在本頁且條件符合時, page_chat / page_overview 會在同一幀
         // 把它顯示回來; 兩頁共用同一個 WebView, 每次只顯示在當前頁的框裡。)
-        if (self.page != Page::ChatRoom && self.page != Page::Overview)
+        if self.page != Page::ChatRoom
             || self.hidden
             || self.engine_unavailable()
             || self.confirm_quit
@@ -2206,8 +2131,53 @@ impl eframe::App for App {
             self.chat_log_last_page = Some(self.page);
         }
         if self.page != Page::Overview {
-            self.overview_last_page = Some(self.page);
             self.login_after_engine = false;
+        }
+        // 聊天室管理頁底部固定儲存列 (界面重整): 頁面再長, 儲存鈕與已儲存/未儲存狀態
+        // 都固定看得到, 不用捲到頂或捲到底才找得到。只管「這個聊天室的設定」,
+        // 全域設定有自己的儲存鈕 (不同設定, 不混在同一顆)。
+        // 注意: Panel::bottom 宣告在頁尾之後, 會疊在頁尾上方、中央捲動區之外, 所以捲動時不動。
+        if self.page == Page::ChatManage {
+            egui::Panel::bottom("manage-save-bar").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let room_name = self
+                        .manage_chat_options()
+                        .iter()
+                        .find(|(id, _)| *id == self.manage_chat_id)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| "尚未選聊天室".to_string());
+                    ui.label(egui::RichText::new(format!("正在設定: {room_name}")).strong());
+                    let saving = self.busy.get("chat_profiles").copied().unwrap_or(false);
+                    let dirty = chat_profile_dirty(
+                        self.form.chat_profiles.get(&self.manage_chat_id),
+                        self.form.chat_profiles_orig.get(&self.manage_chat_id),
+                    );
+                    let status_text = if self.manage_chat_id.is_empty() {
+                        "尚未選聊天室".to_string()
+                    } else if saving {
+                        "儲存中…".to_string()
+                    } else if dirty {
+                        "未儲存: 有還沒儲存的修改".to_string()
+                    } else {
+                        "已儲存".to_string()
+                    };
+                    ui.label(egui::RichText::new(status_text).color(if dirty {
+                        self.palette.warn_text
+                    } else {
+                        self.palette.text_main
+                    }));
+                    if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存這個聊天室的設定" }).clicked()
+                        && !saving
+                        && !self.manage_chat_id.is_empty()
+                    {
+                        let ctx2 = ui.ctx().clone();
+                        self.save_chat_profiles(&ctx2);
+                    }
+                    if let Some(m) = &self.chat_profiles_msg {
+                        ui.label(m.clone());
+                    }
+                });
+            });
         }
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| match self.page {
@@ -2217,7 +2187,6 @@ impl eframe::App for App {
                 Page::SendMessages => self.page_send(ui),
                 Page::AiSettings => self.page_ai(ui),
                 Page::BotSettings => self.page_bot(ui),
-                Page::KbSettings => self.page_kb(ui),
                 Page::ScamSettings => self.page_scam(ui),
                 Page::Logs => self.page_logs(ui),
                 Page::AppSettings => self.page_app_settings(ui, ctx),
@@ -2514,20 +2483,6 @@ impl App {
         f.persona_marital = pstr("maritalStatus");
         f.persona_intro = pstr("intro");
         let notify = v.get("notify").cloned().unwrap_or(Value::Null);
-        f.notify_admins = notify
-            .get("admins")
-            .and_then(|x| x.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|a| {
-                        Some((
-                            a.get("id")?.as_str()?.to_string(),
-                            a.get("name")?.as_str()?.to_string(),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         f.notify_rules = notify
             .get("rules")
             .and_then(|x| x.as_array())
@@ -2592,10 +2547,12 @@ impl App {
                 "jev": jev_body
             },
             "kb": { "folder": f.kb_folder },
+            // 通知收件人不再逐規則選人: 規則的 notifyAdminIds 一律送空, 由 helper 依事發聊天室解析該室管理員。
+            // 備援名單已取消: notify.admins 固定送空陣列, 清除舊存檔裡的備援名單, 之後不再寫回。
             "notify": {
-                "admins": f.notify_admins.iter().map(|(id, name)| serde_json::json!({ "id": id, "name": name })).collect::<Vec<_>>(),
+                "admins": Vec::<Value>::new(),
                 "rules": f.notify_rules.iter().map(|r| serde_json::json!({
-                    "kind": r.kind, "keyword": r.keyword, "enabled": r.enabled, "notifyAdminIds": r.admin_ids
+                    "kind": r.kind, "keyword": r.keyword, "enabled": r.enabled, "notifyAdminIds": Vec::<Value>::new()
                 })).collect::<Vec<_>>()
             },
             "showSources": f.show_sources,
@@ -2774,15 +2731,6 @@ impl App {
                 self.manage_candidates = arr.clone();
             } else if let Some(m) = v.get("message").and_then(|m| m.as_str()) {
                 self.page_msg.insert("manage_candidates".into(), format!("本聊天室候選名單讀不到: {m}"));
-            }
-        }
-        // 管理員候選名單結果
-        if let Some(v) = self.candidates_slot.lock().unwrap().take() {
-            self.busy.insert("candidates".into(), false);
-            if let Some(arr) = v.get("candidates").and_then(|x| x.as_array()) {
-                self.candidates = arr.clone();
-            } else if let Some(m) = v.get("message").and_then(|m| m.as_str()) {
-                self.page_msg.insert("candidates".into(), format!("候選名單讀不到: {m}"));
             }
         }
         // 管理員通知事件紀錄結果
@@ -3069,344 +3017,261 @@ impl App {
         });
     }
 
+    // 總覽 (界面重整): 只留一張全寬服務狀態卡, 內含僅此兩列啟動控制——
+    // LINE 服務與 AI寶。LINE 登入卡、目前情況卡、機器人情況數字卡、總覽下方聊天室
+    // 嵌入全部刪除; 「引擎」不再以獨立服務出現 (它是 AI寶 的一部分)。
+    // 異常不另立卡: 列內狀態文字 + 處置按鈕。被佔用時不自動動作: 只有使用者按了
+    // 「改用空閒連接埠」才換埠重啟; 按「結束」視窗留在畫面 (老吳定奪) 的規則在結束序列, 這裡不改。
     fn page_overview(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let login = self.login_snapshot();
         let status = self.helper_status();
-        // 總覽服務列「登入 QR 碼」先啟動引擎的後續: 引擎就緒、且尚未進入登入流程時
-        // 自動送一次登入 (登入碼出現在上方登入區, 使用者不用再按一次)。
+        // 總覽服務列「登入 QR 碼」先啟動服務的後續: 服務就緒、且尚未進入登入流程時
+        // 自動送一次登入 (登入碼出現在本卡 LINE 列, 使用者不用再按一次)。
         if self.login_after_engine
-            && matches!(self.engine_snap.state, EngineState::Running | EngineState::ExternalRunning)
-            && !matches!(login.auth, AuthState::Ready | AuthState::Authenticating | AuthState::Restoring)
+            && should_send_login_after_engine(
+                matches!(self.engine_snap.state, EngineState::Running | EngineState::ExternalRunning),
+                login.connected,
+                &login.auth,
+            )
         {
             let _ = self.login_tx.send(WsCommand::StartLogin);
             self.login_after_engine = false;
-            shell::log_line("引擎就緒後自動送出登入 (總覽頁「登入 QR 碼」按鈕先啟動引擎)");
+            shell::log_line("服務就緒後自動送出登入 (總覽頁「登入 QR 碼」按鈕先啟動服務)");
         }
         ui.heading("總覽");
         ui.add_space(8.0);
-        // 登入區在最上方 (修復版6: 原 LINE 登入頁併入總覽, 第一眼就能看到登入狀態與按鈕)
-        self.login_section(ui);
-        ui.add_space(10.0);
-        // 目前情況 (2026-10-24 老吳: 情況區最上方要有一列白話提示, 配處置按鈕,
-        // 不要只顯示一句話讓人自己找路。判定與優先順序見 current_situation。)
-        {
-            let bot = status.as_ref().and_then(|s| s.get("bot")).cloned().unwrap_or(Value::Null);
-            let bot_connected = bot
-                .get("botConnected")
-                .and_then(|v| v.as_bool())
-                .or_else(|| bot.get("connected").and_then(|v| v.as_bool()));
-            let decrypt_blocking: u64 = bot
-                .get("decrypt")
-                .and_then(|d| d.get("issues"))
-                .and_then(|v| v.as_array())
-                .map(|issues| {
-                    issues
-                        .iter()
-                        .filter(|i| i.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false))
-                        .map(|i| i.get("failed").and_then(|v| v.as_u64()).unwrap_or(0))
-                        .sum()
-                })
-                .unwrap_or(0);
-            let warned = bot.get("scam").and_then(|s| s.get("warnedToday")).and_then(|v| v.as_u64());
-            let (text, action) =
-                current_situation(&self.engine_snap.state, &login.auth, bot_connected, decrypt_blocking, warned);
-            let ports_err = self.ports_msg.clone();
-            card(ui, self.palette, "目前情況", |ui| {
-                ui.label(&text);
-                ui.add_space(4.0);
-                match action {
-                    SituationAction::StartEngine => {
-                        if ui.button("去啟動").clicked() {
-                            self.start_engine("總覽頁「目前情況」去啟動按鈕");
-                        }
-                    }
-                    SituationAction::RestartEngine => {
-                        if ui.button("重新啟動引擎").clicked() {
-                            self.restart_engine("總覽頁「目前情況」重新啟動引擎按鈕");
-                        }
-                    }
-                    SituationAction::StartLogin => {
-                        if ui.button("去登入").clicked() {
-                            let _ = self.login_tx.send(WsCommand::StartLogin);
-                        }
-                    }
-                    SituationAction::SwitchPorts => {
-                        if ui.button("改用空閒連接埠").clicked() {
-                            match crate::engine::pick_free_port_pair() {
-                                Some((core, helper)) => {
-                                    crate::engine::set_runtime_ports(core, helper);
-                                    self.shell_settings.core_port = Some(core);
-                                    self.shell_settings.helper_port = Some(helper);
-                                    self.shell_settings.save();
-                                    shell::log_line(&format!(
-                                        "連接埠已換到空閒連接埠: 核心 {core}、控制台 {helper}，正在重新啟動引擎"
-                                    ));
-                                    self.ports_msg = None;
-                                    self.restart_engine("總覽頁「目前情況」改用空閒連接埠按鈕");
-                                }
-                                None => {
-                                    self.ports_msg = Some(
-                                        "3801～4000 區間找不到空閒連接埠，請先關掉其他佔用程式再按一次。"
-                                            .to_string(),
-                                    );
-                                }
-                            }
-                        }
-                        if let Some(m) = &ports_err {
-                            ui.label(egui::RichText::new(m).color(self.palette.bad));
-                        }
-                    }
-                    SituationAction::ViewLogs => {
-                        if ui.button("看紀錄").clicked() {
-                            self.page = Page::Logs;
-                        }
-                    }
-                    SituationAction::None => {}
-                }
-            });
-            ui.add_space(10.0);
-        }
-        // 機器人情況數字卡 (Codex 總覽同款資訊架構, 口徑沿用現有統計: 知識庫檔數、
-        // 今日回答、今日防詐判讀、今日警告; 服務狀態卡裡重複的今日回答/防詐騙兩行
-        // 隨之上移到這裡, 不再重複列。掃描數仍在「防詐騙」頁可查。)
-        {
-            let bot = status.as_ref().and_then(|s| s.get("bot")).cloned().unwrap_or(Value::Null);
-            let kb_files = bot.get("kb").and_then(|k| k.get("files")).and_then(|v| v.as_u64());
-            let answered = bot.get("answeredToday").and_then(|v| v.as_u64());
-            let (checked, warned) = bot
-                .get("scam")
-                .map(|s| {
-                    (
-                        s.get("checkedToday").and_then(|v| v.as_u64()),
-                        s.get("warnedToday").and_then(|v| v.as_u64()),
-                    )
-                })
-                .unwrap_or((None, None));
-            let num = |v: Option<u64>, unit: &str| {
-                v.map(|n| format!("{n} {unit}")).unwrap_or_else(|| "—".to_string())
-            };
-            card(ui, self.palette, "機器人情況", |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for (n, label) in [
-                        (num(kb_files, "檔"), "知識庫"),
-                        (num(answered, "次"), "今日回答"),
-                        (num(checked, "則"), "今日防詐判讀"),
-                        (num(warned, "則"), "今日警告"),
-                    ] {
-                        ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(n).size(20.0).strong());
-                            ui.label(egui::RichText::new(label).weak().small());
-                        });
-                        ui.add_space(24.0);
-                    }
-                });
-            });
-            ui.add_space(10.0);
-        }
-        card(ui, self.palette, "服務狀態", |ui| {
+        let running = matches!(self.engine_snap.state, EngineState::Running | EngineState::ExternalRunning);
+        let starting = matches!(self.engine_snap.state, EngineState::Starting);
+        let failed = matches!(self.engine_snap.state, EngineState::Failed(_));
+        let foreign = match &self.engine_snap.state {
+            EngineState::Failed(msg) => msg.starts_with(&crate::engine::foreign_port_message()),
+            _ => false,
+        };
+        let bot = status.as_ref().and_then(|s| s.get("bot").cloned()).unwrap_or(Value::Null);
+        let bot_connected = bot
+            .get("botConnected")
+            .and_then(|v| v.as_bool())
+            .or_else(|| bot.get("connected").and_then(|v| v.as_bool()));
+        let line_state = bot.get("lineState").and_then(|v| v.as_str()).unwrap_or("");
+        let line_status = if starting {
+            "啟動中…".to_string()
+        } else if !running {
+            if foreign {
+                "連接埠被佔用，服務無法啟動".to_string()
+            } else if failed {
+                "異常停止".to_string()
+            } else {
+                "已停止".to_string()
+            }
+        } else {
+            match login.auth {
+                AuthState::Ready => format!(
+                    "已登入（{}）",
+                    login.profile_name.as_deref().unwrap_or("名稱讀取中")
+                ),
+                AuthState::Authenticating => "登入中…".to_string(),
+                AuthState::Restoring => "正在恢復登入…".to_string(),
+                AuthState::Error => "登入異常".to_string(),
+                _ => "尚未登入".to_string(),
+            }
+        };
+        let line_dot = if starting {
+            self.palette.warn
+        } else if !running {
+            self.palette.bad
+        } else {
+            match login.auth {
+                AuthState::Ready => self.palette.ok,
+                AuthState::Authenticating | AuthState::Restoring => self.palette.warn,
+                AuthState::Error => self.palette.bad,
+                _ => self.palette.idle,
+            }
+        };
+        let ai_status = if starting {
+            "啟動中…".to_string()
+        } else if !running {
+            if failed { "異常停止".to_string() } else { "已停止".to_string() }
+        } else if bot.is_object() {
+            if bot_connected == Some(true) {
+                "已連線，會回應群組訊息".to_string()
+            } else if line_state == "未設定 Token" {
+                "尚未設定 Token".to_string()
+            } else {
+                "未連線，會自動重試連線".to_string()
+            }
+        } else {
+            "狀態尚未取得…".to_string()
+        };
+        let ai_dot = if starting {
+            self.palette.warn
+        } else if !running {
+            self.palette.bad
+        } else if bot_connected == Some(true) {
+            self.palette.ok
+        } else {
+            self.palette.warn
+        };
+        let ai_small = if running && bot.is_object() {
+            let ai = bot.get("aiActive").and_then(|v| v.as_str()).unwrap_or("-");
+            let model = bot.get("aiModel").and_then(|v| v.as_str()).unwrap_or("-");
+            let core_ver = bot.get("coreVersion").and_then(|v| v.as_str()).unwrap_or("");
+            if core_ver.is_empty() {
+                format!("使用中的 AI：{ai} / {model}；核心 LINE.js：—")
+            } else {
+                format!("使用中的 AI：{ai} / {model}；核心 LINE.js：v{core_ver}")
+            }
+        } else {
+            "使用中的 AI：尚未取得（服務未執行）".to_string()
+        };
+        let decrypt_blocking: u64 = bot
+            .get("decrypt")
+            .and_then(|d| d.get("issues"))
+            .and_then(|v| v.as_array())
+            .map(|issues| {
+                issues
+                    .iter()
+                    .filter(|i| i.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false))
+                    .map(|i| i.get("failed").and_then(|v| v.as_u64()).unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0);
+        let bot_name = bot.get("botName").and_then(|v| v.as_str()).unwrap_or("AI寶").to_string();
+        full_card(ui, self.palette, "服務狀態", |ui| {
             ui.horizontal(|ui| {
                 if let Some(tex) = self.display_avatar() {
-                    ui.image((tex.id(), egui::vec2(84.0, 84.0)));
+                    ui.image((tex.id(), egui::vec2(64.0, 64.0)));
                 }
                 ui.vertical(|ui| {
-                    let bot = status.as_ref().and_then(|s| s.get("bot").cloned()).unwrap_or(Value::Null);
-                    let bot_name = bot.get("botName").and_then(|v| v.as_str()).unwrap_or("AI寶");
-                    // 狀態一致性原則: 引擎不在執行時, 登入/機器人/AI 資訊都只是「上次的舊資料」,
-                    // 不得照舊顯示綠燈 (2026-10-20 實機: 引擎異常停止, 總覽卻顯示 LINE 已登入, 畫面全綠實際已死)。
-                    let engine_ok = matches!(self.engine_snap.state, EngineState::Running | EngineState::ExternalRunning);
-                    let engine_starting = matches!(self.engine_snap.state, EngineState::Starting);
                     ui.label(egui::RichText::new(bot_name).size(22.0).strong().color(self.palette.primary));
-                    ui.horizontal(|ui| {
-                        ui.label(status_dot(match self.engine_snap.state {
-                            EngineState::Running | EngineState::ExternalRunning => self.palette.ok,
-                            EngineState::Starting => self.palette.warn,
-                            _ => self.palette.bad,
-                        }));
-                        ui.label(format!("引擎: {}", self.engine_snap.label));
-                    });
-                    // LINE 登入狀態 (核心 session): 只有引擎真的在跑時, 登入快照才可信
-                    ui.horizontal(|ui| {
-                        if !engine_ok {
-                            ui.label(status_dot(self.palette.idle));
-                            ui.label(if engine_starting {
-                                "LINE: 引擎啟動中, 登入狀態尚未取得".to_string()
-                            } else {
-                                "LINE: 未取得 (引擎目前沒有在執行)".to_string()
-                            });
-                        } else {
-                            ui.label(status_dot(match login.auth {
-                                AuthState::Ready => self.palette.ok,
-                                AuthState::Authenticating | AuthState::Restoring => self.palette.warn,
-                                AuthState::Error => self.palette.bad,
-                                _ => self.palette.idle,
-                            }));
-                            ui.label(match login.auth {
-                                AuthState::Ready => format!(
-                                    "LINE: 已登入{}",
-                                    login.profile_name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
-                                ),
-                                AuthState::Authenticating => "LINE: 登入中 (請看「總覽」頁)".to_string(),
-                                AuthState::Restoring => "LINE: 正在恢復上次登入…".to_string(),
-                                AuthState::Error => "LINE: 登入異常, 請到「總覽」頁處理".to_string(),
-                                _ => "LINE: 尚未登入".to_string(),
-                            });
-                        }
-                    });
-                    // LINE 服務列按鈕 (2026-10-24 總覽 Codex 化: 啟動就做在情況區裡,
-                    // 不用跳去別頁。登入 QR 碼只在未登入時顯示, 已登入不顯示以免誤觸重登;
-                    // 引擎未跑時點登入 QR 碼先啟動引擎、就緒後自動送一次登入, 見 login_after_engine。)
-                    ui.horizontal(|ui| {
-                        let running = matches!(self.engine_snap.state, EngineState::Running | EngineState::ExternalRunning);
-                        let starting = matches!(self.engine_snap.state, EngineState::Starting);
-                        let failed = matches!(self.engine_snap.state, EngineState::Failed(_));
-                        if ui.add_enabled(!running && !starting, egui::Button::new("啟動")).clicked() {
-                            self.start_engine("總覽頁 LINE 服務列「啟動」按鈕");
-                        }
-                        if ui.add_enabled(running || failed, egui::Button::new("重新啟動")).clicked() {
-                            self.restart_engine("總覽頁 LINE 服務列「重新啟動」按鈕");
-                        }
-                        if login.auth != AuthState::Ready {
-                            if ui.add_enabled(!starting, egui::Button::new("登入 QR 碼")).clicked() {
-                                if running {
-                                    let _ = self.login_tx.send(WsCommand::StartLogin);
-                                } else {
-                                    self.login_after_engine = true;
-                                    self.start_engine("總覽頁 LINE 服務列「登入 QR 碼」按鈕 (先啟動引擎)");
-                                }
-                            }
-                        }
-                    });
-                    // 機器人連線狀態 (bot 與核心的 WS): 與「LINE 已登入」分開顯示 —
-                    // 登入還在不代表機器人有連上 (換 Token 被踢線時就是登入在、機器人斷), 兩件事要分得出來。
-                    ui.horizontal(|ui| {
-                        if !engine_ok {
-                            ui.label(status_dot(self.palette.idle));
-                            ui.label("機器人: 未連線 (引擎未執行)".to_string());
-                        } else if bot.is_object() {
-                            let bc = bot
-                                .get("botConnected")
-                                .and_then(|v| v.as_bool())
-                                .or_else(|| bot.get("connected").and_then(|v| v.as_bool()))
-                                .unwrap_or(false);
-                            let line_state = bot.get("lineState").and_then(|v| v.as_str()).unwrap_or("");
-                            ui.label(status_dot(if bc { self.palette.ok } else { self.palette.warn }));
-                            ui.label(if bc {
-                                "機器人: 已連線 (會回應群組訊息)".to_string()
-                            } else if line_state == "未設定 Token" {
-                                "機器人: 尚未設定 Token, 請到「機器人與觸發」頁完成開通".to_string()
-                            } else {
-                                "機器人: 未連線, 會自動重試連線; 一直沒連上請重新啟動引擎".to_string()
-                            });
-                        } else {
-                            ui.label(status_dot(self.palette.idle));
-                            ui.label("機器人: 狀態尚未取得…".to_string());
-                        }
-                    });
-                    // 小幫手服務列按鈕 (與 LINE 列同款。注意: 我方核心與 helper 同屬一個引擎,
-                    // 與 Codex 的雙行程不同, 所以這列的啟動/重新啟動接同一組引擎動作;
-                    // 回報中會把這個差異講明, 不假裝是兩個獨立服務。)
-                    ui.horizontal(|ui| {
-                        let running = matches!(self.engine_snap.state, EngineState::Running | EngineState::ExternalRunning);
-                        let starting = matches!(self.engine_snap.state, EngineState::Starting);
-                        let failed = matches!(self.engine_snap.state, EngineState::Failed(_));
-                        if ui.add_enabled(!running && !starting, egui::Button::new("啟動")).clicked() {
-                            self.start_engine("總覽頁小幫手服務列「啟動」按鈕");
-                        }
-                        if ui.add_enabled(running || failed, egui::Button::new("重新啟動")).clicked() {
-                            self.restart_engine("總覽頁小幫手服務列「重新啟動」按鈕");
-                        }
-                    });
-                    if engine_ok {
-                        if let Some(bot) = status.as_ref().and_then(|s| s.get("bot")) {
-                        let ai = bot.get("aiActive").and_then(|v| v.as_str()).unwrap_or("-");
-                        let model = bot.get("aiModel").and_then(|v| v.as_str()).unwrap_or("-");
-                        ui.label(format!("使用中的 AI: {ai} / {model}"));
-                        // 核心版本 (第 14 項): 來自核心 hello 影格的實際回報, 未連線時顯示「—」不猜
-                        let core_ver = bot.get("coreVersion").and_then(|v| v.as_str()).unwrap_or("");
-                        ui.label(if core_ver.is_empty() {
-                            "核心 LINE.js: —".to_string()
-                        } else {
-                            format!("核心 LINE.js: v{core_ver}")
-                        });
-                        // 今日回答/防詐騙數字已上移到上方「機器人情況」數字卡, 這裡不再重複列。
-                        // 訊息解密健康 (2026-10-21 第二段): 有解不開的訊息要老實點燈,
-                        // 不讓「機器人已連線」的綠燈蓋住「其實讀不到訊息」(事故定案:
-                        // 成員變動後鑰匙對不上, 訊息在核心解密失敗, 以前全綠看不出來)。
-                        if let Some(dec) = bot.get("decrypt") {
-                            if dec.get("state").and_then(|v| v.as_str()) == Some("failed") {
-                                // 顯示分流 (2026-10-22 修復, 依真機診斷包定案): 「現在真的讀不到」
-                                // (blocking, 即時訊息也解不開) 與「只有舊世代歷史訊息解不開、
-                                // 目前收發正常」是兩回事 — 舊版混成一句「有 N 則讀不到」把整群
-                                // 判死, 還連帶擋下發送。分開講, 只有 blocking 才給處置。
-                                let issues = dec.get("issues").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                                let blocking: Vec<&Value> = issues.iter().filter(|i| i.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false)).collect();
-                                let history_only: Vec<&Value> = issues.iter().filter(|i| !i.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false)).collect();
-                                if !blocking.is_empty() {
-                                    let total: u64 = blocking.iter().map(|i| i.get("failed").and_then(|v| v.as_u64()).unwrap_or(0)).sum();
-                                    ui.label(egui::RichText::new(format!("⚠ 有 {total} 則訊息我現在讀不到, 那些訊息我不會回覆:")).color(self.palette.bad));
-                                    for issue in &blocking {
-                                        let name = issue.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                        let failed = issue.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
-                                        let senders: Vec<&str> = issue.get("senders").and_then(|v| v.as_array())
-                                            .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
-                                            .unwrap_or_default();
-                                        let who = if senders.is_empty() { String::new() } else { format!("({} 的)", senders.join("、")) };
-                                        ui.label(format!("・在『{}』有 {} 則{}訊息讀不到", if name.is_empty() { "未命名群組" } else { name }, failed, who));
-                                    }
-                                    ui.label("處置: 先到「總覽」頁登出後重新登入 (讓鑰匙重新對齊); 若還是讀不到, 下一步是把機器人移出該群組、再重新邀請它加入 (重新入群會讓 LINE 把目前的鑰匙重新發一份給它)。");
-                                }
-                                for issue in &history_only {
-                                    let name = issue.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                    let failed = issue.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    ui.label(egui::RichText::new(format!(
-                                        "『{}』目前收發正常; 有 {} 則舊訊息因為先前的鑰匙事故無法讀取 (不影響現在的訊息, 那些舊訊息我不會回覆)。",
-                                        if name.is_empty() { "未命名群組" } else { name }, failed
-                                    )).color(self.palette.warn));
-                                }
-                            }
-                            // 訊息漏接 (同批追加): 訊息有進群組歷史、卻完全沒有送到機器人這裡 —
-                            // 最壞情形是整個群組都收不到 (事故擴大時的現況), 文案要講到這個程度,
-                            // 不能只寫「有幾則漏接」讓人以為只是小毛病。
-                            if let Some(missed_issues) = dec.get("missedIssues").and_then(|v| v.as_array()) {
-                                for issue in missed_issues {
-                                    let name = issue.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                    let missed = issue.get("missed").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let when = issue.get("newestMissedTime").and_then(|v| v.as_str()).unwrap_or("");
-                                    ui.label(egui::RichText::new(format!(
-                                        "⚠ 『{}』整個群組的訊息都沒有送到我這裡 (最近一則是 {} 的訊息, 已漏接 {} 則), 現在在那個群組叫我也不會回應。",
-                                        if name.is_empty() { "未命名群組" } else { name }, when, missed
-                                    )).color(self.palette.bad));
-                                }
-                                if !missed_issues.is_empty() {
-                                    ui.label("處置: 先到「總覽」頁登出後重新登入; 若還是收不到, 把機器人移出該群組、再重新邀請它加入。");
-                                }
-                            }
-                        }
-                        } else {
-                            ui.label(egui::RichText::new("設定服務尚未就緒, 請稍候…").weak());
-                        }
-                    }
+                    ui.label(egui::RichText::new("LINE 群組裡的學習小幫手").weak().small());
                 });
             });
-            if matches!(self.engine_snap.state, EngineState::NotStarted) {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("目前尚未啟用: 還沒有登入 LINE, 不會回應群組訊息。按下面的「登入並啟用」開始; 想讓它以後打開就自動登入, 到「程式設定」打開『開啟程式時自動登入並啟用服務』。").color(self.palette.warn));
-            }
             ui.add_space(6.0);
+            ui.separator();
+            // 第一列: LINE 服務 (狀態 + 啟動/重新啟動; 未登入附登入 QR 碼按鈕, 已登入附登出)。
+            ui.label(egui::RichText::new("LINE 服務").strong());
             ui.horizontal(|ui| {
-                if matches!(self.engine_snap.state, EngineState::NotStarted) {
-                    if primary_btn(ui, self.palette, "登入並啟用").clicked() {
-                        self.start_engine("總覽頁「登入並啟用」按鈕");
+                ui.label(status_dot(line_dot));
+                ui.label(format!("LINE 服務：{line_status}"));
+            });
+            ui.horizontal(|ui| {
+                if !starting {
+                    if !running && ui.button("啟動").clicked() {
+                        self.start_engine("總覽頁 LINE 服務列「啟動」按鈕");
                     }
-                } else if ui.button("重新啟動引擎").clicked() {
-                    self.restart_engine("總覽頁「重新啟動引擎」按鈕");
+                    if (running || failed) && ui.button("重新啟動").clicked() {
+                        self.restart_engine("總覽頁 LINE 服務列「重新啟動」按鈕");
+                    }
                 }
-                let repairing = self.busy.get("repair").copied().unwrap_or(false);
-                if primary_btn(ui, self.palette, if repairing { "修復中…" } else { "一鍵修復" }).clicked() && !repairing {
-                    self.start_repair(&ctx);
+                if login.auth == AuthState::Ready {
+                    if ui.button("登出").clicked() {
+                        self.confirm_logout = true;
+                    }
+                } else if ui.add_enabled(!starting, egui::Button::new("登入 QR 碼")).clicked() {
+                    if running {
+                        let _ = self.login_tx.send(WsCommand::StartLogin);
+                    } else {
+                        // 服務還沒跑: 先啟動服務, 就緒後自動送一次登入 (見本函數開頭)。
+                        self.login_after_engine = true;
+                        self.start_engine("總覽頁 LINE 服務列「登入 QR 碼」按鈕 (先啟動服務)");
+                    }
+                }
+                if foreign && ui.button("改用空閒連接埠").clicked() {
+                    match crate::engine::pick_free_port_pair() {
+                        Some((core, helper)) => {
+                            crate::engine::set_runtime_ports(core, helper);
+                            self.shell_settings.core_port = Some(core);
+                            self.shell_settings.helper_port = Some(helper);
+                            self.shell_settings.save();
+                            shell::log_line(&format!(
+                                "連接埠已換到空閒連接埠: 核心 {core}、控制台 {helper}，正在重新啟動服務"
+                            ));
+                            self.ports_msg = None;
+                            self.restart_engine("總覽頁 LINE 服務列「改用空閒連接埠」按鈕");
+                        }
+                        None => {
+                            self.ports_msg = Some(
+                                "3801～4000 區間找不到空閒連接埠，請先關掉其他佔用程式再按一次。"
+                                    .to_string(),
+                            );
+                        }
+                    }
                 }
             });
+            if foreign {
+                ui.label("先關掉佔用連接埠的程式，再按「啟動」；也可以按「改用空閒連接埠」換到空閒連接埠再啟動。");
+            }
+            if running && matches!(login.auth, AuthState::Idle) {
+                ui.label("還沒登入：按「登入 QR 碼」掃碼登入，登入後下次開啟會直接恢復。");
+            }
+            if let Some(m) = &self.ports_msg {
+                ui.label(egui::RichText::new(m.clone()).color(self.palette.bad));
+            }
+            // 登入進行中: QR 碼與 PIN 碼收在本卡 LINE 列下方, 不另立登入卡。
+            if login.auth == AuthState::Authenticating {
+                ui.add_space(6.0);
+                if login.login_started.is_some() {
+                    ui.label("用次要帳號的手機 LINE 掃描這張 QR 碼，掃完輸入下面這組 PIN 碼。");
+                } else {
+                    // 沒按過登入鈕卻出現 QR: 是核心那邊要求重登 (上次狀態沒能直接恢復),
+                    // 不是使用者主動要掃 — 原因要白話講清楚, 不能只丟一張碼讓人猜。
+                    ui.label("上次的登入狀態沒能直接恢復，請用次要帳號重新掃碼登入；掃完後，下次開啟會直接恢復，不用再掃。");
+                }
+                if let Some(url) = &login.qr_url {
+                    draw_qr(ui, self.palette, url, 240.0);
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("正在向 LINE 取得 QR 碼…");
+                    });
+                }
+                if let Some(pin) = &login.pin {
+                    ui.label(egui::RichText::new(pin.clone()).size(44.0).strong().color(self.palette.primary));
+                } else {
+                    ui.label(egui::RichText::new("等待產生…").size(24.0).weak());
+                }
+                ui.label(egui::RichText::new("QR 碼 3 分鐘內有效；過期請按重新產生。").weak());
+            }
+            if let Some(err) = &login.last_error {
+                ui.label(egui::RichText::new(err.clone()).color(self.palette.bad));
+                if login.auth == AuthState::Authenticating && ui.button("重新產生").clicked() {
+                    let _ = self.login_tx.send(WsCommand::StartLogin);
+                }
+            }
+            if login.auth == AuthState::Ready {
+                ui.label("這個帳號就是 AI寶 在群組裡的身分。登入狀態已加密保存，下次開機自啟動會自動登入。");
+            }
+            ui.add_space(8.0);
+            ui.separator();
+            // 第二列: AI寶 (狀態 + 啟動/重新啟動; 異常附一鍵修復; 小字附使用中的 AI 與核心版本)。
+            ui.label(egui::RichText::new("AI寶").strong());
+            ui.horizontal(|ui| {
+                ui.label(status_dot(ai_dot));
+                ui.label(format!("AI寶：{ai_status}"));
+            });
+            ui.horizontal(|ui| {
+                if !starting {
+                    if !running && ui.button("啟動").clicked() {
+                        self.start_engine("總覽頁 AI寶 列「啟動」按鈕");
+                    }
+                    if (running || failed) && ui.button("重新啟動").clicked() {
+                        self.restart_engine("總覽頁 AI寶 列「重新啟動」按鈕");
+                    }
+                }
+                if failed {
+                    let repairing = self.busy.get("repair").copied().unwrap_or(false);
+                    if primary_btn(ui, self.palette, if repairing { "修復中…" } else { "一鍵修復" }).clicked() && !repairing {
+                        self.start_repair(&ctx);
+                    }
+                }
+            });
+            ui.label(egui::RichText::new(ai_small).weak().small());
+            if running && decrypt_blocking > 0 {
+                ui.label(egui::RichText::new(format!(
+                    "有 {decrypt_blocking} 則訊息讀不到：先登出再重新登入，讓鑰匙重新對齊。"
+                )).color(self.palette.bad));
+            }
             if !self.repair_lines.is_empty() {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("一鍵修復結果:").strong());
@@ -3414,208 +3279,23 @@ impl App {
                     ui.label(format!("・{line}"));
                 }
             }
-            if let EngineState::Failed(msg) = &self.engine_snap.state {
-                ui.label(egui::RichText::new(format!("引擎異常: {msg}")).color(self.palette.bad));
-            }
             #[cfg(windows)]
             if self.tray.is_none() {
-                ui.label(egui::RichText::new("右下角系統匣圖示建立失敗 (原因已寫進程式紀錄): 要結束程式請用「程式設定」頁的『結束服務並關閉程式』, 並請把這行訊息回報給維護人員。").color(self.palette.warn));
+                ui.label(egui::RichText::new("右下角系統匣圖示建立失敗 (原因已寫進程式紀錄): 要結束程式請用「程式設定」頁的「結束服務並關閉程式」, 並請把這行訊息回報給維護人員。").color(self.palette.warn));
             }
+            // 自動登入開關 (修復 B): 放在總覽服務卡內一眼看得到, 與程式設定頁是同一個開關。
+            ui.add_space(8.0);
+            ui.separator();
+            let mut auto_login = self.shell_settings.auto_login;
+            if ui.checkbox(&mut auto_login, "開啟程式時自動登入並啟用服務").changed() {
+                self.shell_settings.auto_login = auto_login;
+                self.shell_settings.save();
+                if auto_login && matches!(self.engine_snap.state, EngineState::NotStarted) {
+                    self.start_engine("總覽頁服務卡「自動登入」開關");
+                }
+            }
+            ui.label("打開後，下次開啟程式會直接恢復登入，不用再掃碼。");
         });
-        ui.add_space(10.0);
-        // LINE 聊天畫面直接嵌在總覽下方 (Codex 總覽同款, 老吳 2026-10-24 定奪):
-        // 與「聊天室畫面」頁共用同一個 WebView, 每次只顯示在當前頁的框裡;
-        // 未登入時只顯示占位文字, 不重複出現第二個登入介面 (登入在上方登入區做)。
-        // 進頁狀態紀錄與強制重排: 與聊天室畫面頁同一標準, 第一次進總覽就要畫出來,
-        // 不必等使用者縮小再打開 (追蹤欄位與聊天室畫面頁分開記)。
-        let force_chatview = std::env::var("AIBAO_CHATVIEW_FORCE").as_deref() == Ok("1");
-        if self.overview_last_page != Some(Page::Overview) {
-            let login0 = self.login_snapshot();
-            shell::log_line(&format!(
-                "總覽頁: 進入本頁, 登入狀態={:?}, WebView 已建立={}, 嵌入可用={}{}",
-                login0.auth,
-                self.chatview.is_created(),
-                chatview::available(),
-                if force_chatview { ", 強制嵌入模式 (CI)" } else { "" }
-            ));
-            self.overview_last_page = Some(Page::Overview);
-            self.chatview.request_reveal();
-        }
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("LINE 聊天畫面").strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("重新載入聊天畫面").clicked() {
-                    self.chatview.reset();
-                }
-            });
-        });
-        ui.add_space(4.0);
-        let minimized = ui.ctx().input(|i| i.viewport().minimized) == Some(true);
-        let want = Self::chatview_hidden_reason(self.hidden, minimized, self.confirm_quit, self.confirm_logout, self.show_tray_hint, self.quitting).is_none();
-        let want_reason = Self::chatview_hidden_reason(self.hidden, minimized, self.confirm_quit, self.confirm_logout, self.show_tray_hint, self.quitting).unwrap_or("顯示中");
-        let avail = ui.available_size();
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(avail.x, 520.0), egui::Sense::hover());
-        ui.painter().rect_stroke(
-            rect,
-            egui::CornerRadius::same(10),
-            egui::Stroke::new(1.0, self.palette.border),
-            egui::StrokeKind::Inside,
-        );
-        if self.engine_unavailable() {
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "引擎尚未就緒：請在上方服務狀態列按『啟動』或『一鍵修復』，引擎就緒後聊天會顯示在這裡。",
-                egui::FontId::proportional(15.0),
-                self.palette.warn_text,
-            );
-        } else if !matches!(login.auth, AuthState::Ready) && !force_chatview {
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "請在上方啟動 LINE 服務；登入後聊天會顯示在這裡。",
-                egui::FontId::proportional(15.0),
-                self.palette.warn_text,
-            );
-        } else if chatview::available() {
-            ui.label(egui::RichText::new(self.chatview.status_line(want, want_reason)).weak().small());
-            let profile = self.webview_profile_dir.clone();
-            let ppp = ui.ctx().pixels_per_point();
-            self.chatview.sync(self.parent_hwnd, rect, ppp, want, want_reason, &profile);
-            if let Some(err) = self.chatview.error() {
-                let err = err.to_string();
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    err,
-                    egui::FontId::proportional(15.0),
-                    self.palette.warn_text,
-                );
-            }
-        } else {
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "聊天畫面會在 Windows 版的 AI寶 裡顯示",
-                egui::FontId::proportional(15.0),
-                self.palette.warn_text,
-            );
-        }
-        ui.add_space(4.0);
-        if ui.button("去「聊天室畫面」頁看大畫面").clicked() {
-            self.page = Page::ChatRoom;
-        }
-    }
-
-    /// 總覽最上方的登入區 (修復版6: 原「LINE 登入」頁全部內容併入總覽)。
-    /// 分區標題保留「LINE 登入」四字作為總覽內的分區名; 登入狀態機、按鈕行為與
-    /// confirm_logout 對話框一律不改。尚未啟用與引擎未就緒時只顯示對應卡片,
-    /// 不提早離開總覽 (下方服務狀態與聊天情況仍要顯示)。
-    fn login_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("LINE 登入").strong().size(17.0).color(self.palette.primary));
-        ui.add_space(6.0);
-        let login = self.login_snapshot();
-        if matches!(self.engine_snap.state, EngineState::NotStarted) {
-            card(ui, self.palette, "尚未啟用", |ui| {
-                ui.label("程式還沒有啟用: 目前沒有登入 LINE, 也不會回應群組訊息。");
-                ui.label("按下面的按鈕就會開始登入 (之前登入過的話會用保存的登入狀態自動恢復, 不用再掃一次 QR 碼)。");
-                ui.add_space(6.0);
-                if ui.button("登入並啟用").clicked() {
-                    self.start_engine("總覽頁「登入並啟用」按鈕");
-                }
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("想讓它每次打開程式就自動登入, 到「程式設定」打開『開啟程式時自動登入並啟用服務』。").weak());
-            });
-        } else if self.engine_unavailable() {
-            card(ui, self.palette, "引擎尚未就緒", |ui| {
-                ui.label(format!("目前引擎狀態: {}", self.engine_snap.label));
-                ui.label("引擎還沒啟動完成, 登入功能要等引擎就緒才能使用。");
-                if ui.button("重新啟動引擎").clicked() {
-                    self.restart_engine("總覽頁「重新啟動引擎」按鈕");
-                }
-            });
-        } else {
-        match login.auth {
-            AuthState::Ready => {
-                card(ui, self.palette, "已登入", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(status_dot(self.palette.ok));
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "已登入: {}",
-                                login.profile_name.as_deref().unwrap_or("(名稱讀取中)")
-                            ))
-                            .size(18.0),
-                        );
-                    });
-                    ui.label("這個帳號就是 AI寶 在 LINE 群組裡的身分。登入狀態已加密保存, 下次開機自啟動會自動登入。");
-                    ui.add_space(6.0);
-                    if ui.button("登出").clicked() {
-                        self.confirm_logout = true;
-                    }
-                    ui.add_space(6.0);
-                    // 什麼情況需要登出重登 (2026-10-21 第二段): 事故時老吳只能重啟亂試,
-                    // 把正解寫在登出按鈕旁邊, 以後不用再問人。
-                    ui.label(egui::RichText::new("什麼時候需要登出再重新登入? 如果機器人突然讀不到某位同事的訊息 (例如群組有人加入或離開之後), 那是 LINE 換了讀訊息的鑰匙、跟這台電腦對不上。先按上面的「登出」, 再重新掃 QR 登入, 讓鑰匙重新對齊。若登出重登後還是讀不到, 下一步是把機器人移出該群組、再重新邀請它加入 — 重新入群會讓 LINE 把目前的鑰匙重新分發給它。重新啟動程式修不好這個問題。").weak());
-                });
-            }
-            AuthState::Authenticating => {
-                card(ui, self.palette, "登入中", |ui| {
-                    ui.label("請用次要帳號的 LINE, 依下面步驟完成登入:");
-                    ui.label("第 1 步: 用手機 LINE 掃描這張 QR 碼 (LINE App 的「加入好友 → 行動條碼」)。");
-                    if let Some(url) = &login.qr_url {
-                        draw_qr(ui, self.palette, url, 240.0);
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("正在向 LINE 取得 QR 碼…");
-                        });
-                    }
-                    ui.add_space(6.0);
-                    ui.label("第 2 步: 掃描後, 手機會要你輸入一組 PIN 碼, 就是這一組:");
-                    if let Some(pin) = &login.pin {
-                        ui.label(egui::RichText::new(pin.clone()).size(44.0).strong().color(self.palette.primary));
-                    } else {
-                        ui.label(egui::RichText::new("等待產生…").size(24.0).weak());
-                    }
-                    if let Some(err) = &login.last_error {
-                        ui.label(egui::RichText::new(err.clone()).color(self.palette.bad));
-                        if ui.button("重新產生").clicked() {
-                            let _ = self.login_tx.send(WsCommand::StartLogin);
-                        }
-                    }
-                    ui.label(egui::RichText::new("QR 碼 3 分鐘內有效; 過期請按重新產生。").weak());
-                });
-            }
-            AuthState::Restoring => {
-                card(ui, self.palette, "恢復登入中", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("正在用上次保存的登入狀態自動登入, 請稍候…");
-                    });
-                });
-            }
-            _ => {
-                card(ui, self.palette, "尚未登入", |ui| {
-                    if !login.connected {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("正在連接核心服務…");
-                        });
-                    }
-                    ui.label("按下開始登入後, 這裡會出現 QR 碼, 用次要帳號的手機 LINE 掃描即可。");
-                    ui.label(egui::RichText::new("重要: 請用次要帳號, 不要用主帳號登入。").color(self.palette.warn_text).strong());
-                    if let Some(err) = &login.last_error {
-                        ui.label(egui::RichText::new(err.clone()).color(self.palette.bad));
-                    }
-                    ui.add_space(6.0);
-                    if ui.add(egui::Button::new(egui::RichText::new("開始登入").size(18.0).color(egui::Color32::WHITE)).fill(self.palette.primary)).clicked() {
-                        let _ = self.login_tx.send(WsCommand::StartLogin);
-                    }
-                });
-            }
-        }
-        }
     }
 
 /// 聊天室畫面「目前不顯示」的原因 (白話, 檢查順序與 page_chat 的 want 條件一致)。
@@ -3700,9 +3380,9 @@ fn chatview_hidden_reason(hidden: bool, minimized: bool, confirm_quit: bool, con
         }
         if self.engine_unavailable() {
             self.chatview.force_hide();
-            card(ui, self.palette, "引擎尚未就緒", |ui| {
+            card(ui, self.palette, "服務尚未就緒", |ui| {
                 ui.label(format!("目前引擎狀態: {}", self.engine_snap.label));
-                ui.label("引擎還沒啟動完成, 聊天畫面要等引擎就緒才能使用。");
+                ui.label("服務還沒啟動完成，聊天畫面要等服務就緒才能使用。");
                 if ui.button("重新啟動引擎").clicked() {
                     self.restart_engine("聊天室頁「重新啟動引擎」按鈕");
                 }
@@ -3767,15 +3447,39 @@ fn chatview_hidden_reason(hidden: bool, minimized: bool, confirm_quit: bool, con
         ui.label("選一家 AI 服務、貼上 API Key、抓模型清單選一個, 測試成功後按「儲存全部設定」。");
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
-        // 第一張卡改為指路卡 (修復版6後續修復, 一份設定只有一個家):
-        // 全域角色定位與回答範圍改到「聊天室管理」頁上方全域區改, 這裡不再放第二份可編輯欄位。
-        // (欄位本身仍在表單裡, 由管理頁全域區編輯、走同一條 save_settings 儲存。)
-        card(ui, self.palette, "機器人定位與範圍（全域的預設設定）", |ui| {
-            ui.label("全域的角色定位與回答範圍改到「聊天室管理」頁最上方的全域區改, 這裡不再放第二份。");
-            ui.label(egui::RichText::new("已有自己設定的聊天室不會用這份, 也不會和這份合併。").weak().small());
-            if ui.button("去「聊天室管理」頁改全域設定").clicked() {
-                self.page = Page::ChatManage;
-            }
+        // 全域知識庫資料夾 (界面重整: 從聊天室管理頁全域區搬到這裡, 標明全域預設)。
+        card(ui, self.palette, "知識庫資料夾（全域預設）", |ui| {
+            ui.label("指定一個資料夾，AI寶 會讀取裡面的 .txt / .md / .csv 回答公司問題，資料夾內容請先自行脫敏。");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.form.kb_folder).desired_width(420.0).hint_text("例如 D:\\公司文件\\知識庫"));
+                if ui.button("選擇資料夾…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.form.kb_folder = path.to_string_lossy().to_string();
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.form.show_sources, "回答時附上參考來源");
+            });
+            ui.horizontal(|ui| {
+                let busy = self.busy.get("reindex").copied().unwrap_or(false);
+                if ui.button(if busy { "整理中…" } else { "重新建立索引" }).clicked() && !busy {
+                    self.busy.insert("reindex".into(), true);
+                    let slot = self.reindex_slot.clone();
+                    let ctx2 = ctx.clone();
+                    std::thread::spawn(move || {
+                        let r = helper_api::kb_reindex();
+                        *slot.lock().unwrap() = Some(match r {
+                            Ok(v) => v,
+                            Err(e) => serde_json::json!({ "ok": false, "message": e }),
+                        });
+                        ctx2.request_repaint();
+                    });
+                }
+                if let Some(m) = self.page_msg.get("reindex") {
+                    ui.label(m.clone());
+                }
+            });
         });
         ui.add_space(10.0);
         let pids: Vec<String> = ["openai", "groq", "minimax"].iter().map(|s| s.to_string()).collect();
@@ -3966,7 +3670,7 @@ impl App {
     /// 補上假候選人 (先放該室已儲存的管理員、再以「截圖驗證成員NN」補到 N 位), 只影響畫面
     /// 顯示, 不寫回任何存檔、不參與儲存 (與 AIBAO_MANAGE_CHAT_ID、AIBAO_CHATVIEW_FORCE
     /// 同款 CI 專用環境變數, 一般使用不設)。假帳號皆為 u9 開頭的測試編號, 不是真實帳號。
-    fn manage_display_candidates(&self, chat_id: &str) -> Vec<(String, String, String)> {
+    fn manage_display_candidates(&self, _chat_id: &str) -> Vec<(String, String, String)> {
         let mut out: Vec<(String, String, String)> = Vec::new();
         for c in &self.manage_candidates {
             let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -3982,13 +3686,8 @@ impl App {
             .parse::<usize>()
         {
             if n > 0 {
-                if let Some(saved) = self.form.chat_profiles_orig.get(chat_id) {
-                    for (aid, aname) in &saved.admins {
-                        if !out.iter().any(|(id, _, _)| id == aid) {
-                            out.push((aid.clone(), aname.clone(), String::new()));
-                        }
-                    }
-                }
+                // 已選管理員的名字一律來自本室候選名單即時解析, 不再從存檔名補
+                // (存檔已只存 ID); 候選名單外的已選人不在此補, 避免畫出名字快照。
                 let mut i = 1usize;
                 while out.len() < n {
                     let fid = format!("u9{i:031}");
@@ -4057,15 +3756,11 @@ impl App {
                     "全域預設"
                 };
                 let chatty = if f.chatty { "聒噪開" } else { "聒噪關" };
-                let admins = if f.admins.is_empty() {
-                    "未設管理員".to_string()
-                } else {
-                    format!("管理員 {} 位", f.admins.len())
-                };
+                let admins = format!("管理員 {} 位", f.admins.len());
                 let kb = if f.kb_enabled { "知識庫開" } else { "知識庫關" };
                 format!("{source}・{chatty}・{admins}・{kb}")
             }
-            None => "全域預設・聒噪關・未設管理員・知識庫開".to_string(),
+            None => "全域預設・聒噪關・管理員 0 位・知識庫開".to_string(),
         }
     }
 
@@ -4096,7 +3791,7 @@ impl App {
                 }
                 return;
             }
-            ui.label("只有加進白名單的聊天室, 機器人才會在裡面回應; 沒加進來的群組, 機器人不會說話。下面每列就是一個已經加進來的聊天室, 可以直接移除、或是跳去設定那個聊天室。");
+            ui.label("只有加進白名單的聊天室，機器人才會在裡面回應。");
             ui.add_space(4.0);
             if !self.wl_loaded && !self.wl_attempted && !self.busy.get("wl").copied().unwrap_or(false) {
                 self.spawn_whitelist_load(ctx);
@@ -4250,19 +3945,11 @@ impl App {
         // 頁面標題列: 右上角放一顆看得見的儲存鈕 (Codex 管理頁同款位置),
         // 存的與標題下方、表單最下方那兩顆是同一個動作 (存這個聊天室的設定)。
         // 標題下方最上方就是白名單區, 不用去別頁。
-        ui.horizontal(|ui| {
-            ui.heading("聊天室管理");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let saving_profiles = self.busy.get("chat_profiles").copied().unwrap_or(false);
-                if primary_btn(ui, self.palette, if saving_profiles { "儲存中…" } else { "儲存這個聊天室的設定" }).clicked() && !saving_profiles {
-                    self.save_chat_profiles(&ctx);
-                }
-            });
-        });
+        ui.heading("聊天室管理");
         ui.add_space(8.0);
         self.whitelist_section(ui, &ctx, logged_in);
         ui.add_space(10.0);
-        let options = self.manage_chat_options();
+        let options = self.manage_chat_options();        let options = self.manage_chat_options();
         if options.is_empty() {
             card(ui, self.palette, "聊天室管理", |ui| {
                 ui.label("目前還沒有可以管理的聊天室: 請先在本頁上方的白名單加入群組, 這裡就會列出來。");
@@ -4297,19 +3984,9 @@ impl App {
                 self.manage_admin_search = s;
             }
         }
-        // 三步指引 (老吳 2026-10-24: 原頁面看不出改完按哪裡儲存、改完去哪裡看效果)。
-        // 第零步: 白名單先設好, 這裡才有室可以管; 白名單表就在本頁最上方, 不用去別頁。
-        card(ui, self.palette, "怎麼用這個頁面 (三步)", |ui| {
-            ui.label("第零步 (先做一次就好): 先在本頁最上方的白名單把要管的群組加進來, 加進來的聊天室才會出現在下面, 才能編輯。");
-            ui.label("第一步: 下面點一個聊天室的頁簽, 點哪個頁簽就是在設哪個聊天室。");
-            ui.label("第二步: 改下面五區的設定 (角色、回答範圍、知識庫、管理員、聒噪)。");
-            ui.label("第三步: 按「儲存這個聊天室的設定」 (頁面右上角、標題下面和表單最下面都有)。");
-            ui.label("改完去哪裡看效果: 總覽頁上方的「機器人情況」數字會跟著變; 詳細的通知與回答紀錄在「紀錄」頁。");
-        });
         ui.add_space(10.0);
-        // 上方全域區 (老吳 2026-10-24 版面): 全域預設一處可改; 各室自己的設定在下方頁簽改。
-        // 全域角色/範圍/知識庫資料夾原本散在「AI 設定」頁與「知識庫」頁, 現在起以這裡為主,
-        // 那兩頁改為指到這裡的說明卡/說明頁 (一份設定只有一個家)。
+        // 上方全域區 (老吳 2026-10-24 版面): 全域角色定位與回答範圍一處可改; 各室自己的設定在下方頁簽改。
+        // 全域知識庫資料夾已搬到「AI 設定」頁 (一份設定只有一個家)。
         card(ui, self.palette, "全域設定 (所有聊天室沒自訂時都用這一份)", |ui| {
             ui.label(egui::RichText::new("這裡改的是「沒自訂的聊天室共用的預設」; 已經有自己設定的聊天室不會用這份, 也不會和這份合併。").weak().small());
             ui.label(egui::RichText::new("角色定位").strong());
@@ -4320,43 +3997,12 @@ impl App {
             ui.add(egui::TextEdit::multiline(&mut self.form.ai_scope).desired_rows(4).desired_width(f32::INFINITY));
             ui.label(egui::RichText::new("清空這個欄位 = 不限制範圍, 什麼問題都回答。").weak().small());
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("知識庫資料夾").strong());
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.form.kb_folder).desired_width(420.0).hint_text("例如 D:\\公司文件\\知識庫"));
-                if ui.button("選擇資料夾…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.form.kb_folder = path.to_string_lossy().to_string();
-                    }
-                }
-            });
-            ui.label(egui::RichText::new("指定一個資料夾, AI寶 會讀取裡面的 .txt / .md / .csv 回答公司問題。資料夾內容請先自行脫敏。留空 = 沒有全域資料夾, 各室只能用自己的專屬資料夾。").weak().small());
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.form.show_sources, "回答時附上參考來源");
-                ui.label(egui::RichText::new("(打開才會在回答後面附上參考的檔案名稱; 關閉就不顯示)").weak());
-            });
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
                 if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存全域設定" }).clicked() && !saving {
                     self.save_settings(&ctx);
                 }
                 if let Some(m) = &self.form.save_msg {
-                    ui.label(m.clone());
-                }
-                let busy = self.busy.get("reindex").copied().unwrap_or(false);
-                if ui.button(if busy { "整理中…" } else { "重新建立索引" }).clicked() && !busy {
-                    self.busy.insert("reindex".into(), true);
-                    let slot = self.reindex_slot.clone();
-                    let ctx2 = ctx.clone();
-                    std::thread::spawn(move || {
-                        let r = helper_api::kb_reindex();
-                        *slot.lock().unwrap() = Some(match r {
-                            Ok(v) => v,
-                            Err(e) => serde_json::json!({ "ok": false, "message": e }),
-                        });
-                        ctx2.request_repaint();
-                    });
-                }
-                if let Some(m) = self.page_msg.get("reindex") {
                     ui.label(m.clone());
                 }
             });
@@ -4461,22 +4107,9 @@ impl App {
             }
             ui.add_space(6.0);
             // 儲存鈕放標題下面, 不用捲到最下方才找得到 (下方表單最下面也有一顆, 兩顆同一動作)。
-            ui.horizontal(|ui| {
-                let saving_profiles = self.busy.get("chat_profiles").copied().unwrap_or(false);
-                if primary_btn(ui, pal, if saving_profiles { "儲存中…" } else { "儲存這個聊天室的設定" }).clicked() && !saving_profiles {
-                    self.save_chat_profiles(&ctx);
-                }
-                if let Some(m) = &self.chat_profiles_msg {
-                    ui.label(m.clone());
-                }
-            });
-            ui.add_space(4.0);
-            // 角色與回答範圍 (五區前兩區): 這區是改這個聊天室回答問題時扮演的角色、
-            // 以及能回答哪些範圍。
-            // 使用全域預設 / 本聊天室自訂切換: 切自訂時預填全域文字; 切回全域只清人設自訂旗標,
-            // 聒噪、管理員、知識庫等獨立欄位不連帶刪除 (條目存廢由 has_entry 決定)。
-            ui.label(egui::RichText::new("角色與回答範圍").strong());
-            ui.label(egui::RichText::new("這區是改這個聊天室回答問題時扮演的角色、以及能回答哪些範圍。").weak().small());
+            // 角色定位與回答範圍 (五區前兩區): 切換只改人設自訂旗標, 不連帶刪其他欄位。
+            ui.label(egui::RichText::new("角色定位").strong());
+            ui.label(egui::RichText::new("這個聊天室回答問題時扮演的角色。").weak().small());
             {
                 let f = match self.form.chat_profiles.get_mut(&chat_id) {
                     Some(f) => f,
@@ -4496,47 +4129,52 @@ impl App {
                         f.scope = global_scope.clone();
                     }
                 }
+                if f.custom {
+                    ui.add(egui::TextEdit::multiline(&mut f.role).desired_rows(2).desired_width(f32::INFINITY));
+                } else {
+                    ui.label(egui::RichText::new("這個聊天室用全域預設的角色定位。").weak().small());
+                }
             }
             ui.add_space(6.0);
-            // 角色定位與回答範圍 (自訂時才在這裡改; 用全域時去「AI 設定」頁改全域預設)
+            ui.label(egui::RichText::new("回答範圍").strong());
+            ui.label(egui::RichText::new("這個聊天室能回答哪些範圍的問題。").weak().small());
             {
                 let f = match self.form.chat_profiles.get_mut(&chat_id) {
                     Some(f) => f,
                     None => return,
                 };
-                if !f.custom {
-                    ui.label(egui::RichText::new("這個聊天室用上方全域區的角色定位與回答範圍, 要改全域預設請捲到上面全域區。").weak().small());
-                } else {
-                    ui.label(egui::RichText::new("角色定位").strong());
-                    ui.add(egui::TextEdit::multiline(&mut f.role).desired_rows(2).desired_width(f32::INFINITY));
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("回答範圍").strong());
+                if f.custom {
                     ui.add(egui::TextEdit::multiline(&mut f.scope).desired_rows(4).desired_width(f32::INFINITY));
-                    ui.label(egui::RichText::new("清空這個欄位 = 這個聊天室不限制範圍, 什麼問題都回答。").weak().small());
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                // 知識庫 (五區第三區): 允許讀取 + 專屬資料夾 + 該群索引狀態一行
-                ui.label(egui::RichText::new("這個聊天室的知識庫").strong());
-                ui.label(egui::RichText::new("這區是決定這個聊天室能不能查知識庫、查哪個專屬資料夾。").weak().small());
-                ui.checkbox(&mut f.kb_enabled, "允許這個聊天室讀取知識庫");
-                ui.label(egui::RichText::new("關閉後, 這個聊天室問公司問題時不會查知識庫。").weak().small());
-                ui.horizontal(|ui| {
-                    ui.label("專屬資料夾:");
-                    ui.add(egui::TextEdit::singleline(&mut f.kb_folder).desired_width(340.0).hint_text("留空 = 用全域資料夾"));
-                    if ui.button("選擇資料夾…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            f.kb_folder = path.to_string_lossy().to_string();
-                        }
-                    }
-                });
-                ui.label(egui::RichText::new("留空 = 用全域知識庫資料夾。").weak().small());
-                if let Some(entry) = kb_chats.get(&chat_id) {
-                    ui.label(egui::RichText::new(format!("這個聊天室的知識庫索引: {}", kb_status_line(entry))).weak().small());
-                } else if !global_kb.is_null() {
-                    ui.label(egui::RichText::new(format!("全域知識庫索引: {}", kb_status_line(&global_kb))).weak().small());
+                } else {
+                    ui.label(egui::RichText::new("這個聊天室用全域預設的回答範圍。").weak().small());
                 }
             }
+            ui.add_space(8.0);
+            ui.separator();
+                // 知識庫 (五區第三區): 允許讀取 + 專屬資料夾 + 該群索引狀態一行。
+                ui.label(egui::RichText::new("知識庫").strong());
+                ui.label(egui::RichText::new("允許這個聊天室讀取知識庫，留空資料夾就用全域資料夾。").weak().small());
+                {
+                    let f = match self.form.chat_profiles.get_mut(&chat_id) {
+                        Some(f) => f,
+                        None => return,
+                    };
+                    ui.checkbox(&mut f.kb_enabled, "允許這個聊天室讀取知識庫");
+                    ui.horizontal(|ui| {
+                        ui.label("專屬資料夾:");
+                        ui.add(egui::TextEdit::singleline(&mut f.kb_folder).desired_width(340.0).hint_text("留空 = 用全域資料夾"));
+                        if ui.button("選擇資料夾…").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                f.kb_folder = path.to_string_lossy().to_string();
+                            }
+                        }
+                    });
+                    if let Some(entry) = kb_chats.get(&chat_id) {
+                        ui.label(egui::RichText::new(format!("這個聊天室的知識庫索引: {}", kb_status_line(entry))).weak().small());
+                    } else if !global_kb.is_null() {
+                        ui.label(egui::RichText::new(format!("全域知識庫索引: {}", kb_status_line(&global_kb))).weak().small());
+                    }
+                }
             // (聒噪區移到管理員區之後, 五區順序: 角色、範圍、知識庫、管理員、聒噪。)
             ui.add_space(8.0);
             ui.separator();
@@ -4549,9 +4187,7 @@ impl App {
                 ui.scroll_to_rect(admin_head.rect, Some(egui::Align::TOP));
                 self.manage_jump_admin = false;
             }
-            ui.label(egui::RichText::new("這區是選這個聊天室出事時要 @ 出來處理的人。").weak().small());
-            ui.label(egui::RichText::new("這裡的管理員只是「通知對象」: 有重要事件時, AI寶 會在群組裡 @ 他們出面處理; AI寶 本身不會踢人或處分任何人。未設定時, 重要事件會通知「機器人與觸發」頁的備援管理員。").weak().small());
-            ui.label(egui::RichText::new("管理員認的是帳號不是名字: 這個人改名字、或在不同聊天室顯示不同名字, 管理員身分都不會認不得。上面顯示的是他最近一次發言用的名字, 若和存檔舊名不同會加註。").weak().small());
+            ui.label(egui::RichText::new("出事時要在群組裡 @ 出來處理的人，名字是在這個室看到的樣子。").weak().small());
             // 顯示用候選名單 (真實名單; CI 截圖時另補假候選人, 見 manage_display_candidates)。
             // 候選名單是否已讀完: 只有讀完才能判斷「已選的人不在名單裡」, 讀取中不亂警告。
             let display_cands = self.manage_display_candidates(&chat_id);
@@ -4565,36 +4201,18 @@ impl App {
                     Some(f) => f,
                     None => return,
                 };
-                if f.admins.is_empty() {
-                    // 沒設本室管理員時, 實際生效的是全域備援名單——這就是之前每個室
-                    // 通知看起來都是同一個人 (妖狐藏馬) 的原因: 不是寫死, 是全部退回備援。
-                    let fallback = self
-                        .form
-                        .notify_admins
-                        .iter()
-                        .map(|(_, n)| n.clone())
-                        .collect::<Vec<_>>()
-                        .join("、");
-                    if fallback.is_empty() {
-                        ui.label(egui::RichText::new("未設管理員, 全域備援也沒設人: 重要事件只會記在紀錄裡, 不會 @ 任何人。").weak().small());
-                    } else {
-                        ui.label(egui::RichText::new(format!("未設管理員, 目前用全域備援: {fallback} (只有這個聊天室沒設管理員時才用這裡的人)。")).weak().small());
-                    }
-                } else {
-                    // 顯示名字以候選名單最新名字為準 (帳號相同、名字改過時不顯示舊名);
-                    // 存檔舊名不同時加註, 不偷偷改寫存檔。
+                // 未設時已選區就是空的 (不跳提醒、不補說明, 2026-10-25 老吳定案);
+                // 有設才列出, 名字一律取自本室最新候選名單即時解析。
+                if !f.admins.is_empty() {
                     let mut remove_id: Option<String> = None;
-                    for (aid, aname) in &f.admins.clone() {
-                        let fresh = display_cands
+                    for aid in &f.admins.clone() {
+                        // 名字只從本室最新候選名單即時解析; 候選名單裡暫時沒有這個人時
+                        // 顯示帳號本身 (仍可移除), 絕不顯示存檔的名字快照 (存檔已只存 ID)。
+                        let label = display_cands
                             .iter()
                             .find(|(id, _, _)| id == aid)
                             .map(|(_, n, _)| n.clone())
-                            .unwrap_or_else(|| aname.clone());
-                        let label = if fresh != *aname {
-                            format!("{fresh} (存檔舊名: {aname})")
-                        } else {
-                            fresh
-                        };
+                            .unwrap_or_else(|| aid.clone());
                         ui.horizontal(|ui| {
                             ui.label(label);
                             if ui.button("移除").clicked() {
@@ -4603,16 +4221,24 @@ impl App {
                         });
                     }
                     if let Some(rid) = remove_id {
-                        f.admins.retain(|(id, _)| *id != rid);
+                        f.admins.retain(|id| *id != rid);
                     }
-                    // 未確認提醒 (Codex: 成員名單未經確認要有提醒文字): 已選的人不在目前
-                    // 候選名單裡 (最近沒在這個室說話), 無法確認他還在室內, 請重新確認。
-                    // 注意: Codex 另有「未核對就不 @」的門檻, 我們不抄——那會改變現有通知
-                    // 行為 (備援與已設管理員本來就會 @); 這裡只提醒、不擋通知。
+                    // 已選的人不在目前候選名單裡 (最近沒在這個室說話), 名字顯示為帳號、
+                    // 無法確認他還在室內時, 在此列出帳號供確認; 這裡只列出、不擋通知。
                     if load_done {
                         let bad = admin_unconfirmed(&f.admins.clone(), &candidate_ids);
                         if !bad.is_empty() {
-                            let names = bad.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>().join("、");
+                            let names = bad
+                                .iter()
+                                .map(|id| {
+                                    display_cands
+                                        .iter()
+                                        .find(|(cid, _, _)| cid == id)
+                                        .map(|(_, n, _)| n.clone())
+                                        .unwrap_or_else(|| id.clone())
+                                })
+                                .collect::<Vec<_>>()
+                                .join("、");
                             ui.label(egui::RichText::new(format!("⚠ 以下已選的人不在目前的候選名單裡 (最近沒在這個室說話), 無法確認他還在室內, 建議重新確認: {names}。")).color(pal.warn_text).strong());
                         }
                     }
@@ -4647,7 +4273,7 @@ impl App {
                 .form
                 .chat_profiles
                 .get(&chat_id)
-                .map(|f| f.admins.iter().map(|(id, _)| id.clone()).collect())
+                .map(|f| f.admins.clone())
                 .unwrap_or_default();
             let cands_empty = display_cands.is_empty();
             let filtered: Vec<(String, String, String)> = display_cands
@@ -4688,7 +4314,7 @@ impl App {
                     let suffix = if source == "openchat-admin" { " (社群管理員)" } else { "" };
                     let mut on = false;
                     if ui.checkbox(&mut on, format!("{cname}（帳號末 4 碼：{}）{suffix}", admin_last4(cid))).changed() && on {
-                        f.admins.push((cid.clone(), cname.clone()));
+                        f.admins.push(cid.clone());
                     }
                 }
             }
@@ -4699,30 +4325,16 @@ impl App {
             // 護欄 (45 秒間隔、每小時 20 則、剛接過話先讓真人講、同一人來回 3 次冷卻 10 分鐘)
             // 與「不主動接其他機器人的話」照凍結定義, 這裡只寫開關與指路, 不重定義。
             ui.label(egui::RichText::new("聒噪模式").strong());
-            ui.label(egui::RichText::new("這區是決定這個聊天室要不要讓 AI 自己找話題接話 (不用叫名字)。").weak().small());
+            ui.label(egui::RichText::new("觸發是全域規則、聒噪是各室開關，同一則不會回兩次。").weak().small());
             {
                 let f = match self.form.chat_profiles.get_mut(&chat_id) {
                     Some(f) => f,
                     None => return,
                 };
                 ui.checkbox(&mut f.chatty, "聒噪模式: 不用叫名字, 我也會自己找話題接話");
-                ui.label(egui::RichText::new("打開後, 我會看著這個群最近的對話, 自己判斷有沒有自然合適的話可以接; 沒有合適的話就保持安靜, 不會每則都回。打開後 AI 用量會增加。叫名字或引用問我時, 還是照平常方式優先回答; 別的群的事、個人資料跟公司機密, 我一樣不會說出去。").weak().small());
-            }
-            ui.label(egui::RichText::new("聒噪只接「沒被叫名字」的話; 被叫名字時走全域觸發規則, 不走這裡。兩邊怎麼分工, 看「機器人與觸發」頁上方的說明。").weak().small());
-            if ui.button("去「機器人與觸發」頁看分工說明").clicked() {
-                self.page = Page::BotSettings;
             }
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let saving_profiles = self.busy.get("chat_profiles").copied().unwrap_or(false);
-                if primary_btn(ui, pal, if saving_profiles { "儲存中…" } else { "儲存這個聊天室的設定" }).clicked() && !saving_profiles {
-                    self.save_chat_profiles(&ctx);
-                }
-                if let Some(m) = &self.chat_profiles_msg {
-                    ui.label(m.clone());
-                }
-            });
-            ui.label(egui::RichText::new("儲存後馬上生效, 不用重新開啟程式。").weak().small());
+
         });
         ui.add_space(10.0);
         // 已停用設定區 (頁尾): 移出白名單後保留但停用的條目, 在這裡恢復或捨棄。
@@ -4736,7 +4348,7 @@ impl App {
         suspended_ids.sort();
         if !suspended_ids.is_empty() {
             card(ui, pal, "已停用設定", |ui| {
-                ui.label(egui::RichText::new("這些聊天室之前有自訂設定, 移出白名單後先保留但停用。恢復使用後要在本頁上方白名單把聊天室加回來才會真的生效; 不要了可以捨棄這份設定 (會把這份設定刪掉, 聒噪/管理員等欄位也會一起刪掉)。").weak().small());
+                ui.label(egui::RichText::new("這些聊天室之前有自訂設定，移出白名單後先保留但停用。").weak().small());
                 let mut restore_id: Option<String> = None;
                 let mut discard_id: Option<String> = None;
                 for sid in &suspended_ids {
@@ -4772,18 +4384,6 @@ impl App {
             self.admin_events_attempted = true;
             self.spawn_admin_events_load(&ctx);
         }
-        // 觸發與聒噪的分工說明 (修復版6後續修復, 語意經程式查證 — 見施工紀錄):
-        // 叫名字/引用走觸發、沒叫名字才看各室聒噪、同一則絕不雙回; 兩者不打架。
-        card(ui, self.palette, "觸發跟聒噪怎麼分工 (不會打架)", |ui| {
-            ui.label("觸發是全域規則, 在這一頁管: 有人在訊息裡叫機器人名字或別名、或是引用機器人的回答再追問, 就走觸發回答; 冷卻、60 秒上限、每日上限也在這一頁。");
-            ui.label("聒噪是各聊天室自己的開關, 在「聊天室管理」頁管: 只有「沒被叫名字」的一般訊息, 才看那個聊天室的聒噪開關決定要不要自己接話。");
-            ui.label("同一則訊息不會回兩次: 被叫名字的訊息就算這次被冷卻或上限擋下不回, 也不會轉給聒噪補一句; 聒噪只接沒叫名字的話。");
-            ui.label("AI寶 自己的話和系統通知 (有人加入或離開) 不觸發也不接話。其他機器人的話因為 LINE 沒給可靠的標記、沒辦法百分之百認出來, 靠接話間隔與上限護欄收斂, 不會無限互聊。");
-            if ui.button("去「聊天室管理」頁開／關聒噪").clicked() {
-                self.page = Page::ChatManage;
-            }
-        });
-        ui.add_space(8.0);
         card(ui, self.palette, "機器人名字與觸發規則", |ui| {
             ui.horizontal(|ui| {
                 ui.label("機器人主名 (在群組裡叫這個名字, 我就會回應):");
@@ -4817,9 +4417,7 @@ impl App {
                 ui.label("所有群合計／60 秒上限:");
                 ui.add(egui::DragValue::new(&mut self.form.all_chats_minute).range(0..=1000));
             });
-            ui.label(egui::RichText::new("每人每群／60 秒: 同一個人在同一個聊天室，任意連續 60 秒內最多問 AI 幾次。").weak());
-            ui.label(egui::RichText::new("所有群合計／60 秒: 所有允許的聊天室加起來，任意連續 60 秒內最多問幾次；用滿後，其他群的人也要等有空額才能問。").weak());
-            ui.label(egui::RichText::new("兩個數字填 0 表示不限制。只算真正送出的提問: 只叫名字打招呼不算，AI 當次回答失敗也算一次；次數在程式重啟後會清零。").weak());
+            ui.label(egui::RichText::new("60 秒上限填 0 表示不限制，只算真正送出的提問，程式重開後清零。").weak());
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
                 if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存設定" }).clicked() {
@@ -4885,76 +4483,8 @@ impl App {
             }
         });
         ui.add_space(10.0);
-        card(ui, self.palette, "備援管理員 (聊天室未設管理員時用)", |ui| {
-            ui.label(egui::RichText::new("每個聊天室可以在「聊天室管理」頁設定自己的管理員; 該聊天室有自己的管理員時, 重要事件只通知該室管理員, 不會通知這份備援名單。").weak());
-            ui.label(egui::RichText::new("只有聊天室沒設管理員時才用這裡的人: 所以如果你看到每個室通知的都是同一批人, 不是寫死, 是那些室都還沒設自己的管理員、全部退回這份備援名單。").weak());
-            ui.label(egui::RichText::new("管理員認的是帳號不是名字: 這個人改名字、或在不同聊天室顯示不同名字, 管理員身分都不會認不得。").weak());
-            ui.label(egui::RichText::new("被 @ 的對象就是這份名單裡的人; 實務上大部份會是你本人。從下面「有在白名單群組裡發言過的人」裡面用勾的選, 不用打任何代號; 勾完按下面通知事件清單裡的「儲存通知設定」才算數。").weak());
-            ui.label(egui::RichText::new("小提醒: 被通知的人最好有在那個群裡說過話。從來沒在群裡說過話的人可能 @ 不到, 到時候 AI寶 會改用寫名字的方式通知, 並在紀錄裡註明。").weak());
-            // 已選的管理員固定置頂 (比照聊天室管理頁): 不因搜尋或清單捲動而消失, 可直接取消勾選。
-            ui.label(egui::RichText::new("已選的管理員").strong());
-            if self.form.notify_admins.is_empty() {
-                ui.label("目前還沒有設定管理員。");
-            } else {
-                let selected: Vec<(String, String)> = self.form.notify_admins.clone();
-                for (aid, aname) in &selected {
-                    let mut on = true;
-                    if ui.checkbox(&mut on, aname.clone()).changed() && !on {
-                        self.form.notify_admins.retain(|(id, _)| id != aid);
-                    }
-                }
-            }
-            ui.add_space(6.0);
-            // 搜尋框: 打名字關鍵字即時篩選下方待選清單 (本機過濾, 資料來源沿用全域候選名單)
-            ui.horizontal(|ui| {
-                ui.label("搜尋名字:");
-                ui.add(egui::TextEdit::singleline(&mut self.backup_admin_search).desired_width(220.0).hint_text("輸入名字的一部分"));
-            });
-            ui.horizontal(|ui| {
-                let busy_c = self.busy.get("candidates").copied().unwrap_or(false);
-                if ui.button(if busy_c { "讀取中…" } else { "讀取可選名單" }).clicked() && !busy_c {
-                    self.spawn_candidates_load(&ctx);
-                }
-                if let Some(m) = self.page_msg.get("candidates") {
-                    ui.label(m.clone());
-                }
-            });
-            if !self.candidates.is_empty() {
-                ui.label(egui::RichText::new("有在白名單群組發言過的人 (勾選 = 加入備援管理員名單):").weak());
-            }
-            let keyword = self.backup_admin_search.trim().to_string();
-            let cands = self.candidates.clone();
-            let mut shown = 0usize;
-            for c in &cands {
-                let cid = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let cname = c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if cid.is_empty() || cname.is_empty() {
-                    continue;
-                }
-                // 已選的人只在上方已選區出現, 待選清單不重複列
-                if self.form.notify_admins.iter().any(|(id, _)| *id == cid) {
-                    continue;
-                }
-                if !keyword.is_empty() && !cname.contains(&keyword) {
-                    continue;
-                }
-                shown += 1;
-                let chats = c.get("chats").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("、")).unwrap_or_default();
-                let source = if c.get("source").and_then(|v| v.as_str()) == Some("openchat-admin") { " (社群管理員)" } else { "" };
-                let mut on = false;
-                let label = if chats.is_empty() { format!("{cname}{source}") } else { format!("{cname}{source} — 在『{chats}』發言過") };
-                if ui.checkbox(&mut on, label).changed() && on {
-                    self.form.notify_admins.push((cid.clone(), cname.clone()));
-                }
-            }
-            if shown == 0 && !self.candidates.is_empty() {
-                ui.label(egui::RichText::new("沒有符合搜尋的人, 或想找的人已經在上方已選名單裡。").weak().small());
-            }
-        });
-        ui.add_space(10.0);
         card(ui, self.palette, "通知事件清單 (發生什麼事要通知管理員)", |ui| {
-            ui.label(egui::RichText::new("一筆一筆設定: 發生哪種事、要通知哪幾位管理員。這裡的開關和關鍵字改完按下面「儲存通知設定」才算數。同一種事 10 分鐘內先通知第一筆, 其他先合併起來、不會一直 @ 人; 過了 10 分鐘會再補送一則彙總通知, 不會漏掉。一天最多通知 20 次。").weak());
-            let admins = self.form.notify_admins.clone();
+            ui.label(egui::RichText::new("同一種事 10 分鐘內只通知第一筆，其餘合併後補送一則彙總，一天最多 20 次。").weak());
             let mut remove_idx: Option<usize> = None;
             for (idx, rule) in self.form.notify_rules.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
@@ -4979,23 +4509,7 @@ impl App {
                         ui.label(egui::RichText::new(format!("目前關鍵字: 『{}』— 群組訊息裡出現這個詞, 就會通知管理員。", rule.keyword.trim())).weak());
                     }
                 }
-                if admins.is_empty() {
-                    ui.label(egui::RichText::new("尚無管理員名單, 這一筆先存著, 名單設定好後在這裡勾要通知誰。").weak());
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label("通知誰:");
-                        for (aid, aname) in &admins {
-                            let mut on = rule.admin_ids.contains(aid);
-                            if ui.checkbox(&mut on, aname.clone()).changed() {
-                                if on {
-                                    rule.admin_ids.push(aid.clone());
-                                } else {
-                                    rule.admin_ids.retain(|x| x != aid);
-                                }
-                            }
-                        }
-                    });
-                }
+                ui.label("收件人：該聊天室管理員。");
                 ui.separator();
             }
             if let Some(idx) = remove_idx {
@@ -5027,7 +4541,7 @@ impl App {
                 ui.add_space(4.0);
             }
             if self.admin_events.is_empty() {
-                ui.label(egui::RichText::new("還沒有通知紀錄。有設定通知事件、而且真的發生事情時, 會記在這裡 (有沒有真的送出去、為什麼改用寫名字, 都會註明)。").weak());
+                ui.label(egui::RichText::new("有設定通知事件、而且真的發生事情時，會記在這裡。").weak());
             }
             for ev in self.admin_events.iter().take(15) {
                 let label = ev.get("kindLabel").and_then(|v| v.as_str()).unwrap_or("通知");
@@ -5093,23 +4607,6 @@ impl App {
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
             let r = helper_api::get_materials();
-            *slot.lock().unwrap() = Some(match r {
-                Ok(v) => v,
-                Err(e) => serde_json::json!({ "ok": false, "message": e }),
-            });
-            ctx2.request_repaint();
-        });
-    }
-
-    fn spawn_candidates_load(&mut self, ctx: &egui::Context) {
-        if self.busy.get("candidates").copied().unwrap_or(false) {
-            return;
-        }
-        self.busy.insert("candidates".into(), true);
-        let slot = self.candidates_slot.clone();
-        let ctx2 = ctx.clone();
-        std::thread::spawn(move || {
-            let r = helper_api::get_admin_candidates();
             *slot.lock().unwrap() = Some(match r {
                 Ok(v) => v,
                 Err(e) => serde_json::json!({ "ok": false, "message": e }),
@@ -5356,7 +4853,7 @@ impl App {
                     });
                 }
             });
-            ui.label(egui::RichText::new("「截圖」: 按下後視窗會先縮小, 直接用滑鼠在畫面上拖出要截的範圍, 放開就截好; 按 Esc 取消。也可以把圖片檔案直接拖進這一頁。").weak());
+            ui.label(egui::RichText::new("按下「截圖」後視窗會先縮小，直接用滑鼠拖出範圍，放開就截好，按 Esc 取消。").weak());
             let mut rm_img: Option<usize> = None;
             for (i, im) in self.send_images.iter().enumerate() {
                 ui.horizontal(|ui| {
@@ -5464,7 +4961,7 @@ impl App {
                     ui.selectable_value(&mut self.send_repeat_kind, "series".to_string(), "依序發下一份 (整套教材)");
                 });
                 if self.send_repeat_kind == "series" {
-                    ui.label(egui::RichText::new("整套教材一份一份排好: 每次到期就發下一份, 發完最後一份自動停。每一份先放文字; 要附圖的那一份, 發送前也可以在待發清單建立後用「同一份」方式另排。").weak());
+                    ui.label(egui::RichText::new("整套教材一份一份排好：每次到期就發下一份，發完最後一份自動停。").weak());
                     let mut rm_part: Option<usize> = None;
                     let part_count = self.send_series.len();
                     for (i, part) in self.send_series.iter_mut().enumerate() {
@@ -5658,41 +5155,6 @@ impl App {
         });
     }
 
-    fn page_kb(&mut self, ui: &mut egui::Ui) {
-        ui.heading("知識庫");
-        ui.add_space(8.0);
-        // 知識庫設定改到「聊天室管理」頁上方全域區 (修復版6後續修復, 一份設定只有一個家):
-        // 這裡只留指路與唯讀索引狀態, 不再放可改欄位 (資料夾、附上參考來源、重新建立索引都在管理頁)。
-        card(ui, self.palette, "知識庫設定改到「聊天室管理」頁", |ui| {
-            ui.label("全域知識庫資料夾、回答時附上參考來源、重新建立索引, 都改到「聊天室管理」頁最上方的全域區改, 這裡不再放第二份。");
-            if ui.button("去「聊天室管理」頁改知識庫設定").clicked() {
-                self.page = Page::ChatManage;
-            }
-            ui.add_space(6.0);
-            let status = self.helper_status();
-            if let Some(kb) = status.as_ref().and_then(|s| s.get("bot")).and_then(|b| b.get("kb")) {
-                if !kb.is_null() {
-                    let files = kb.get("files").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let chunks = kb.get("chunks").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let ready = kb.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
-                    ui.label(format!("索引狀態: {}; 檔案 {} 個、片段 {} 段", if ready { "已就緒" } else { "尚無可用檔案" }, files, chunks));
-                    if kb.get("scanning").and_then(|v| v.as_bool()).unwrap_or(false) {
-                        ui.label("索引正在背景整理中… (不影響其他功能, 整理好後這裡的數字會自動更新)");
-                    }
-                    // 檔案異常多只提醒不阻擋: 通常是誤把整個文件庫根目錄設進來 (實機曾掃到 7 千多個檔、卡 2 分鐘)
-                    if kb.get("largeFolder").and_then(|v| v.as_bool()).unwrap_or(false) || files > 2000 {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "提醒: 這個資料夾有 {files} 個文件檔案, 數量很多, 每次掃描都會花比較久。建議另外建一個只放要給 AI 參考文件的專用資料夾, 會快很多。"
-                            ))
-                            .color(self.palette.warn_text),
-                        );
-                    }
-                }
-            }
-        });
-    }
-
     fn page_scam(&mut self, ui: &mut egui::Ui) {
         ui.heading("防詐騙");
         ui.add_space(8.0);
@@ -5707,7 +5169,7 @@ impl App {
                 ui.label("每分鐘最多判讀則數:");
                 ui.add(egui::DragValue::new(&mut self.form.scam_per_minute).range(1..=60));
             });
-            ui.label("運作方式: 本機規則先預篩, 可疑訊息再送判讀; 有啟用下方 Jev 時優先由 Jev 判讀, Jev 連不上會自動改用 AI 判讀, 不會漏掉。超過門檻會在群組回覆警告。");
+            ui.label("本機規則先預篩，可疑訊息再送判讀，超過門檻會在群組回覆警告。");
             ui.add_space(6.0);
             ui.checkbox(&mut self.form.jev_enabled, "啟用 TypeSafe Jev 判讀 (付費服務, 需要先貼上 Jev API Key)");
             ui.horizontal(|ui| {
@@ -5761,7 +5223,7 @@ impl App {
                     ui.label("Jev 狀態: 尚未取得 (等設定服務回應)");
                 }
             }
-            ui.label(egui::RichText::new("貼上新金鑰或清除金鑰後, 要把 AI寶 完全結束再重新開啟, 核心才會載入新金鑰生效 (跟白名單改完要重開一樣)。").weak().small());
+            ui.label(egui::RichText::new("貼上新金鑰或清除金鑰後，要把 AI寶 完全結束再重新開啟才會生效。").weak().small());
             ui.horizontal(|ui| {
                 let saving = self.busy.get("save").copied().unwrap_or(false);
                 if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存設定" }).clicked() {
@@ -5844,7 +5306,7 @@ impl App {
             if let Some(dir) = self.page_msg.get("logdir") {
                 ui.label(format!("紀錄資料夾: {dir}"));
             }
-            ui.label(egui::RichText::new("紀錄不會包含 API Key、Token 或訊息全文 (機密會被遮罩)。出問題時按「匯出診斷包」把檔案給維護人員看即可。").weak());
+            ui.label(egui::RichText::new("紀錄不會包含 API Key、Token 或訊息全文，出問題時按「匯出診斷包」把檔案給維護人員看。").weak());
             ui.add_space(6.0);
             egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                 // 讀取中就明說讀取中, 不要讓使用者對著空白猜 (2026-10-22 事故修復)。
@@ -5898,7 +5360,7 @@ impl App {
                         }
                     }
                 }
-                ui.label("勾選後, 每次登入 Windows, AI寶 會自己打開, 縮在右下角系統匣待命。這個開關只負責把程式叫起來; 要不要接著自動登入 LINE, 由下面那個開關決定, 兩個互不影響。取消勾選就完全移除, 不留殘留。");
+                ui.label("勾選後，每次登入 Windows，AI寶 會自己打開，縮在右下角系統匣待命。");
                 if let Some(cur) = &current {
                     ui.label(egui::RichText::new(format!("目前登錄: {cur}")).size(12.0).weak());
                 }
@@ -5911,7 +5373,7 @@ impl App {
                 ui.label("自啟動設定只在 Windows 版提供。");
             }
             ui.add_space(6.0);
-            // 自動登入開關 (2026-10-22 新增, 與開機自啟動互相獨立): 預設關閉。
+            // 自動登入開關 (2026-10-22 新增, 與開機自啟動互相獨立; 修復 B 起預設開啟, 總覽服務卡也有同一個開關)。
             // 打開的當下若引擎還沒啟動, 直接啟用 (馬上生效, 不用重開程式);
             // 關閉只影響「下次打開程式」: 下次會停在未登入, 等使用者按「登入並啟用」。
             let mut auto_login = self.shell_settings.auto_login;
@@ -5922,7 +5384,7 @@ impl App {
                     self.start_engine("程式設定頁「自動登入」開關");
                 }
             }
-            ui.label("不勾選 (出廠預設): 每次打開 AI寶, 它會先停在未登入的狀態, 要你按「登入並啟用」才會開始服務。勾選: 打開就自動登入、直接上工。跟上面「隨 Windows 開機自動啟動」是兩個獨立開關: 可以只開機自啟動、不自動登入 (開機後在系統匣待命, 等你按登入), 也可以兩個都開或都關。");
+            ui.label("不勾選時，每次打開 AI寶 會先停在未登入狀態，要按「登入並啟用」才開始服務。");
             ui.add_space(6.0);
             let mut show = self.shell_settings.show_window_on_start;
             if ui.checkbox(&mut show, "雙擊啟動時直接顯示主視窗 (取消勾選則直接縮到系統匣)").changed() {
@@ -6030,9 +5492,10 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_profile_dirty, chat_profile_uses_custom, chat_profiles_new_orig, chat_profiles_patch, current_situation,
+        chat_profile_dirty, chat_profile_uses_custom, chat_profiles_new_orig, chat_profiles_patch,
         decode_image_rgba, icon_rgba, parse_start_page, rate_limits_from_settings, App, AuthState, ChatProfileForm,
-        EngineOpGate, EngineState, Page, SituationAction, NAV_PAGES,
+        EngineOpGate, EngineState, Page, NAV_PAGES,
+        should_send_login_after_engine,
     };
     use std::collections::HashMap;
     use std::io::Cursor;
@@ -6064,76 +5527,6 @@ mod tests {
         edited.scope = "改過的範圍".to_string();
         assert!(chat_profile_dirty(Some(&edited), Some(&saved)), "改過範圍要算改");
         assert!(!chat_profile_dirty(None, Some(&saved)), "沒草稿不能算改");
-    }
-
-    #[test]
-    fn current_situation_priority() {
-        // 總覽「目前情況」優先順序: 佔用 → 失敗 → 啟動中 → 未啟動 → 登入態 →
-        // 機器人未連線 → 解密被擋 → 今日警告 → 正常。狀態還沒抓到 (None) 時跳過、不誤報。
-        let foreign = crate::engine::foreign_port_message();
-        let (_, a) = current_situation(
-            &EngineState::Failed(foreign.clone()),
-            &AuthState::Ready,
-            Some(true),
-            0,
-            Some(0),
-        );
-        assert_eq!(a, SituationAction::SwitchPorts, "連接埠被佔用要先於一切提示換埠");
-        let (_, a) = current_situation(
-            &EngineState::Failed("啟動失敗測試".to_string()),
-            &AuthState::Ready,
-            Some(true),
-            0,
-            Some(0),
-        );
-        assert_eq!(a, SituationAction::RestartEngine);
-        let (_, a) = current_situation(&EngineState::Starting, &AuthState::Unknown, None, 0, None);
-        assert_eq!(a, SituationAction::None, "啟動中只是等候、不要給按鈕");
-        let (_, a) = current_situation(&EngineState::NotStarted, &AuthState::Unknown, None, 0, None);
-        assert_eq!(a, SituationAction::StartEngine);
-        let (_, a) =
-            current_situation(&EngineState::Running, &AuthState::Authenticating, None, 0, None);
-        assert_eq!(a, SituationAction::None, "等掃碼時不要催登入");
-        let (_, a) = current_situation(&EngineState::Running, &AuthState::Error, None, 0, None);
-        assert_eq!(a, SituationAction::StartLogin);
-        let (_, a) = current_situation(&EngineState::Running, &AuthState::Idle, None, 0, None);
-        assert_eq!(a, SituationAction::StartLogin);
-        let (_, a) = current_situation(
-            &EngineState::Running,
-            &AuthState::Ready,
-            Some(false),
-            0,
-            Some(0),
-        );
-        assert_eq!(a, SituationAction::RestartEngine, "機器人未連線要先於警告提示重啟");
-        let (_, a) = current_situation(
-            &EngineState::Running,
-            &AuthState::Ready,
-            Some(true),
-            3,
-            Some(0),
-        );
-        assert_eq!(a, SituationAction::ViewLogs, "解密被擋要先於警告提示看紀錄");
-        let (_, a) = current_situation(
-            &EngineState::Running,
-            &AuthState::Ready,
-            Some(true),
-            0,
-            Some(2),
-        );
-        assert_eq!(a, SituationAction::ViewLogs);
-        let (t, a) = current_situation(
-            &EngineState::Running,
-            &AuthState::Ready,
-            Some(true),
-            0,
-            Some(0),
-        );
-        assert_eq!(a, SituationAction::None);
-        assert!(t.contains("目前正常"), "全綠時要寫目前正常, 不能留空白或誤報: {t}");
-        let (_, a) =
-            current_situation(&EngineState::Running, &AuthState::Ready, None, 0, None);
-        assert_eq!(a, SituationAction::None, "控制台狀態還沒抓到時不誤報未連線");
     }
 
     #[test]
@@ -6256,6 +5649,20 @@ mod tests {
     }
 
     #[test]
+    fn login_after_engine_only_sends_when_state_is_settled_idle_or_error() {
+        // 修復 B: 服務就緒但核心狀態還沒報到 (Unknown) 或還在恢復 (Restoring) 時絕不搶送,
+        // 否則會打斷核心用已存狀態的恢復、反而逼出新 QR; 只有連上且狀態定案為 Idle/Error 才送。
+        assert!(!should_send_login_after_engine(true, true, &AuthState::Unknown));
+        assert!(!should_send_login_after_engine(true, true, &AuthState::Restoring));
+        assert!(!should_send_login_after_engine(true, true, &AuthState::Authenticating));
+        assert!(!should_send_login_after_engine(true, true, &AuthState::Ready));
+        assert!(!should_send_login_after_engine(true, false, &AuthState::Idle), "WS 還沒連上不能送");
+        assert!(!should_send_login_after_engine(false, true, &AuthState::Idle), "服務沒跑不能送");
+        assert!(should_send_login_after_engine(true, true, &AuthState::Idle));
+        assert!(should_send_login_after_engine(true, true, &AuthState::Error));
+    }
+
+    #[test]
     fn nav_pages_are_repair6_order_without_line_login() {
         // 修復版6 導覽定案: 共 11 頁, 順序固定, 沒有獨立的 LINE 登入頁, 有聊天室管理頁。
         let pages: Vec<Page> = NAV_PAGES.iter().map(|(p, _)| *p).collect();
@@ -6268,7 +5675,6 @@ mod tests {
                 Page::SendMessages,
                 Page::AiSettings,
                 Page::BotSettings,
-                Page::KbSettings,
                 Page::ScamSettings,
                 Page::Logs,
                 Page::AppSettings,
@@ -6283,14 +5689,14 @@ mod tests {
 
     #[test]
     fn start_page_parsing_covers_all_pages_and_legacy_login() {
-        // AIBAO_START_PAGE: 11 頁都有代號; 舊值 login 映射到總覽 (CI 相容); 未知值回總覽。
+        // AIBAO_START_PAGE: 10 頁都有代號; 舊值 login 映射到總覽 (CI 相容); 未知值回總覽。
         assert_eq!(parse_start_page(Some("overview")), Page::Overview);
         assert_eq!(parse_start_page(Some("chat")), Page::ChatRoom);
         assert_eq!(parse_start_page(Some("manage")), Page::ChatManage);
         assert_eq!(parse_start_page(Some("send")), Page::SendMessages);
         assert_eq!(parse_start_page(Some("ai")), Page::AiSettings);
         assert_eq!(parse_start_page(Some("bot")), Page::BotSettings);
-        assert_eq!(parse_start_page(Some("kb")), Page::KbSettings);
+        assert_eq!(parse_start_page(Some("kb")), Page::Overview, "知識庫頁已刪除, 舊值回總覽");
         assert_eq!(parse_start_page(Some("scam")), Page::ScamSettings);
         assert_eq!(parse_start_page(Some("logs")), Page::Logs);
         assert_eq!(parse_start_page(Some("app")), Page::AppSettings);
@@ -6306,7 +5712,7 @@ mod tests {
         // 管理員清空且沒有其他自訂時條目刪除; 人設切回全域時管理員不連帶刪除 (條目保留、管理員照舊)。
         let admins_only = ChatProfileForm {
             custom: false,
-            admins: vec![("u-admin".to_string(), "王管理員".to_string())],
+            admins: vec!["u-admin".to_string()],
             ..Default::default()
         };
         assert!(admins_only.has_entry(), "只設管理員也需要條目");
@@ -6319,12 +5725,15 @@ mod tests {
         let admins = v.get("admins").and_then(|x| x.as_array()).expect("補丁要帶 admins 陣列");
         assert_eq!(admins.len(), 1);
         assert_eq!(admins[0].get("id").and_then(|x| x.as_str()), Some("u-admin"));
-        assert_eq!(admins[0].get("name").and_then(|x| x.as_str()), Some("王管理員"));
+        assert!(admins[0].get("name").is_none(), "只存 ID: 補丁不得再帶名字快照");
         let new_orig = chat_profiles_new_orig(&forms, &orig, &patch);
         assert_eq!(new_orig.get("c-admin").unwrap().admins.len(), 1);
         // from_value 讀回 admins
         let back = ChatProfileForm::from_value(&v);
-        assert_eq!(back.admins, vec![("u-admin".to_string(), "王管理員".to_string())]);
+        assert_eq!(back.admins, vec!["u-admin".to_string()]);
+        // 舊存檔帶名字快照時, 讀回要丟掉名字只留 ID
+        let legacy = ChatProfileForm::from_value(&serde_json::json!({ "admins": [{ "id": "u-admin", "name": "舊名字" }] }));
+        assert_eq!(legacy.admins, vec!["u-admin".to_string()]);
         assert!(!back.custom);
         // 管理員清空 -> 刪除條目
         let mut forms2 = new_orig.clone();
@@ -6334,7 +5743,7 @@ mod tests {
         // 人設自訂的群切回全域, 但管理員還在: 條目保留 (不送 null), personaCustom=false、管理員照舊
         let mut orig3 = HashMap::new();
         let mut with_admins = profile("角色A");
-        with_admins.admins = vec![("u-admin".to_string(), "王管理員".to_string())];
+        with_admins.admins = vec!["u-admin".to_string()];
         orig3.insert("c-mix".to_string(), with_admins);
         let mut forms3 = orig3.clone();
         forms3.get_mut("c-mix").unwrap().custom = false;
@@ -6355,7 +5764,7 @@ mod tests {
         assert!(!chat_profile_uses_custom(Some(&chatty_only)), "只開聒噪不影響人設來源");
         let admins_only = ChatProfileForm {
             custom: false,
-            admins: vec![("u1".to_string(), "甲".to_string())],
+            admins: vec!["u1".to_string()],
             ..Default::default()
         };
         assert!(!chat_profile_uses_custom(Some(&admins_only)), "只設管理員不影響人設來源");

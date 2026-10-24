@@ -136,13 +136,18 @@ pub struct ShellSettings {
     /// 以 serde default 補 forest (森林綠, 出廠預設), 不影響既有偏好。
     #[serde(default = "default_theme")]
     pub theme: String,
-    /// 開啟程式時是否自動登入並啟用服務 (2026-10-22 老吳交代新增, 預設關閉)。
-    /// 關閉時: 程式開啟後引擎不啟動、停在未登入狀態, 由使用者按「登入並啟用」才開始。
+    /// 開啟程式時是否自動登入並啟用服務 (2026-10-22 新增時預設關閉;
+    /// 修復 B, 2026-10-25 改為預設開啟: 開啟程式就啟動服務, 核心用已存狀態直接
+    /// 恢復登入、不出 QR, 只有狀態失效才出 QR。關閉時: 程式開啟後服務不啟動、
+    /// 停在未登入狀態, 由使用者按啟動才開始。
     /// 與「隨 Windows 開機自動啟動」(HKCU Run) 互相獨立: 自啟動只負責把程式叫起來
-    /// (縮系統匣待命), 要不要接著登入由這個欄位決定。舊設定檔沒有此欄位時
-    /// serde default = false (不自動登入), 符合老吳定的出廠預設。
-    #[serde(default)]
+    /// (縮系統匣待命), 要不要接著登入由這個欄位決定。
+    #[serde(default = "default_true")]
     pub auto_login: bool,
+    /// 修復 B 一次性遷移標記: 舊設定檔沒有此欄位時, load() 會把 auto_login 改回開啟
+    /// 並把標記寫成 true 存檔 (之後使用者在總覽服務卡關掉, 標記已是 true, 不會再被翻回來)。
+    #[serde(default)]
+    pub auto_login_migrated: bool,
     /// 引擎連接埠 (只有使用者在總覽按過「改用空閒連接埠」才有值; 缺省 = 預設
     /// 3789/3790)。舊設定檔沒有此欄位時 serde default 補 None, 行為不變。
     #[serde(default)]
@@ -155,13 +160,25 @@ fn default_true() -> bool {
     true
 }
 
+/// 修復 B 一次性遷移 (純函數, 供 load() 與單元測試共用):
+/// 沒有 migrated 標記的舊設定, 不論舊值是出廠預設關閉還是使用者曾關過,
+/// 都先改回開啟 (之後使用者可在總覽服務卡再關掉, 標記已是 true, 不會再被翻回來)。
+/// 已標記的設定原樣不動 — 使用者明確關掉的選擇不會被每一次開啟蓋掉。
+pub fn apply_auto_login_migration(mut settings: ShellSettings) -> ShellSettings {
+    if !settings.auto_login_migrated {
+        settings.auto_login = true;
+        settings.auto_login_migrated = true;
+    }
+    settings
+}
+
 fn default_theme() -> String {
     "forest".to_string()
 }
 
 impl Default for ShellSettings {
     fn default() -> Self {
-        Self { show_window_on_start: true, tray_hint_shown: false, theme: default_theme(), auto_login: false, core_port: None, helper_port: None }
+        Self { show_window_on_start: true, tray_hint_shown: false, theme: default_theme(), auto_login: true, auto_login_migrated: true, core_port: None, helper_port: None }
     }
 }
 
@@ -169,7 +186,19 @@ impl ShellSettings {
     pub fn load() -> Self {
         let path = data_dir().join("shell-settings.json");
         match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Ok(text) => match serde_json::from_str::<ShellSettings>(&text) {
+                Ok(parsed) => {
+                    let changed = !parsed.auto_login_migrated;
+                    let migrated = apply_auto_login_migration(parsed);
+                    if changed {
+                        // 一次性遷移已發生 (舊檔無標記): 立刻存檔並留 log, 下次開啟不再翻動。
+                        migrated.save();
+                        log_line("自動登入預設已改為開啟 (修復 B 一次性遷移): 下次開啟程式會直接恢復登入, 不用再掃碼; 要關掉請到總覽服務卡取消勾選");
+                    }
+                    migrated
+                }
+                Err(_) => Self::default(),
+            },
             Err(_) => Self::default(),
         }
     }
@@ -342,6 +371,24 @@ mod tests {
         assert!(text.contains("helper ok"), "應合併服務紀錄: {text}");
         assert!(text.contains("讀不到這個紀錄檔"), "缺 launcher.log 要明說原因: {text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_login_migration_flips_old_file_once_and_keeps_explicit_off() {
+        // 修復 B: 舊檔 (無標記、auto_login=false) 第一次讀到就改回開啟並標記;
+        // 標記後使用者再關掉 (false + 標記 true), 之後不再被翻回來。
+        let old: ShellSettings = serde_json::from_str(r#"{"auto_login": false}"#).unwrap();
+        assert!(!old.auto_login_migrated, "舊檔不應有標記");
+        let migrated = apply_auto_login_migration(old);
+        assert!(migrated.auto_login && migrated.auto_login_migrated, "舊檔第一次遷移要改回開啟");
+        let mut off = migrated.clone();
+        off.auto_login = false;
+        let kept = apply_auto_login_migration(off);
+        assert!(!kept.auto_login && kept.auto_login_migrated, "標記後關掉要保留關閉");
+        let fresh = ShellSettings::default();
+        assert!(fresh.auto_login && fresh.auto_login_migrated, "新出廠預設就是開啟 + 已標記");
+        let missing: ShellSettings = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(apply_auto_login_migration(missing).auto_login, "缺欄位的舊檔也要遷移到開啟");
     }
 
     #[test]
