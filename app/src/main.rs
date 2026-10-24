@@ -328,7 +328,7 @@ pub fn current_situation(
         if msg.starts_with(&crate::engine::foreign_port_message()) {
             let (core, helper) = crate::engine::runtime_ports();
             return (
-                format!("連接埠 {core}／{helper} 已由其他程式使用；AI寶 先不啟動，也不會去動對方的程式。按「改用空閒連接埠」換到空閒連接埠再啟動。"),
+                format!("連接埠 {core}／{helper} 已由其他程式佔用，服務無法啟動；AI寶 不會自動換埠、不會動對方程式、不會自動重試。請先關掉佔用程式，再到上方服務列手動按「啟動」；佔用解除後也不會自動啟動，要手動按才會啟動。也可以按「改用空閒連接埠」換到空閒連接埠再啟動。"),
                 SwitchPorts,
             );
         }

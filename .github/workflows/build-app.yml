@@ -642,13 +642,25 @@ jobs:
           Shot-App 'about' @{ AIBAO_START_PAGE = 'about' }
           # ---- 特殊態截圖 (修復版6後續修復第二輪: 總覽 Codex 化驗收) ----
           # 共用結束流程: --quit 走具名事件 (與 HOME 無關), 等不到才強制結束並報錯;
+          # 被佔態例外: --quit 後 App 留在畫面是正確行為 (BlockedForeign 留窗),
+          # Stop-ShotApp -Occupied 會主動結束行程收尾、不報錯 (run 40085637039 教訓:
+          # 被佔截圖收尾預期 --quit 結束 App 導致整步紅燈、上傳被跳過)。
           # 被佔提示若等不到 Failed 落定, 只警告不紅燈 (雲端造不出條件時列未驗證)。
-          function Stop-ShotApp([System.Diagnostics.Process]$p, [string]$name) {
+          function Stop-ShotApp([System.Diagnostics.Process]$p, [string]$name, [switch]$Occupied) {
             if (-not $p.HasExited) {
               Start-Process -FilePath $exe -ArgumentList '--quit' | Out-Null
-              $dl = (Get-Date).AddSeconds(120)
+              # 被佔態例外 (老吳定奪: 被佔用時按結束、視窗留在畫面才是正確行為):
+              # 收尾絕不能預期 --quit 結束 App; 等 30 秒讓結束序列跑完留紀錄,
+              # 再由流程主動結束行程, 不報錯。一般頁仍維持 120 秒等不到就報錯。
+              $waitSecs = 120
+              if ($Occupied) { $waitSecs = 30 }
+              $dl = (Get-Date).AddSeconds($waitSecs)
               while (-not $p.HasExited -and (Get-Date) -lt $dl) { Start-Sleep -Seconds 2 }
-              if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; throw "pages/${name}: --quit 後未結束" }
+              if (-not $p.HasExited) {
+                Stop-Process -Id $p.Id -Force
+                if ($Occupied) { Write-Host "pages/${name}: 被佔態 App 依舊留在畫面 (符合 BlockedForeign 留窗預期), 流程已主動結束行程收尾" }
+                else { throw "pages/${name}: --quit 後未結束" }
+              }
             }
             Start-Sleep -Seconds 2
           }
@@ -781,7 +793,7 @@ jobs:
                 Start-Sleep -Seconds 2
                 Save-Screen (Join-Path $PWD "pages\page-overview-occupied.png")
               } finally {
-                Stop-ShotApp $p 'overview-occupied'
+                Stop-ShotApp $p 'overview-occupied' -Occupied
               }
             } finally {
               if (-not $occ.HasExited) { Stop-Process -Id $occ.Id -Force }
