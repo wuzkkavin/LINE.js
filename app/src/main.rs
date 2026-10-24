@@ -1268,7 +1268,8 @@ impl App {
     }
 
     /// 開始結束序列: 背景執行緒執行 engine.stop() (訊號優雅結束→強制清除→逐埠驗證), 完成後主執行緒依結果處理;
-    /// 停不下來 (BlockedForeign / Residual) 就不關窗, 改顯示白話說明與殘留明細 (不假裝已結束)。
+    /// 自家服務停不下來 (Residual) 就不關窗, 改顯示白話說明與殘留明細 (不假裝已結束);
+    /// 對方程式佔用 (BlockedForeign) 照常關窗 (關我們自己的視窗 ≠ 動對方服務, stop() 全程沒碰對方)。
     fn begin_quit(&mut self, ctx: &egui::Context, caller: &str) {
         if self.quitting {
             return;
@@ -2109,15 +2110,21 @@ impl eframe::App for App {
             }
         }
 
-        // 結束序列完成 → 依結果處理: 驗證真的停了才關視窗; 停不下來 (BlockedForeign / Residual) 取消結束並明說。
+        // 結束序列完成 → 依結果處理: 自家服務真的停不下來 (Residual) 才取消結束並明說;
+        // 對方程式佔用 (BlockedForeign) 時 stop() 全程沒碰對方, 關我們自己的視窗不等於動對方服務,
+        // 佔用說明在主畫面已顯示、log 亦有紀錄, 不因對方佔埠就把使用者困在視窗裡關不掉 (2026-10-24 後續修復)。
         if self.quitting {
             let outcome = self.quit_outcome.lock().unwrap().take();
             if let Some(outcome) = outcome {
                 match outcome {
-                    StopOutcome::BlockedForeign(msg) | StopOutcome::Residual(msg) => {
+                    StopOutcome::BlockedForeign(msg) => {
+                        shell::log_line(&format!("結束序列: 對方程式佔用連接埠 (BlockedForeign), 不動對方、正常關閉本程式視窗: {msg}"));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    StopOutcome::Residual(msg) => {
                         self.quitting = false;
                         self.quit_blocked_msg = Some(msg);
-                        shell::log_line("結束序列中止: 服務未完全停止, 已顯示說明給使用者 (不關窗)");
+                        shell::log_line("結束序列中止: 自家服務未完全停止, 已顯示說明給使用者 (不關窗)");
                     }
                     StopOutcome::ForcedStop => {
                         // 有用到強制手段才清乾淨: 不粉飾, engine.stop 已留下完整階段紀錄, 這裡再記一筆後正常關窗

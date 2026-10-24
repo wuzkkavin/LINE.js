@@ -217,18 +217,19 @@ jobs:
             if (Test-Path $logPath) { Copy-Item $logPath (Join-Path $pwd 'foreign-shell.log') }
             if (-not $found) { throw 'App 未偵測到外來佔用 (shell.log 沒有世代分類 Foreign 的紀錄)' }
             Write-Host 'App 已偵測外來佔用並留下紀錄'
-            # 新預期 (2026-10-20 殘留定案): 埠上是不明程式時, 結束序列回 BlockedForeign —
-            # App 不動對方、也不關窗假裝結束, 而是留在畫面顯示說明。驗: --quit 後 45 秒 App 仍在 + log 有 BlockedForeign。
+            # 新預期 (2026-10-24 後續修復, 取代 2026-10-20 留窗定案): 埠上是不明程式時,
+            # 結束序列回 BlockedForeign、App 不動對方、但正常關窗 — 關我們自己的視窗 ≠ 動對方服務,
+            # 佔用說明在主畫面已顯示、log 亦有紀錄, 不因對方佔埠就把使用者困在視窗裡關不掉。
+            # 只有自家服務停不下來 (Residual) 才留窗明說。驗: --quit 後 App 應結束 + log 有 BlockedForeign + stub 仍存活。
             Start-Process -FilePath $exe -ArgumentList '--quit' -Wait
-            $exited = $proc.WaitForExit(45000)
-            if ($exited) { throw '外來情境: App 面對不明程式佔用時不應關窗離開 (應回 BlockedForeign 並留在畫面說明)' }
-            Write-Host 'App 未關窗 (符合 BlockedForeign 預期)'
+            $exited = $proc.WaitForExit(60000)
+            if (-not $exited) { throw '外來情境: App 在 BlockedForeign 下應正常關窗 (不動對方、不困住使用者)' }
+            Write-Host 'App 已關窗 (符合 BlockedForeign 關窗預期)'
             Start-Sleep -Seconds 2
             $logNow = Get-Content $logPath -Raw
             if ($logNow -notmatch 'BlockedForeign') { throw '外來情境: shell.log 未見 BlockedForeign 結束結果' }
             Copy-Item $logPath (Join-Path $pwd 'foreign-shell.log') -Force
-            Write-Host 'shell.log 已確認 BlockedForeign 紀錄; 情境收尾: 人工結束 App 行程 (它本來就不該自己關)'
-            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+            Write-Host 'shell.log 已確認 BlockedForeign 紀錄'
             Start-Sleep -Seconds 2
             Write-Host '確認 stub 沒有被誤殺:'
             $s2 = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3
