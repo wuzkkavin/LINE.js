@@ -731,12 +731,15 @@ jobs:
             if (Test-Path $occHome) { Remove-Item $occHome -Recurse -Force }
             New-Item -ItemType Directory -Force $occHome | Out-Null
             $occJs = Join-Path $occHome 'occupier.cjs'
-            @'
-            const http = require("http");
-            for (const port of [3789, 3790]) {
-              http.createServer((req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("not-aibao"); }).listen(port, "127.0.0.1");
-            }
-            '@ | Set-Content $occJs -Encoding utf8
+            # 注意: 不用 here-string 寫這支 JS——YAML 剝掉共用縮排後, 函式內層的結尾
+            # '@ 前會殘留空白, PowerShell 解析直接報錯、整段截圖步驟連跑都沒跑
+            # (run 40084691090 即因此失敗)。改以單引號字串陣列接合寫檔。
+            @(
+              'const http = require("http");',
+              'for (const port of [3789, 3790]) {',
+              '  http.createServer((req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("not-aibao"); }).listen(port, "127.0.0.1");',
+              '}'
+            ) -join "`n" | Set-Content $occJs -Encoding utf8
             $occ = Start-Process -FilePath 'node' -ArgumentList $occJs -PassThru
             try {
               $deadline = (Get-Date).AddSeconds(30)
