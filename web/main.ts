@@ -1217,6 +1217,8 @@ function drawMessages(anchor: MessageAnchor = "bottom"): void {
   adminTokenToggle.disabled = !signedIn || !channel || socket?.readyState !== WebSocket.OPEN;
   const title = channel?.name ?? "選擇一個聊天室";
   if (channelTitle.textContent !== title) channelTitle.textContent = title;
+  // 室名真的太長被刪節時，滑鼠停留仍可看到全名。
+  if (channelTitle.title !== title) channelTitle.title = title;
   // The header avatar is redrawn only when it would look different.
   const avatarKey = channel ? `${channel.channelId}\n${channel.pictureId ?? ""}\n${channel.name}` : "";
   if (channelAvatar.dataset.key !== avatarKey) {

@@ -12,9 +12,9 @@ export const PROVIDER_DEFAULTS = {
 };
 export const SECRET_NAMES = { openai: "ai:openai", groq: "ai:groq", minimax: "ai:minimax", jev: "jev", lineToken: "line:apiToken" };
 
-// 創造者問題的固定回覆 (舊版出廠預設, 保留供舊存檔相容讀取)
-// 修復版6 起不再使用: 創造者/版權問題改委婉拒答 (機敏)
-export const DEFAULT_CREATOR_REPLY = "是吳治綱大師創造此機器人，©Copyright By 吳治綱";
+// 修復版6後續修復: creatorReply 已清除 (老吳 2026-10-24 02:53 定案: 創造者問答
+// 固定回覆取消、改委婉拒答)。舊版出廠預設與舊存檔殘留值不再讀取、不再回寫,
+// 載入與更新時直接刪掉該欄位; 機器人回答路徑自修復版6 起已不讀它 (見 bot.mjs)。
 
 // 回答範圍 (出廠預設, 老吳 2026-10-21 定案, 逐字); 注入 system prompt 成為獨立段落。
 // 欄位清空 = 不注入 = 不限制範圍, 什麼問題都回答。
@@ -46,8 +46,7 @@ export function defaultSettings() {
     aliases: [],
     // 回答時是否附上參考來源行 (知識庫來源); 出廠預設關閉 (老吳定案: 一律不顯示, 要開自己開)
     showSources: false,
-    // 修復版6 起不再使用: 創造者/版權問題改委婉拒答 (機敏); 欄位保留供舊存檔相容, 非機密, publicView 明文回傳
-    creatorReply: DEFAULT_CREATOR_REPLY,
+    // creatorReply 已清除 (見檔頭註解), 不再放進預設值。
     // 機器人人設 (非機密, publicView 明文回傳); 空欄位 = 尚未設定
     persona: defaultPersona(),
     triggerMode: "standard",
@@ -173,6 +172,8 @@ export class SettingsStore {
       try {
         const stored = JSON.parse(readFileSync(this.path, "utf8"));
         this.data = deepMerge(defaultSettings(), stored);
+        // 舊存檔殘留的 creatorReply 直接清除, 下次存檔就不再出現。
+        delete this.data.creatorReply;
         this.migrateRoleSplit(stored);
         if (this.data.ai) this.data.ai.chatProfiles = normalizeChatProfiles(this.data.ai.chatProfiles);
       } catch (e) {
@@ -211,6 +212,8 @@ export class SettingsStore {
       delete patchForMerge.ai.chatProfiles;
     }
     this.data = deepMerge(this.data, patchForMerge);
+    // 舊用戶端 (或舊存檔) 帶來的 creatorReply 一律刪掉, 不讓它藉合併復活。
+    delete this.data.creatorReply;
     if (!this.data.ai || typeof this.data.ai !== "object") this.data.ai = defaultSettings().ai;
     if (!this.data.ai.chatProfiles || typeof this.data.ai.chatProfiles !== "object" || Array.isArray(this.data.ai.chatProfiles)) {
       this.data.ai.chatProfiles = {};
@@ -249,7 +252,7 @@ export class SettingsStore {
     writeFileSync(this.path, JSON.stringify(this.data, null, 2), { mode: 0o600 });
   }
   // 對外 (控制台 API) 的遮罩檢視: Key 只回已設定與末 4 碼。
-  // showSources / creatorReply / persona 不是機密, 隨 structuredClone 明文回傳 (App 殼與控制台都直接讀寫)。
+  // showSources / persona 不是機密, 隨 structuredClone 明文回傳 (App 殼與控制台都直接讀寫)。
   async publicView(secrets) {
     const view = structuredClone(this.data);
     for (const id of Object.keys(PROVIDER_DEFAULTS)) {

@@ -30,6 +30,21 @@ test("planTargets: 不在群/沒說過話走純文字退路, 有發言過可 @",
   assert.equal(t2[0].mode, "mention");
 });
 
+test("planTargets: 管理員認帳號不認名字——改名後同一帳號仍被認出", () => {
+  // 修復版6後續修復 (老吳 2026-10-24 質疑「管理員寫死」): 規則與在場資料都以 id (mid)
+  // 為鍵, 名字只用來顯示。存檔名字是舊名、近期發言已改新名時, 同一帳號仍要命中。
+  const admins = [{ id: "u123", name: "舊名" }];
+  const rule = { notifyAdminIds: ["u123"] };
+  const t = planTargets({ rule, admins, presence: { u123: { inChat: true, hasSpoken: true } } });
+  assert.equal(t.length, 1, "改名不得讓管理員掉出通知對象");
+  assert.equal(t[0].adminId, "u123");
+  assert.equal(t[0].mode, "mention");
+  // 反向: 名字相同但帳號不同, 絕不能誤認。
+  const impostor = [{ id: "u999", name: "舊名" }];
+  const t2 = planTargets({ rule, admins: impostor, presence: { u999: { inChat: true, hasSpoken: true } } });
+  assert.equal(t2.length, 0, "同名不同帳號不得被當成管理員");
+});
+
 test("事件紀錄: 10 分鐘內同種事件只通知一次, 之後合併計數", () => {
   const dir = mkdtempSync(join(tmpdir(), "admnev-"));
   try {

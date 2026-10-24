@@ -238,6 +238,18 @@ fn chat_profile_uses_custom(form: Option<&ChatProfileForm>) -> bool {
     form.map(|f| f.custom).unwrap_or(false)
 }
 
+/// 草稿與已儲存原貌是否有效不同 (給管理頁「尚未儲存」標示用, 語意對齊補丁規則):
+/// 沒存檔條目時, 草稿沒有任何自訂內容 (不開聒噪、不設管理員、不自訂人設、沒停用)
+/// 視同沒改——剛點進沒自訂的室時草稿是全域預設值, 不能因此謊稱「尚未儲存」;
+/// 有存檔條目時, 草稿與原貌逐值不同才算改 (補丁送完整物件的同一條件)。
+fn chat_profile_dirty(draft: Option<&ChatProfileForm>, saved: Option<&ChatProfileForm>) -> bool {
+    match (draft, saved) {
+        (None, _) => false,
+        (Some(d), None) => d.has_entry(),
+        (Some(d), Some(s)) => d != s,
+    }
+}
+
 /// 起始頁解析 (AIBAO_START_PAGE, CI 冒煙/逐頁截圖專用, 一般使用不設):
 /// 值與頁面的對照: overview 總覽、chat 聊天室畫面、manage 聊天室管理、send 發送群組訊息、
 /// ai AI 設定、bot 機器人與觸發、kb 知識庫、scam 防詐騙、logs 紀錄、app 程式設定、about 關於。
@@ -357,7 +369,9 @@ struct SettingsForm {
     jev_key_clear: bool,
     kb_folder: String,
     show_sources: bool,
-    creator_reply: String,
+    // 修復版6後續修復: creatorReply 已清除 (老吳 2026-10-24 02:53 定案: 創造者問答
+    // 固定回覆取消、改委婉拒答)。App 不再讀寫該欄位, helper 也不再把它放進預設值;
+    // 舊存檔裡殘留的值由 helper 載入時清除, 不會再被回寫。
     persona_birthdate: String,
     persona_gender: String,
     persona_zodiac: String,
@@ -440,6 +454,9 @@ struct App {
     backup_admin_search: String,
     // 聊天室畫面頁進頁紀錄: 記上次寫過紀錄時所在的頁面, 避免每一幀都刷 log。
     chat_log_last_page: Option<Page>,
+    // 聊天室畫面頁自我檢查 (修復版6後續修復): 按「檢查核心網頁」後背景執行緒回填結果。
+    chat_check_slot: Slot<String>,
+    chat_check_msg: Option<String>,
     chat_profiles_msg: Option<String>,
     /// 儲存/刪除成功後要套用的 (新原貌, 成功後要從表單移除的 chatId 清單 — 孤兒刪除用)。
     chat_profiles_pending: Option<(HashMap<String, ChatProfileForm>, Vec<String>)>,
@@ -986,6 +1003,8 @@ impl App {
             manage_candidates_all: false,
             backup_admin_search: String::new(),
             chat_log_last_page: None,
+            chat_check_slot: Arc::new(Mutex::new(None)),
+            chat_check_msg: None,
             chat_profiles_msg: None,
             chat_profiles_pending: None,
             chat_suspend_slot: Arc::new(Mutex::new(None)),
@@ -2348,11 +2367,7 @@ impl App {
         f.jev_key_clear = false;
         f.kb_folder = v.get("kb").and_then(|k| k.get("folder")).and_then(|x| x.as_str()).unwrap_or("").to_string();
         f.show_sources = v.get("showSources").and_then(|x| x.as_bool()).unwrap_or(false);
-        f.creator_reply = v
-            .get("creatorReply")
-            .and_then(|x| x.as_str())
-            .unwrap_or("是吳治綱大師創造此機器人，©Copyright By 吳治綱")
-            .to_string();
+        // creatorReply 不再讀取 (見 SettingsForm 欄位註解): 舊存檔殘留值直接忽略。
         let persona = v.get("persona").cloned().unwrap_or(Value::Null);
         let pstr = |k: &str| persona.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
         f.persona_birthdate = pstr("birthdate");
@@ -2448,7 +2463,7 @@ impl App {
                 })).collect::<Vec<_>>()
             },
             "showSources": f.show_sources,
-            "creatorReply": f.creator_reply,
+            // creatorReply 不再回寫 (見 SettingsForm 欄位註解)。
             "persona": {
                 "birthdate": f.persona_birthdate,
                 "gender": f.persona_gender,
@@ -3294,7 +3309,9 @@ impl App {
                 let scanned = scam.get("scannedToday").and_then(|v| v.as_u64()).unwrap_or(0);
                 let checked = scam.get("checkedToday").and_then(|v| v.as_u64()).unwrap_or(0);
                 let warned = scam.get("warnedToday").and_then(|v| v.as_u64()).unwrap_or(0);
-                ui.horizontal(|ui| {
+                // 修復版6後續修復: 舊版用不換行的 horizontal, 這列在 1024 寬視窗會被右邊緣裁掉
+                // (真機: 「警告 0」後面的字被切)。改可換行, 太長就折到第二行, 不再裁字。
+                ui.horizontal_wrapped(|ui| {
                     ui.label(status_dot(if bc { self.palette.ok } else { self.palette.warn }));
                     ui.label(if bc { "機器人已連線" } else { "機器人未連線" });
                     ui.separator();
@@ -3452,25 +3469,74 @@ impl App {
         }
     }
 
+/// 聊天室畫面「目前不顯示」的原因 (白話, 檢查順序與 page_chat 的 want 條件一致)。
+/// 回 None = 應該顯示。單元測試鎖定優先順序, 免得狀態行與實際條件脫鉤。
+fn chatview_hidden_reason(hidden: bool, minimized: bool, confirm_quit: bool, confirm_logout: bool, show_tray_hint: bool, quitting: bool) -> Option<&'static str> {
+    if hidden {
+        Some("視窗目前縮到系統匣")
+    } else if minimized {
+        Some("視窗目前是最小化")
+    } else if confirm_quit {
+        Some("正在確認結束程式")
+    } else if confirm_logout {
+        Some("正在確認登出")
+    } else if show_tray_hint {
+        Some("正在顯示系統匣提示")
+    } else if quitting {
+        Some("正在結束程式")
+    } else {
+        None
+    }
+}
+
     // 「聊天室畫面」頁 (2026-10-21 老吳定案): 把核心的 LINE.js 聊天室網頁真嵌入內容區
     // (chatview.rs, Windows 版 WebView2 子視窗), 占滿標題下方剩餘空間。
     // 未登入或引擎未就緒只顯示白話占位、不載入頁面; 嵌入不可用的建置 (本機檢查版) 顯示占位說明。
+    // 修復版6後續修復: 嵌入區上方常駐一行狀態 (已建立/還沒建立/原因), 不再是無訊息空白;
+    // 另有「檢查核心網頁」自我檢查, 區分核心連不上與嵌入顯示問題。
     fn page_chat(&mut self, ui: &mut egui::Ui) {
         // 標題列: 右側放「重新載入聊天畫面」自救按鈕 (銷毀 WebView 後重新建立)
+        // 與「檢查核心網頁」自我檢查 (修復版6後續修復): 直接對核心 3789 做一次 GET,
+        // 區分「核心網頁連不上」與「核心網頁通、但嵌入顯示有問題」。
         ui.horizontal(|ui| {
             ui.heading("聊天室畫面");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("重新載入聊天畫面").clicked() {
                     self.chatview.reset();
                 }
+                let checking = self.busy.get("chat_check").copied().unwrap_or(false);
+                if ui.button(if checking { "檢查中…" } else { "檢查核心網頁" }).clicked() && !checking {
+                    self.busy.insert("chat_check".into(), true);
+                    self.chat_check_msg = None;
+                    let slot = self.chat_check_slot.clone();
+                    let ctx2 = ui.ctx().clone();
+                    std::thread::spawn(move || {
+                        let msg = match helper_api::core_page_check() {
+                            Ok(200) => "檢查結果: 核心網頁連得通 (HTTP 200)。如果畫面還是空白, 問題在嵌入顯示這一層, 請到「紀錄」頁匯出診斷包傳給我看。".to_string(),
+                            Ok(code) => format!("檢查結果: 核心網頁回應異常 (HTTP {code})。請先到「總覽」頁按「一鍵修復」重啟引擎, 再回來看。"),
+                            Err(_) => "檢查結果: 連不上核心網頁。引擎可能還沒就緒或已停止, 請先到「總覽」頁按「一鍵修復」重啟引擎, 再回來看。".to_string(),
+                        };
+                        *slot.lock().unwrap() = Some(msg);
+                        ctx2.request_repaint();
+                    });
+                }
             });
         });
+        if let Some(m) = self.chat_check_slot.lock().unwrap().take() {
+            self.busy.insert("chat_check".into(), false);
+            self.chat_check_msg = Some(m);
+        }
+        if let Some(m) = &self.chat_check_msg {
+            ui.label(egui::RichText::new(m.clone()).weak().small());
+        }
         ui.add_space(8.0);
         // CI 強制嵌入 (CI 截圖驗證專用, 一般使用不設): AIBAO_CHATVIEW_FORCE=1 時略過登入完成門檻,
         // 直接走嵌入路徑 (引擎仍須就緒), 好在雲端截到 WebView 內的畫面; 未設時行為完全不變。
         let force_chatview = std::env::var("AIBAO_CHATVIEW_FORCE").as_deref() == Ok("1");
         // 進頁狀態紀錄: 進入本頁後第一次要 sync 前寫一行, 供日後診斷包定案空白問題;
         // 以 chat_log_last_page 記上次紀錄時的頁面, 避免每一幀刷 log。
+        // 同時要求強制重排重顯: 把縮小再打開時觸發的那個重排動作變成進頁動作,
+        // 第一次進頁就直接畫出來, 不必等使用者縮小再打開 (見 chatview.rs reveal 註解)。
         if self.chat_log_last_page != Some(Page::ChatRoom) {
             let login0 = self.login_snapshot();
             shell::log_line(&format!(
@@ -3481,6 +3547,7 @@ impl App {
                 if force_chatview { ", 強制嵌入模式 (CI)" } else { "" }
             ));
             self.chat_log_last_page = Some(Page::ChatRoom);
+            self.chatview.request_reveal();
         }
         if self.engine_unavailable() {
             self.chatview.force_hide();
@@ -3502,6 +3569,15 @@ impl App {
             });
             return;
         }
+        // 嵌入狀態行 (修復版6後續修復): 先算好顯示條件, 狀態行寫在框上方,
+        // 再配額嵌入框 — 框裡空白時, 使用者至少看得到原因與下一步。
+        let minimized = ui.ctx().input(|i| i.viewport().minimized) == Some(true);
+        let want = Self::chatview_hidden_reason(self.hidden, minimized, self.confirm_quit, self.confirm_logout, self.show_tray_hint, self.quitting).is_none();
+        let want_reason = Self::chatview_hidden_reason(self.hidden, minimized, self.confirm_quit, self.confirm_logout, self.show_tray_hint, self.quitting).unwrap_or("顯示中");
+        if chatview::available() {
+            ui.label(egui::RichText::new(self.chatview.status_line(want, want_reason)).weak().small());
+            ui.add_space(4.0);
+        }
         let avail = ui.available_size();
         let height = avail.y.max(140.0);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(avail.x, height), egui::Sense::hover());
@@ -3512,16 +3588,9 @@ impl App {
             egui::StrokeKind::Inside,
         );
         if chatview::available() {
-            let minimized = ui.ctx().input(|i| i.viewport().minimized) == Some(true);
-            let want = !self.hidden
-                && !minimized
-                && !self.confirm_quit
-                && !self.confirm_logout
-                && !self.show_tray_hint
-                && !self.quitting;
             let profile = self.webview_profile_dir.clone();
             let ppp = ui.ctx().pixels_per_point();
-            self.chatview.sync(self.parent_hwnd, rect, ppp, want, &profile);
+            self.chatview.sync(self.parent_hwnd, rect, ppp, want, want_reason, &profile);
             if let Some(err) = self.chatview.error() {
                 let err = err.to_string();
                 ui.painter().text(
@@ -3549,29 +3618,15 @@ impl App {
         ui.label("選一家 AI 服務、貼上 API Key、抓模型清單選一個, 測試成功後按「儲存全部設定」。");
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
-        // 第一張卡 (2026-10-21 老吳定案): 機器人定位與範圍, 兩欄都可編輯、儲存即時生效 (機器人每則訊息讀最新設定)。
+        // 第一張卡改為指路卡 (修復版6後續修復, 一份設定只有一個家):
+        // 全域角色定位與回答範圍改到「聊天室管理」頁上方全域區改, 這裡不再放第二份可編輯欄位。
+        // (欄位本身仍在表單裡, 由管理頁全域區編輯、走同一條 save_settings 儲存。)
         card(ui, self.palette, "機器人定位與範圍（全域的預設設定）", |ui| {
-            ui.label(egui::RichText::new("各群自己的設定在『聊天室管理』頁改。").weak().small());
-            ui.label(egui::RichText::new("已有本群自訂的群組不會用這份，也不會和本群設定合併。").weak().small());
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("角色定位").strong());
-            ui.add(egui::TextEdit::multiline(&mut self.form.ai_role).desired_rows(2).desired_width(f32::INFINITY));
-            ui.label(egui::RichText::new("清空後儲存，會自動回復成出廠預設的角色定位。例：也可以改成「你是華葳集成的資訊小老師，專門陪同事學電腦」這類你想要的身分描述。").weak().small());
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("回答範圍").strong());
-            ui.add(egui::TextEdit::multiline(&mut self.form.ai_scope).desired_rows(4).desired_width(f32::INFINITY));
-            ui.label(egui::RichText::new("清空這個欄位＝不限制範圍，什麼問題都回答").weak().small());
-            ui.label(egui::RichText::new("例：也可以改成「離題的問題只簡短回答一句，並提醒對方你主要負責電腦學習協助」這種比較寬鬆的寫法。").weak().small());
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let saving = self.busy.get("save").copied().unwrap_or(false);
-                if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存定位與範圍" }).clicked() {
-                    self.save_settings(&ctx);
-                }
-                if let Some(m) = &self.form.save_msg {
-                    ui.label(m.clone());
-                }
-            });
+            ui.label("全域的角色定位與回答範圍改到「聊天室管理」頁最上方的全域區改, 這裡不再放第二份。");
+            ui.label(egui::RichText::new("已有自己設定的聊天室不會用這份, 也不會和這份合併。").weak().small());
+            if ui.button("去「聊天室管理」頁改全域設定").clicked() {
+                self.page = Page::ChatManage;
+            }
         });
         ui.add_space(10.0);
         let pids: Vec<String> = ["openai", "groq", "minimax"].iter().map(|s| s.to_string()).collect();
@@ -3843,52 +3898,120 @@ impl App {
             });
             return;
         }
+        // 預設選室: CI 逐頁截圖可用 AIBAO_MANAGE_CHAT_ID 指定先選哪個室
+        // (切換前後對照截圖用, 一般使用不設); 沒指定或對不上時選第一個室。
         if self.manage_chat_id.is_empty() || !options.iter().any(|(id, _)| *id == self.manage_chat_id) {
-            self.manage_chat_id = options[0].0.clone();
+            let forced = std::env::var("AIBAO_MANAGE_CHAT_ID").ok().unwrap_or_default();
+            self.manage_chat_id = if options.iter().any(|(id, _)| *id == forced) {
+                forced
+            } else {
+                options[0].0.clone()
+            };
         }
-        // 頁首: 聊天室清單 (企業多群場景, 老吳 2026-10-24 定案): 群很多時先用搜尋找,
-        // 每列附設定狀態摘要 (來源/聒噪/管理員/知識庫), 不用逐群點開才知道狀態;
-        // 按「選取」在下方編輯該群 (動線: 先選聊天室→改設定→同頁儲存)。一律用名稱, 不顯示編號。
-        ui.label(egui::RichText::new("選擇聊天室").strong());
+        // 三步指引 (老吳 2026-10-24: 原頁面看不出改完按哪裡儲存、改完去哪裡看效果)。
+        card(ui, self.palette, "怎麼用這個頁面 (三步)", |ui| {
+            ui.label("第一步: 下面點一個聊天室的頁簽, 點哪個頁簽就是在設哪個聊天室。");
+            ui.label("第二步: 改下面五區的設定 (角色、回答範圍、知識庫、管理員、聒噪)。");
+            ui.label("第三步: 按「儲存這個聊天室的設定」 (標題下面和表單最下面都有)。");
+            ui.label("改完去哪裡看效果: 總覽頁下方的「機器人聊天情況」會看到新設定; 詳細的通知與回答紀錄在「紀錄」頁。");
+        });
+        ui.add_space(10.0);
+        // 上方全域區 (老吳 2026-10-24 版面): 全域預設一處可改; 各室自己的設定在下方頁簽改。
+        // 全域角色/範圍/知識庫資料夾原本散在「AI 設定」頁與「知識庫」頁, 現在起以這裡為主,
+        // 那兩頁改為指到這裡的說明卡/說明頁 (一份設定只有一個家)。
+        card(ui, self.palette, "全域設定 (所有聊天室沒自訂時都用這一份)", |ui| {
+            ui.label(egui::RichText::new("這裡改的是「沒自訂的聊天室共用的預設」; 已經有自己設定的聊天室不會用這份, 也不會和這份合併。").weak().small());
+            ui.label(egui::RichText::new("角色定位").strong());
+            ui.add(egui::TextEdit::multiline(&mut self.form.ai_role).desired_rows(2).desired_width(f32::INFINITY));
+            ui.label(egui::RichText::new("清空後儲存, 會自動回復成出廠預設的角色定位。").weak().small());
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("回答範圍").strong());
+            ui.add(egui::TextEdit::multiline(&mut self.form.ai_scope).desired_rows(4).desired_width(f32::INFINITY));
+            ui.label(egui::RichText::new("清空這個欄位 = 不限制範圍, 什麼問題都回答。").weak().small());
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("知識庫資料夾").strong());
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.form.kb_folder).desired_width(420.0).hint_text("例如 D:\\公司文件\\知識庫"));
+                if ui.button("選擇資料夾…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.form.kb_folder = path.to_string_lossy().to_string();
+                    }
+                }
+            });
+            ui.label(egui::RichText::new("指定一個資料夾, AI寶 會讀取裡面的 .txt / .md / .csv 回答公司問題。資料夾內容請先自行脫敏。留空 = 沒有全域資料夾, 各室只能用自己的專屬資料夾。").weak().small());
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.form.show_sources, "回答時附上參考來源");
+                ui.label(egui::RichText::new("(打開才會在回答後面附上參考的檔案名稱; 關閉就不顯示)").weak());
+            });
+            ui.horizontal(|ui| {
+                let saving = self.busy.get("save").copied().unwrap_or(false);
+                if primary_btn(ui, self.palette, if saving { "儲存中…" } else { "儲存全域設定" }).clicked() && !saving {
+                    self.save_settings(&ctx);
+                }
+                if let Some(m) = &self.form.save_msg {
+                    ui.label(m.clone());
+                }
+                let busy = self.busy.get("reindex").copied().unwrap_or(false);
+                if ui.button(if busy { "整理中…" } else { "重新建立索引" }).clicked() && !busy {
+                    self.busy.insert("reindex".into(), true);
+                    let slot = self.reindex_slot.clone();
+                    let ctx2 = ctx.clone();
+                    std::thread::spawn(move || {
+                        let r = helper_api::kb_reindex();
+                        *slot.lock().unwrap() = Some(match r {
+                            Ok(v) => v,
+                            Err(e) => serde_json::json!({ "ok": false, "message": e }),
+                        });
+                        ctx2.request_repaint();
+                    });
+                }
+                if let Some(m) = self.page_msg.get("reindex") {
+                    ui.label(m.clone());
+                }
+            });
+        });
+        ui.add_space(10.0);
+        // 下方各室區: 頁簽本身就是室名, 點哪個頁簽就是在設哪個室。
+        // 搜尋只是輔助找室: 輸入關鍵字會縮小頁簽範圍, 清空就全部回來, 不取代可見的頁簽。
+        ui.label(egui::RichText::new("各聊天室的管理 (點頁簽就是在設那個室)").strong());
         ui.horizontal(|ui| {
-            ui.label("搜尋:");
+            ui.label("找室:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.manage_chat_search)
                     .desired_width(260.0)
-                    .hint_text("打群名關鍵字篩選…"),
+                    .hint_text("打群名關鍵字縮小頁簽範圍…"),
             );
-            if !self.manage_chat_search.is_empty() && ui.button("清除").clicked() {
+            if !self.manage_chat_search.is_empty() && ui.button("顯示全部").clicked() {
                 self.manage_chat_search.clear();
             }
         });
         let q = self.manage_chat_search.trim().to_string();
-        let rows: Vec<(String, String, String)> = options
+        let tabs: Vec<(String, String)> = options
             .iter()
             .filter(|(_, label)| q.is_empty() || label.contains(&q))
-            .map(|(id, label)| (id.clone(), label.clone(), self.chat_profile_summary(id)))
+            .map(|(id, label)| (id.clone(), label.clone()))
             .collect();
-        if rows.is_empty() {
-            ui.label(egui::RichText::new("沒有名字符合的聊天室。").weak());
+        if tabs.is_empty() {
+            ui.label(egui::RichText::new("沒有名字符合的聊天室, 按「顯示全部」回到完整頁簽。").weak());
         }
-        let current = self.manage_chat_id.clone();
         let mut picked: Option<String> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("manage-chat-list")
-            .max_height(200.0)
+        egui::ScrollArea::horizontal()
+            .id_salt("manage-chat-tabs")
             .show(ui, |ui| {
-                for (id, label, sub) in &rows {
-                    let selected = *id == current;
-                    chat_list_row(ui, label, sub, |ui| {
-                        if selected {
-                            let _ = chat_action_btn(ui, "編輯中", false);
-                        } else if chat_action_btn(ui, "選取", true).clicked() {
+                ui.horizontal(|ui| {
+                    for (id, label) in &tabs {
+                        let summary = self.chat_profile_summary(id);
+                        if ui
+                            .selectable_value(&mut self.manage_chat_id, id.clone(), label.clone())
+                            .on_hover_text(summary)
+                            .changed()
+                        {
                             picked = Some(id.clone());
                         }
-                    });
-                }
+                    }
+                });
             });
-        if let Some(id) = picked {
-            self.manage_chat_id = id;
+        if picked.is_some() {
             self.manage_admin_search.clear();
             self.manage_candidates_all = false;
             self.manage_candidates.clear();
@@ -3908,22 +4031,51 @@ impl App {
         let global_role = self.form.ai_role.clone();
         let global_scope = self.form.ai_scope.clone();
         let pal = self.palette;
-        card(ui, pal, "這個聊天室的設定", |ui| {
-            // 生效來源標示 (每個聊天室編輯區上方必有): 全域預設 / 本聊天室自訂 / 已停用待確認
-            let (is_custom, is_suspended) = {
-                let f0 = self.form.chat_profiles.get(&chat_id);
-                (chat_profile_uses_custom(f0), f0.map(|f| f.suspended).unwrap_or(false))
+        let room_name = options
+            .iter()
+            .find(|(id, _)| *id == chat_id)
+            .map(|(_, l)| l.clone())
+            .unwrap_or_else(|| activity_chat_label(&chat_id, ""));
+        card(ui, pal, &format!("正在設定: {room_name}"), |ui| {
+            // 生效來源標示改看「已儲存原貌」: 診斷包 chatProfiles={} 卻顯示「本聊天室自訂」
+            // 的教訓——之前看的是未儲存的編輯草稿, 草稿一動就謊稱已生效。
+            // 草稿與存檔不同時, 另起一行標明「尚未儲存」, 不准把草稿當成效。
+            let (saved_custom, saved_suspended) = {
+                let s0 = self.form.chat_profiles_orig.get(&chat_id);
+                (chat_profile_uses_custom(s0), s0.map(|f| f.suspended).unwrap_or(false))
             };
-            if is_suspended {
-                ui.label(egui::RichText::new("目前狀態: 已停用待確認 (這個聊天室的自訂設定暫停中, 請到本頁最下方處理)").color(pal.warn_text).strong());
-            } else if is_custom {
-                ui.label(egui::RichText::new("目前用本聊天室設定 (全域預設不生效)").color(pal.primary).strong());
+            let dirty = chat_profile_dirty(
+                self.form.chat_profiles.get(&chat_id),
+                self.form.chat_profiles_orig.get(&chat_id),
+            );
+            if saved_suspended {
+                ui.label(egui::RichText::new("已儲存的狀態: 已停用待確認 (這個聊天室的自訂設定暫停中, 請到本頁最下方處理)").color(pal.warn_text).strong());
+            } else if saved_custom {
+                ui.label(egui::RichText::new("已儲存的狀態: 用本聊天室設定 (全域預設不生效)").color(pal.primary).strong());
             } else {
-                ui.label(egui::RichText::new("目前用全域預設").strong());
+                ui.label(egui::RichText::new("已儲存的狀態: 用全域預設").strong());
             }
+            if dirty {
+                ui.label(egui::RichText::new("⚠ 上面有還沒儲存的修改 (尚未生效), 按「儲存這個聊天室的設定」才會真的生效。").color(pal.warn_text).strong());
+            }
+            ui.add_space(6.0);
+            // 儲存鈕放標題下面, 不用捲到最下方才找得到 (下方表單最下面也有一顆, 兩顆同一動作)。
+            ui.horizontal(|ui| {
+                let saving_profiles = self.busy.get("chat_profiles").copied().unwrap_or(false);
+                if primary_btn(ui, pal, if saving_profiles { "儲存中…" } else { "儲存這個聊天室的設定" }).clicked() && !saving_profiles {
+                    self.save_chat_profiles(&ctx);
+                }
+                if let Some(m) = &self.chat_profiles_msg {
+                    ui.label(m.clone());
+                }
+            });
             ui.add_space(4.0);
+            // 角色與回答範圍 (五區前兩區): 這區是改這個聊天室回答問題時扮演的角色、
+            // 以及能回答哪些範圍。
             // 使用全域預設 / 本聊天室自訂切換: 切自訂時預填全域文字; 切回全域只清人設自訂旗標,
             // 聒噪、管理員、知識庫等獨立欄位不連帶刪除 (條目存廢由 has_entry 決定)。
+            ui.label(egui::RichText::new("角色與回答範圍").strong());
+            ui.label(egui::RichText::new("這區是改這個聊天室回答問題時扮演的角色、以及能回答哪些範圍。").weak().small());
             {
                 let f = match self.form.chat_profiles.get_mut(&chat_id) {
                     Some(f) => f,
@@ -3952,7 +4104,7 @@ impl App {
                     None => return,
                 };
                 if !f.custom {
-                    ui.label(egui::RichText::new("這個聊天室用全域的角色定位與回答範圍, 在「AI 設定」頁那張全域預設卡改。").weak().small());
+                    ui.label(egui::RichText::new("這個聊天室用上方全域區的角色定位與回答範圍, 要改全域預設請捲到上面全域區。").weak().small());
                 } else {
                     ui.label(egui::RichText::new("角色定位").strong());
                     ui.add(egui::TextEdit::multiline(&mut f.role).desired_rows(2).desired_width(f32::INFINITY));
@@ -3963,8 +4115,9 @@ impl App {
                 }
                 ui.add_space(8.0);
                 ui.separator();
-                // 知識庫: 允許讀取 + 專屬資料夾 + 該群索引狀態一行
+                // 知識庫 (五區第三區): 允許讀取 + 專屬資料夾 + 該群索引狀態一行
                 ui.label(egui::RichText::new("這個聊天室的知識庫").strong());
+                ui.label(egui::RichText::new("這區是決定這個聊天室能不能查知識庫、查哪個專屬資料夾。").weak().small());
                 ui.checkbox(&mut f.kb_enabled, "允許這個聊天室讀取知識庫");
                 ui.label(egui::RichText::new("關閉後, 這個聊天室問公司問題時不會查知識庫。").weak().small());
                 ui.horizontal(|ui| {
@@ -3982,18 +4135,16 @@ impl App {
                 } else if !global_kb.is_null() {
                     ui.label(egui::RichText::new(format!("全域知識庫索引: {}", kb_status_line(&global_kb))).weak().small());
                 }
-                ui.add_space(8.0);
-                ui.separator();
-                // 聒噪模式 (修復版5 文案沿用)
-                ui.checkbox(&mut f.chatty, "聒噪模式: 不用叫名字, 我也會自己找話題接話");
-                ui.label(egui::RichText::new("打開後, 我會看著這個群最近的對話, 自己判斷有沒有自然合適的話可以接; 沒有合適的話就保持安靜, 不會每則都回。打開後 AI 用量會增加。叫名字或引用問我時, 還是照平常方式優先回答; 別的群的事、個人資料跟公司機密, 我一樣不會說出去。").weak().small());
             }
+            // (聒噪區移到管理員區之後, 五區順序: 角色、範圍、知識庫、管理員、聒噪。)
             ui.add_space(8.0);
             ui.separator();
-            // 本聊天室管理員挑選 (人多先行): 預設只列近期發言過的人 + 社群管理員;
+            // 本聊天室管理員挑選 (五區第四區, 人多先行): 預設只列近期發言過的人 + 社群管理員;
             // 已選的人固定置頂, 搜尋只過濾下方待選清單, 已選區不會被篩掉。
             ui.label(egui::RichText::new("本聊天室管理員").strong());
+            ui.label(egui::RichText::new("這區是選這個聊天室出事時要 @ 出來處理的人。").weak().small());
             ui.label(egui::RichText::new("這裡的管理員只是「通知對象」: 有重要事件時, AI寶 會在群組裡 @ 他們出面處理; AI寶 本身不會踢人或處分任何人。未設定時, 重要事件會通知「機器人與觸發」頁的備援管理員。").weak().small());
+            ui.label(egui::RichText::new("管理員認的是帳號不是名字: 這個人改名字、或在不同聊天室顯示不同名字, 管理員身分都不會認不得。上面顯示的是他最近一次發言用的名字, 若和存檔舊名不同會加註。").weak().small());
             // 已選的管理員 (置頂, 可直接取消勾選)
             ui.label(egui::RichText::new("已選的管理員").strong());
             {
@@ -4002,12 +4153,38 @@ impl App {
                     None => return,
                 };
                 if f.admins.is_empty() {
-                    ui.label(egui::RichText::new("目前沒有設定本聊天室管理員。").weak().small());
+                    // 沒設本室管理員時, 實際生效的是全域備援名單——這就是之前每個室
+                    // 通知看起來都是同一個人 (妖狐藏馬) 的原因: 不是寫死, 是全部退回備援。
+                    let fallback = self
+                        .form
+                        .notify_admins
+                        .iter()
+                        .map(|(_, n)| n.clone())
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    if fallback.is_empty() {
+                        ui.label(egui::RichText::new("未設管理員, 全域備援也沒設人: 重要事件只會記在紀錄裡, 不會 @ 任何人。").weak().small());
+                    } else {
+                        ui.label(egui::RichText::new(format!("未設管理員, 目前用全域備援: {fallback} (只有這個聊天室沒設管理員時才用這裡的人)。")).weak().small());
+                    }
                 } else {
+                    // 顯示名字以近期發言候選名單的最新名字為準 (帳號相同、名字改過時不顯示舊名);
+                    // 存檔舊名不同時加註, 不偷偷改寫存檔。
                     let selected: Vec<(String, String)> = f.admins.clone();
                     for (aid, aname) in &selected {
+                        let fresh = self
+                            .manage_candidates
+                            .iter()
+                            .find(|c| c.get("id").and_then(|v| v.as_str()) == Some(aid.as_str()))
+                            .and_then(|c| c.get("name").and_then(|v| v.as_str()))
+                            .unwrap_or(aname.as_str());
+                        let label = if fresh != aname.as_str() {
+                            format!("{fresh} (存檔舊名: {aname})")
+                        } else {
+                            fresh.to_string()
+                        };
                         let mut on = true;
-                        if ui.checkbox(&mut on, aname.clone()).changed() && !on {
+                        if ui.checkbox(&mut on, label).changed() && !on {
                             f.admins.retain(|(id, _)| id != aid);
                         }
                     }
@@ -4069,6 +4246,26 @@ impl App {
                 }
             }
             ui.add_space(8.0);
+            ui.separator();
+            // 聒噪模式 (五區第五區, 各室自己的開關; 凍結定義, 語意不改):
+            // 開啟後 AI 看該群近期對話、自己判斷接不接話, 沒合適的話就安靜;
+            // 護欄 (45 秒間隔、每小時 20 則、剛接過話先讓真人講、同一人來回 3 次冷卻 10 分鐘)
+            // 與「不主動接其他機器人的話」照凍結定義, 這裡只寫開關與指路, 不重定義。
+            ui.label(egui::RichText::new("聒噪模式").strong());
+            ui.label(egui::RichText::new("這區是決定這個聊天室要不要讓 AI 自己找話題接話 (不用叫名字)。").weak().small());
+            {
+                let f = match self.form.chat_profiles.get_mut(&chat_id) {
+                    Some(f) => f,
+                    None => return,
+                };
+                ui.checkbox(&mut f.chatty, "聒噪模式: 不用叫名字, 我也會自己找話題接話");
+                ui.label(egui::RichText::new("打開後, 我會看著這個群最近的對話, 自己判斷有沒有自然合適的話可以接; 沒有合適的話就保持安靜, 不會每則都回。打開後 AI 用量會增加。叫名字或引用問我時, 還是照平常方式優先回答; 別的群的事、個人資料跟公司機密, 我一樣不會說出去。").weak().small());
+            }
+            ui.label(egui::RichText::new("聒噪只接「沒被叫名字」的話; 被叫名字時走全域觸發規則, 不走這裡。兩邊怎麼分工, 看「機器人與觸發」頁上方的說明。").weak().small());
+            if ui.button("去「機器人與觸發」頁看分工說明").clicked() {
+                self.page = Page::BotSettings;
+            }
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let saving_profiles = self.busy.get("chat_profiles").copied().unwrap_or(false);
                 if primary_btn(ui, pal, if saving_profiles { "儲存中…" } else { "儲存這個聊天室的設定" }).clicked() && !saving_profiles {
@@ -4128,6 +4325,18 @@ impl App {
             self.admin_events_attempted = true;
             self.spawn_admin_events_load(&ctx);
         }
+        // 觸發與聒噪的分工說明 (修復版6後續修復, 語意經程式查證 — 見施工紀錄):
+        // 叫名字/引用走觸發、沒叫名字才看各室聒噪、同一則絕不雙回; 兩者不打架。
+        card(ui, self.palette, "觸發跟聒噪怎麼分工 (不會打架)", |ui| {
+            ui.label("觸發是全域規則, 在這一頁管: 有人在訊息裡叫機器人名字或別名、或是引用機器人的回答再追問, 就走觸發回答; 冷卻、60 秒上限、每日上限也在這一頁。");
+            ui.label("聒噪是各聊天室自己的開關, 在「聊天室管理」頁管: 只有「沒被叫名字」的一般訊息, 才看那個聊天室的聒噪開關決定要不要自己接話。");
+            ui.label("同一則訊息不會回兩次: 被叫名字的訊息就算這次被冷卻或上限擋下不回, 也不會轉給聒噪補一句; 聒噪只接沒叫名字的話。");
+            ui.label("AI寶 自己的話和系統通知 (有人加入或離開) 不觸發也不接話。其他機器人的話因為 LINE 沒給可靠的標記、沒辦法百分之百認出來, 靠接話間隔與上限護欄收斂, 不會無限互聊。");
+            if ui.button("去「聊天室管理」頁開／關聒噪").clicked() {
+                self.page = Page::ChatManage;
+            }
+        });
+        ui.add_space(8.0);
         card(ui, self.palette, "機器人名字與觸發規則", |ui| {
             ui.horizontal(|ui| {
                 ui.label("機器人主名 (在群組裡叫這個名字, 我就會回應):");
@@ -4354,6 +4563,8 @@ impl App {
         ui.add_space(10.0);
         card(ui, self.palette, "備援管理員 (聊天室未設管理員時用)", |ui| {
             ui.label(egui::RichText::new("每個聊天室可以在「聊天室管理」頁設定自己的管理員; 該聊天室有自己的管理員時, 重要事件只通知該室管理員, 不會通知這份備援名單。").weak());
+            ui.label(egui::RichText::new("只有聊天室沒設管理員時才用這裡的人: 所以如果你看到每個室通知的都是同一批人, 不是寫死, 是那些室都還沒設自己的管理員、全部退回這份備援名單。").weak());
+            ui.label(egui::RichText::new("管理員認的是帳號不是名字: 這個人改名字、或在不同聊天室顯示不同名字, 管理員身分都不會認不得。").weak());
             ui.label(egui::RichText::new("被 @ 的對象就是這份名單裡的人; 實務上大部份會是你本人。從下面「有在白名單群組裡發言過的人」裡面用勾的選, 不用打任何代號; 勾完按下面通知事件清單裡的「儲存通知設定」才算數。").weak());
             ui.label(egui::RichText::new("小提醒: 被通知的人最好有在那個群裡說過話。從來沒在群裡說過話的人可能 @ 不到, 到時候 AI寶 會改用寫名字的方式通知, 並在紀錄裡註明。").weak());
             // 已選的管理員固定置頂 (比照聊天室管理頁): 不因搜尋或清單捲動而消失, 可直接取消勾選。
@@ -5126,21 +5337,14 @@ impl App {
     fn page_kb(&mut self, ui: &mut egui::Ui) {
         ui.heading("知識庫");
         ui.add_space(8.0);
-        let ctx = ui.ctx().clone();
-        card(ui, self.palette, "知識庫資料夾", |ui| {
-            ui.label("指定一個資料夾, AI寶 會讀取裡面的 .txt / .md / .csv 回答公司問題。資料夾內容請先自行脫敏。");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.form.show_sources, "回答時附上參考來源");
-                ui.label(egui::RichText::new("(打開才會在回答後面附上參考的檔案名稱; 關閉就不顯示)").weak());
-            });
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.form.kb_folder).desired_width(420.0).hint_text("例如 D:\\公司文件\\知識庫"));
-                if ui.button("選擇資料夾…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.form.kb_folder = path.to_string_lossy().to_string();
-                    }
-                }
-            });
+        // 知識庫設定改到「聊天室管理」頁上方全域區 (修復版6後續修復, 一份設定只有一個家):
+        // 這裡只留指路與唯讀索引狀態, 不再放可改欄位 (資料夾、附上參考來源、重新建立索引都在管理頁)。
+        card(ui, self.palette, "知識庫設定改到「聊天室管理」頁", |ui| {
+            ui.label("全域知識庫資料夾、回答時附上參考來源、重新建立索引, 都改到「聊天室管理」頁最上方的全域區改, 這裡不再放第二份。");
+            if ui.button("去「聊天室管理」頁改知識庫設定").clicked() {
+                self.page = Page::ChatManage;
+            }
+            ui.add_space(6.0);
             let status = self.helper_status();
             if let Some(kb) = status.as_ref().and_then(|s| s.get("bot")).and_then(|b| b.get("kb")) {
                 if !kb.is_null() {
@@ -5162,29 +5366,6 @@ impl App {
                     }
                 }
             }
-            ui.horizontal(|ui| {
-                let saving = self.busy.get("save").copied().unwrap_or(false);
-                if primary_btn(ui, self.palette, "儲存知識庫設定").clicked() && !saving {
-                    self.save_settings(&ctx);
-                }
-                let busy = self.busy.get("reindex").copied().unwrap_or(false);
-                if ui.button(if busy { "整理中…" } else { "重新建立索引" }).clicked() && !busy {
-                    self.busy.insert("reindex".into(), true);
-                    let slot = self.reindex_slot.clone();
-                    let ctx2 = ctx.clone();
-                    std::thread::spawn(move || {
-                        let r = helper_api::kb_reindex();
-                        *slot.lock().unwrap() = Some(match r {
-                            Ok(v) => v,
-                            Err(e) => serde_json::json!({ "ok": false, "message": e }),
-                        });
-                        ctx2.request_repaint();
-                    });
-                }
-                if let Some(m) = self.page_msg.get("reindex") {
-                    ui.label(m.clone());
-                }
-            });
         });
     }
 
@@ -5525,8 +5706,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_profile_uses_custom, chat_profiles_new_orig, chat_profiles_patch, decode_image_rgba, icon_rgba,
-        parse_start_page, rate_limits_from_settings, ChatProfileForm, EngineOpGate, Page, NAV_PAGES,
+        chat_profile_dirty, chat_profile_uses_custom, chat_profiles_new_orig, chat_profiles_patch, decode_image_rgba,
+        icon_rgba, parse_start_page, rate_limits_from_settings, App, ChatProfileForm, EngineOpGate, Page, NAV_PAGES,
     };
     use std::collections::HashMap;
     use std::io::Cursor;
@@ -5542,6 +5723,56 @@ mod tests {
             chatty: false,
             admins: Vec::new(),
         }
+    }
+
+    #[test]
+    fn chat_profile_dirty_matches_patch_semantics() {
+        // 修復版6後續修復: 管理頁「尚未儲存」標示的語意必須與補丁規則一致,
+        // 否則標示會在「明明存不進去」或「明明沒改」時說謊。
+        let fresh = ChatProfileForm::default();
+        assert!(!chat_profile_dirty(Some(&fresh), None), "剛點進沒自訂的室不能顯示尚未儲存");
+        let chatty_only = ChatProfileForm { chatty: true, ..Default::default() };
+        assert!(chat_profile_dirty(Some(&chatty_only), None), "只開聒噪要算改");
+        let saved = profile("角色A");
+        assert!(!chat_profile_dirty(Some(&saved), Some(&saved)), "沒動過不能顯示尚未儲存");
+        let mut edited = profile("角色A");
+        edited.scope = "改過的範圍".to_string();
+        assert!(chat_profile_dirty(Some(&edited), Some(&saved)), "改過範圍要算改");
+        assert!(!chat_profile_dirty(None, Some(&saved)), "沒草稿不能算改");
+    }
+
+    #[test]
+    fn chatview_hidden_reason_priority() {
+        // 修復版6後續修復: 狀態行原因的優先順序必須與 page_chat 的 want 條件一致:
+        // 系統匣 > 最小化 > 確認結束 > 確認登出 > 系統匣提示 > 正在結束; 全無才顯示。
+        assert_eq!(
+            App::chatview_hidden_reason(true, true, true, true, true, true),
+            Some("視窗目前縮到系統匣")
+        );
+        assert_eq!(
+            App::chatview_hidden_reason(false, true, true, true, true, true),
+            Some("視窗目前是最小化")
+        );
+        assert_eq!(
+            App::chatview_hidden_reason(false, false, true, true, true, true),
+            Some("正在確認結束程式")
+        );
+        assert_eq!(
+            App::chatview_hidden_reason(false, false, false, true, true, true),
+            Some("正在確認登出")
+        );
+        assert_eq!(
+            App::chatview_hidden_reason(false, false, false, false, true, true),
+            Some("正在顯示系統匣提示")
+        );
+        assert_eq!(
+            App::chatview_hidden_reason(false, false, false, false, false, true),
+            Some("正在結束程式")
+        );
+        assert_eq!(
+            App::chatview_hidden_reason(false, false, false, false, false, false),
+            None
+        );
     }
 
     #[test]

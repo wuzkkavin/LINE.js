@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Logger } from "../src/logger.mjs";
 import { FileSecretStore, MemorySecretStore, WindowsSecretStore, createSecretStore, maskSecret } from "../src/secrets.mjs";
-import { SettingsStore, SECRET_NAMES, DEFAULT_CREATOR_REPLY, DEFAULT_SCOPE_PROMPT, DEFAULT_ROLE_PROMPT, DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT } from "../src/config.mjs";
+import { SettingsStore, SECRET_NAMES, DEFAULT_SCOPE_PROMPT, DEFAULT_ROLE_PROMPT, DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT } from "../src/config.mjs";
 import { createAiClient, DEFAULT_LIST_MODELS_TIMEOUT_MS } from "../src/ai.mjs";
 import { createTriggerState, evaluateTrigger, markAnswered, markTriggered, localDateKey } from "../src/trigger.mjs";
 import { KnowledgeBase } from "../src/kb.mjs";
@@ -872,31 +872,40 @@ test("kb: 索引重載直接還原詞頻可搜尋; 舊格式索引 (無詞頻) �
 
 // ===== 修復批次一 (2026-10-20) 新測試 =====
 
-test("config: showSources 預設 false、creatorReply 預設值一字不差、persona 預設全空; 保存與 publicView 明文回傳", async () => {
+test("config: showSources 預設 false、creatorReply 已清除、persona 預設全空; 保存與 publicView 明文回傳", async () => {
   const dir = await tmp();
   const store = new SettingsStore({ path: join(dir, "settings.json") });
   const d = store.get();
   assert.equal(d.showSources, false);
-  assert.equal(d.creatorReply, "是吳治綱大師創造此機器人，©Copyright By 吳治綱");
-  assert.equal(d.creatorReply, DEFAULT_CREATOR_REPLY);
+  assert.equal(d.creatorReply, undefined, "預設值不再含 creatorReply (修復版6後續修復已清除)");
   assert.deepEqual(d.persona, { birthdate: "", gender: "", zodiac: "", measurements: "", interests: "", maritalStatus: "", intro: "" });
-  // 部分更新 persona: 只給 birthdate, 其他欄位保留空字串 (deepMerge)
+  // 部分更新 persona: 只給 birthdate, 其他欄位保留空字串 (deepMerge);
+  // 舊用戶端送來的 creatorReply 在更新時直接刪掉, 不藉合併復活。
   store.update({ showSources: true, creatorReply: "自訂回覆", persona: { birthdate: "2000-10-21", interests: "畫畫" } });
   const u = store.get();
   assert.equal(u.showSources, true);
-  assert.equal(u.creatorReply, "自訂回覆");
+  assert.equal(u.creatorReply, undefined, "更新不得把 creatorReply 寫回來");
   assert.equal(u.persona.birthdate, "2000-10-21");
   assert.equal(u.persona.interests, "畫畫");
   assert.equal(u.persona.gender, "");
-  // 落盤保存: 新實例讀得回來
+  // 落盤保存: 新實例讀得回來, 且 creatorReply 沒有復活
   const store2 = new SettingsStore({ path: join(dir, "settings.json") });
   assert.equal(store2.get().persona.birthdate, "2000-10-21");
   assert.equal(store2.get().showSources, true);
-  // publicView: 三項都明文回傳 (非機密), 不被遮罩邏輯吞掉
+  assert.equal(store2.get().creatorReply, undefined);
+  // publicView: 明文回傳的非機密項不含 creatorReply
   const view = await store.publicView(new MemorySecretStore());
   assert.equal(view.showSources, true);
-  assert.equal(view.creatorReply, "自訂回覆");
+  assert.equal(view.creatorReply, undefined);
   assert.equal(view.persona.birthdate, "2000-10-21");
+});
+
+test("config: 舊存檔殘留 creatorReply 載入即清除", async () => {
+  const dir = await tmp();
+  const p = join(dir, "settings.json");
+  await writeFile(p, JSON.stringify({ botName: "AI寶", creatorReply: "舊殘留" }), "utf8");
+  const store = new SettingsStore({ path: p });
+  assert.equal(store.get().creatorReply, undefined, "舊存檔的 creatorReply 載入時就要刪掉");
 });
 
 test("creator: 創造者意圖判定 (命中三例、不命中外部主詞兩例)", () => {
@@ -1070,7 +1079,7 @@ test("bot: 機敏問題回委婉拒答 (修復版6, 不呼叫 AI、不再用 cre
   h.inject("m1", "u-a", "AI寶，你是誰創造的？");
   const sent1 = await h.waitSent((f) => f.replyTo === "m1", "confidential deflection");
   assert.equal(sent1.text, CONFIDENTIAL_DEFLECTION);
-  assert.ok(!sent1.text.includes(DEFAULT_CREATOR_REPLY), "拒答不得含舊 creatorReply 內容");
+  assert.ok(!sent1.text.includes("是吳治綱大師創造此機器人"), "拒答不得含舊 creatorReply 內容");
   assert.ok(!sent1.text.includes("吳治綱"), "拒答不得含創作者姓名");
   assert.equal(h.aiBodies.length, 0, "機敏問題不應呼叫 AI");
   h.inject("m2", "u-b", "AI寶，Excel 是誰開發的？");
@@ -1081,8 +1090,9 @@ test("bot: 機敏問題回委婉拒答 (修復版6, 不呼叫 AI、不再用 cre
   const sent3 = await h.waitSent((f) => f.replyTo === "m3", "possessive confidential deflection");
   assert.equal(sent3.text, CONFIDENTIAL_DEFLECTION);
   assert.equal(h.aiBodies.length, 1, "所有格問句命中後不應再呼叫 AI");
-  // 就算設定裡有自訂 creatorReply, 修復版6 起也不再使用, 照樣回委婉拒答
+  // 就算舊用戶端送來 creatorReply, 更新時直接刪掉、回答路徑也不讀它, 照樣回委婉拒答
   h.settings.update({ creatorReply: "我是老吳做的機器人" });
+  assert.equal(h.settings.get().creatorReply, undefined, "舊 creatorReply 不得藉更新復活");
   h.inject("m4", "u-d", "AI寶，版權屬於誰？");
   const sent4 = await h.waitSent((f) => f.replyTo === "m4", "copyright deflection despite custom creatorReply");
   assert.equal(sent4.text, CONFIDENTIAL_DEFLECTION);

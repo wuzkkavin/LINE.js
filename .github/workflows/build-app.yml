@@ -569,11 +569,20 @@ jobs:
               kbEnabled: true, kbFolder: "", chatty: true, personaCustom: true, suspended: false,
               admins: [{ id: "u22222222222222222222222222222222", name: "截圖驗證管理員" }],
             };
+            // 修復版6後續修復: 第二個對照室 (值全部不同, 供 manage-b 截圖證明切換頁簽後表單跟著換)。
+            s.ai.chatProfiles["c22222222222222222222222222222222"] = {
+              rolePrompt: "（截圖驗證用）第二群專屬角色",
+              scopePrompt: "（截圖驗證用）只回答財務問題",
+              kbEnabled: false, kbFolder: "", chatty: false, personaCustom: true, suspended: false,
+              admins: [{ id: "u33333333333333333333333333333333", name: "第二群管理員" }],
+            };
             const res = await req("PUT", "/api/settings", s);
             if (!res || res.ok !== true) { console.error("seed: PUT /api/settings did not return ok"); process.exit(1); }
             const back = await req("GET", "/api/settings");
             const got = back && back.ai && back.ai.chatProfiles && back.ai.chatProfiles["c11111111111111111111111111111111"];
             if (!got || !Array.isArray(got.admins) || got.admins.length !== 1) { console.error("seed: read-back verification failed"); process.exit(1); }
+            const got2 = back && back.ai && back.ai.chatProfiles && back.ai.chatProfiles["c22222222222222222222222222222222"];
+            if (!got2 || !Array.isArray(got2.admins) || got2.admins.length !== 1) { console.error("seed: read-back verification failed (second room)"); process.exit(1); }
             console.log("seeded chatProfiles via API (read-back ok)");
           })().catch((e) => { console.error(e); process.exit(1); });
           '@ | Set-Content $seedJs -Encoding utf8
@@ -584,6 +593,9 @@ jobs:
           Shot-App 'overview' @{} $seedAction
           Shot-App 'chat' @{ AIBAO_START_PAGE = 'chat'; AIBAO_CHATVIEW_FORCE = '1' }
           Shot-App 'manage' @{ AIBAO_START_PAGE = 'manage' }
+          # 修復版6後續修復: 切換頁簽對照截圖——以 AIBAO_MANAGE_CHAT_ID 預選第二室,
+          # 與上一張 manage 截圖 (預設第一室) 對照, 證明表單跟著頁簽換成該室存檔值。
+          Shot-App 'manage-b' @{ AIBAO_START_PAGE = 'manage'; AIBAO_MANAGE_CHAT_ID = 'c22222222222222222222222222222222' }
           Shot-App 'send' @{ AIBAO_START_PAGE = 'send' }
           Shot-App 'ai' @{ AIBAO_START_PAGE = 'ai' }
           Shot-App 'bot' @{ AIBAO_START_PAGE = 'bot' }

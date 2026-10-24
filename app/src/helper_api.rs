@@ -120,6 +120,18 @@ pub fn get_status() -> Result<serde_json::Value, String> {
 /// 群組篩選 (2026-10-23): chat 給了就帶 ?chat=<chatId>, 由 helper 端做純顯示層
 /// 篩選 (邏輯在 helper/src/activityfilter.mjs, 附單元測試); chatId 只含英數字
 /// 與連字號, 直接拼進 query 即可。
+/// 核心聊天頁自我檢查 (修復版6後續修復): 直接對核心 3789 根頁面做一次 GET,
+/// 只回狀態碼、不解析內容。給「聊天室畫面」頁區分「核心網頁連不上」
+/// 與「核心網頁通、但嵌入顯示有問題」兩種情況, 不再讓使用者對著空白猜。
+pub fn core_page_check() -> Result<u16, String> {
+    use crate::engine::CORE_PORT;
+    match agent(5).get(&format!("http://127.0.0.1:{CORE_PORT}/")).call() {
+        Ok(resp) => Ok(resp.status()),
+        Err(ureq::Error::Status(code, _)) => Ok(code),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
 pub fn bot_activity(chat: Option<&str>) -> Result<serde_json::Value, String> {
     match chat {
         Some(id) if !id.is_empty() => get_json(&format!("/api/bot/activity?chat={id}")),
