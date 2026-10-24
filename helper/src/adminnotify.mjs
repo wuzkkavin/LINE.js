@@ -16,7 +16,11 @@ export const NOTIFY_EVENT_KINDS = {
 export const NOTIFY_THROTTLE_MS = 10 * 60 * 1000;
 export const NOTIFY_DAILY_CAP = 20;
 
-// 設定形狀驗證: admins=[{id,name}], rules=[{id,kind,keyword,notifyAdminIds,enabled}]
+// 設定形狀驗證: rules=[{id,kind,keyword,notifyAdminIds,enabled}]
+// notifyAdminIds 是舊版「逐規則選人」留下的欄位: 儲存時原樣保留 (不刪除, 規則的種類/
+// 關鍵字/開關不受影響), 但發送收件人不再用它挑人 — 收件人只有該聊天室自己的管理員,
+// 未設管理員的室不 @ 任何人、只寫紀錄 (2026-10-25 老吳定案, 備援已廢除; 見 bot.raiseAdminEvent)。
+// notify.admins (舊版全域備援名單) 同樣只留存檔、發送解析不再讀它。
 export function validateNotifySettings(notify) {
   const errors = [];
   const admins = [];

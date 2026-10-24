@@ -7,6 +7,7 @@ import { SettingsStore, SECRET_NAMES } from "./config.mjs";
 import { createAiClient } from "./ai.mjs";
 import { KbPool } from "./kb.mjs";
 import { HelperBot } from "./bot.mjs";
+import { readCoreApiStatus } from "./linecfg.mjs";
 import { syncJevCoreConfig } from "./jev.mjs";
 import { MessageSenderRegistry } from "./msgregistry.mjs";
 import { OutboxStore } from "./outbox.mjs";
@@ -38,7 +39,9 @@ kbPool.syncFromSettings(settings.get()); // 預熱各群專屬索引 (背景掃�
 const registry = new MessageSenderRegistry({ path: join(dataDir, "message-senders.json"), logger });
 // 管理員通知的事件紀錄要先建好再交給 bot (bot 是事件來源); 待發清單與教材庫同批建立
 const adminEvents = new AdminEventStore({ path: join(dataDir, "admin-events.json"), logger });
-const bot = new HelperBot({ settings, secrets, ai, kb, kbPool, logger, registry, dailyStatePath: join(dataDir, "daily-state.json"), adminEvents });
+// 修復 A: 白名單讀取器交給 bot — 監聽狀態對照、補登與解密掃描都以核心設定檔
+// api.chats 為準, 不再只認核心即時清單 (社群群缺在快照裡時也不會默默消失)。
+const bot = new HelperBot({ settings, secrets, ai, kb, kbPool, logger, registry, dailyStatePath: join(dataDir, "daily-state.json"), adminEvents, whitelistReader: () => readCoreApiStatus({ dataDir, repoRoot: join(here, "..", "..") }).chats });
 // Jev 接通: 啟動時先把核心 config.yaml 的 jev 區段與目前設定/金鑰對齊 (上次執行期間改的存檔當下
 // 就已同步, 這裡是補上「程式沒開時設定被改」或核心設定檔後來才產生的情況), 並刷新 bot 的 Jev 狀態,
 // 防詐騙頁顯示的狀態才誠實。同步失敗只記 log, 不擋啟動。

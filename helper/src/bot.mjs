@@ -11,6 +11,7 @@ import { resolveChatSettings, buildScopeGuardSection, classifyAnswerKind, guidan
 import { ChattyTracker, CHATTY_INSTRUCTIONS, parseChattyReply, CHATTY_REPLY_MAX_TOKENS } from "./chatty.mjs";
 import { matchNotifyRules, planTargets, NOTIFY_EVENT_KINDS } from "./adminnotify.mjs";
 import { isValidJevToken } from "./jev.mjs";
+import { readCoreApiStatus } from "./linecfg.mjs";
 
 const COMPANY_HINTS = ["公司", "華葳", "內部", "規定", "請假", "加班", "影印", "列印", "印表機", "分機", "會議室", "系統", "帳號申請", "福利", "薪資", "考勤", "打卡", "公文", "簽呈", "部門", "同仁", "總公司", "工務所"];
 
@@ -286,7 +287,7 @@ export const DECRYPT_SEEN_IDS_CAP = 300;
 export const ADMIN_CANDIDATE_RECENT_MS = 30 * 24 * 60 * 60 * 1000;
 
 export class HelperBot {
-  constructor({ settings, secrets, ai, kb, kbPool, logger, registry, reconnectDelaysMs, dailyStatePath = "", decryptMissedOptions, adminEvents = null, chattyOptions = null } = {}) {
+  constructor({ settings, secrets, ai, kb, kbPool, logger, registry, reconnectDelaysMs, dailyStatePath = "", decryptMissedOptions, adminEvents = null, chattyOptions = null, whitelistReader = null } = {}) {
     this.settings = settings; // SettingsStore
     this.secrets = secrets;
     this.ai = ai;
@@ -328,8 +329,13 @@ export class HelperBot {
     // 引用續答加固 (第 6 項): 核心送來的白名單聊天室清單與「連線後主動補登歷史」的進度。
     // 補登目的: 離線/重啟期間機器人自己發過的訊息不在登記簿裡, 重連後先主動把近期歷史補登,
     // 同事引用那些回答追問時第一時間就認得出來, 不必等引用當下才向核心補查。
-    this.botChats = []; // 白名單聊天室 ID (由核心 channels 影格提供)
+    this.botChats = []; // 核心即時清單裡的聊天室 ID (由核心 channels 影格提供)
     this.chatNames = new Map(); // chatId -> 顯示名稱 (活動面板用; 同樣來自 channels 影格)
+    // 白名單讀取器 (修復 A, 2026-10-25): 核心設定檔 api.chats = 使用者要求服務的聊天室。
+    // 它與 channels 影格不同: 影格是核心記憶體快照與白名單的交集, 社群群可能因核心快照
+    // 缺失而不在影格裡, 但仍在白名單裡 — 這正是 2026-10-24 社群群默默不服務的落差。
+    // 沒傳入時 (單元測試/舊進入點) 退回以即時清單為準, 行為與改版前相同。
+    this.whitelistReader = typeof whitelistReader === "function" ? whitelistReader : null;
     this.historyPrefetchedChats = new Set(); // 本次連線已補登過的聊天室 (重連時清空重補)
     this.historyPrefetchInFlight = new Set();
     this.stats = { date: "", answered: 0, triggered: 0, scamChecked: 0, scamWarned: 0, scamScanned: 0 };
@@ -450,6 +456,31 @@ export class HelperBot {
     }
   }
 
+  // 白名單聊天室 ID (修復 A): 核心設定檔 api.chats, 讀不到或沒傳入讀取器時退回即時清單。
+  // 讀取失敗不丟例外 (設定檔可能正在寫入或核心還沒產生), 呼叫端以空陣列視為「未知」。
+  whitelistChats() {
+    try {
+      if (this.whitelistReader) {
+        const list = this.whitelistReader();
+        if (Array.isArray(list)) return list.filter((id) => typeof id === "string" && id);
+      }
+    } catch { return []; }
+    return [...this.botChats];
+  }
+
+  // 每室監聽狀態 (修復 A, 管理頁顯示用): 白名單裡的室, 即時清單有它 = 監聽中,
+  // 沒有它 = 未監聽 (即時訊息與問答都不會進來, 不准再顯示成正常服務中)。
+  monitorStatus() {
+    const whitelist = this.whitelistChats();
+    const live = new Set(this.botChats);
+    return {
+      total: whitelist.length,
+      monitored: whitelist.filter((id) => live.has(id)),
+      unmonitored: whitelist.filter((id) => !live.has(id)).map((id) => ({ chatId: id, name: this.chatNames.get(id) ?? "" })),
+      monitoredCount: whitelist.filter((id) => live.has(id)).length,
+    };
+  }
+
   // 管理員通知: 事件發生 -> 在這裡組白話本文、決定通知誰與用 @ 還是寫名字、寫進事件紀錄。
   // 真正把訊息送進群組的是 App 殼 (瀏覽器通道, 每隔一段時間來領「還沒送出的待通知」);
   // 這裡不直接送, 是因為 @ 的可行性與送出都在殼端那條通道上驗證 (規格分工定案)。
@@ -460,41 +491,28 @@ export class HelperBot {
       const notify = s.notify ?? { admins: [], rules: [] };
       const rules = matchNotifyRules(notify, kind, { text });
       if (!rules.length) return;
-      // 多筆規則命中時合併對象: 任一筆沒勾人 = 通知全部管理員 (planTargets 的既有語意)
-      const union = new Set();
-      let notifyAll = false;
-      for (const r of rules) {
-        const ids = Array.isArray(r.notifyAdminIds) ? r.notifyAdminIds : [];
-        if (!ids.length) notifyAll = true;
-        for (const id of ids) union.add(id);
-      }
-      const mergedRule = { notifyAdminIds: notifyAll ? [] : [...union] };
-      // 收件人解析 (修復版6): 這個聊天室有自己的管理員 -> 通知該室全部自訂管理員
-      // (規則只決定事件要不要通知, 不再以全域名單挑人); 沒有 -> 沿用全域邏輯 (mergedRule 篩 notify.admins)。
+      // 收件人解析 (2026-10-25 老吳定案, 備援已廢除): 規則只決定「這類事件要不要通知」,
+      // 不再逐規則選人; 收件人只有一種 — 該聊天室自己的管理員。沒設管理員的室:
+      // 不 @ 任何人, 事件只寫進紀錄, 僅此而已 (不補、不 fallback、不跳提醒)。
+      // 舊的全域備援名單 (notify.admins) 存檔值留置不動, 但發送解析不再讀它;
+      // 舊規則裡逐筆勾的人 (notifyAdminIds) 同樣只留存檔, 不影響種類/關鍵字/開關。
+      // 身分認 ID 不認名字: 已選管理員只存 ID, 顯示名一律從該室最新發言資料即時解析
+      // (存檔裡的舊名字快照一律忽略, 改名後顯示自動跟著變、通知對象不變)。
       // @ 可行性: 有在這個聊天室發言紀錄 = hasSpoken true; 完全查不到這個聊天室的發言紀錄時
       // 不給 presence (planTargets 預設可 @, 送出端真的被核心擋下時殼端會改用寫名字並註明)。
-      // presence 只針對實際收件池的 id 由 chatSpeakers 計算。
-      const chatAdmins = getChatAdmins(s, chatId);
-      let targets;
-      let pool;
-      if (chatAdmins.length > 0) {
-        pool = "chat";
-        const speakers = this.chatSpeakers.get(chatId);
-        const presence = {};
-        if (speakers) {
-          for (const a of chatAdmins) presence[a.id] = { hasSpoken: speakers.has(a.id) };
-        }
-        targets = planTargets({ rule: { notifyAdminIds: [] }, admins: chatAdmins, presence });
-      } else {
-        pool = "global";
-        const speakers = this.chatSpeakers.get(chatId);
-        const presence = {};
-        if (speakers) {
-          for (const a of notify.admins ?? []) presence[a.id] = { hasSpoken: speakers.has(a.id) };
-        }
-        targets = planTargets({ rule: mergedRule, admins: notify.admins ?? [], presence });
+      const chatAdminIds = getChatAdmins(s, chatId).map((a) => a.id);
+      const speakers = this.chatSpeakers.get(chatId);
+      const liveAdmins = chatAdminIds.map((id) => ({
+        id,
+        // 顯示名只認即時資料: 該室發言紀錄裡的最新名字; 沒有紀錄時顯示 ID, 不拿舊快照充數。
+        name: speakers?.get(id)?.name || id,
+      }));
+      const presence = {};
+      if (speakers) {
+        for (const a of liveAdmins) presence[a.id] = { hasSpoken: speakers.has(a.id) };
       }
-      this.logger?.debugLog("管理員通知", "收件人解析", { kind, chat: chatId, pool, count: targets.length });
+      const targets = planTargets({ rule: { notifyAdminIds: [] }, admins: liveAdmins, presence });
+      this.logger?.debugLog("管理員通知", "收件人解析", { kind, chat: chatId, pool: "chat", count: targets.length });
       const now = new Date();
       const p2 = (n) => String(n).padStart(2, "0");
       const timeText = `${p2(now.getHours())}:${p2(now.getMinutes())}`;
@@ -537,10 +555,11 @@ export class HelperBot {
     });
   }
 
-  // 管理員候選名單: ① 白名單群組近期發言者 (noteSpeaker 累積) ② OpenChat 管理員查詢。
+  // 管理員候選名單: ① 該室近期發言者 (noteSpeaker 累積) ② 該室 OpenChat 管理員查詢。
   // 回 [{ id, name, chats: [聊天室名], source }] — 殼端「管理員名單」勾選清單的來源, 不用手打代號。
-  // 給 chatId 時 (修復版6) 只回該室候選: 只取該室的 chatSpeakers 與該室的社群管理員查詢結果;
-  // chatId 形狀不合法 (比照 linecfg 的格式) 回空陣列不報錯。不給時行為與先前完全相同。
+  // 只回該室候選: 只取該室的 chatSpeakers 與該室的社群管理員查詢結果, 不得混室;
+  // chatId 形狀不合法 (比照 linecfg 的格式) 回空陣列不報錯; 不給 chatId 也回空陣列
+  // (2026-10-25 老吳定案: 備援聯集已廢除, 沒有跨室聯集)。
   // 選人原則 (修復版6 擴充, 老吳 2026-10-24 定案「人多的情境先行」):
   // 預設 (all=false) 只列近期窗內在該室發言過的人 + 該室社群管理員, 人多時先看這份短名單;
   // all=true 才放寬為「曾記錄過的本室發言者」全部 (chatSpeakers 不套時間窗) + 該室社群管理員, 去重、形狀相同。
@@ -578,20 +597,9 @@ export class HelperBot {
       }
       return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
     }
-    for (const [cid, speakers] of this.chatSpeakers) {
-      const chatName = this.chatNames.get(cid) ?? "";
-      for (const [id, info] of speakers) add(id, info.name, chatName, "speaker");
-    }
-    if (this.connected) {
-      for (const cid of [...this.botChats]) {
-        try {
-          const frame = await this.queryChatAdmins(cid);
-          const chatName = this.chatNames.get(cid) ?? "";
-          for (const a of frame?.admins ?? []) add(a.userId, a.displayName ?? "", chatName, "openchat-admin");
-        } catch { /* 不是 OpenChat 或查不到: 略過, 發言者來源已涵蓋 */ }
-      }
-    }
-    return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
+    // 2026-10-25 老吳定案: 備援聯集已廢除, 不給聊天室就不提供候選資料
+    // (管理員只能從該室成員裡選, 沒有跨室聯集)。呼叫端必須帶 chat。
+    return [];
   }
   cfg() { return this.settings.get(); }
   kbInstanceFor(resolved, chatId) {
@@ -626,10 +634,12 @@ export class HelperBot {
       },
       answeredToday: this.stats.answered,
       // 訊息解密健康 (2026-10-21 第二段): 近期歷史裡有沒有核心解不開的訊息。
-      // state: unknown (尚未掃描) / ok / failed; failed 時 issues 逐聊天室列出
-      // 名稱、失敗則數、最近失敗時間與寄件者 — 總覽與一鍵修復據此誠實點燈,
-      // 不再像事故當下那樣全綠假裝正常。
+      // state: unknown (尚未掃描) / ok / partial (有白名單室未監聽) / failed;
+      // failed 時 issues 逐聊天室列出名稱、失敗則數、最近失敗時間與寄件者 —
+      // 總覽與一鍵修復據此誠實點燈, 不再像事故當下那樣全綠假裝正常。
       decrypt: this.decryptSummary(),
+      // 每室監聽狀態 (修復 A): 白名單 vs 即時清單對照, 管理頁每室顯示監聽中/未監聽。
+      monitor: this.monitorStatus(),
       // 第 14 項: 核心實際版本 (hello 影格的 serverVersion; 未連線時為空字串, 介面顯示「—」)
       coreVersion: this.coreVersion,
       // 第 12 項面板: 今日已回答 / 每日上限要成對顯示
@@ -892,9 +902,11 @@ export class HelperBot {
   }
 
   // --- 訊息解密健康偵測 (2026-10-21 第二段) ---
-  // 狀態彙總 (status().decrypt 與 log 轉移判定共用): state 三態 —
-  // unknown = 還沒完成過任何一輪掃描 (不冒充正常); ok = 掃過且沒有解密失敗;
-  // failed = 至少一個聊天室的近期歷史裡有 decryptFailed 訊息。
+  // 狀態彙總 (status().decrypt 與 log 轉移判定共用): state 四態 —
+  // unknown = 還沒完成過任何一輪掃描 (不冒充正常); ok = 掃過且沒有解密失敗、
+  // 白名單也全數監聽中; partial = 沒有解密失敗, 但有白名單聊天室未監聽
+  // (修復 A: 不准再以 chatsChecked 冒充全部正常); failed = 至少一個聊天室的
+  // 近期歷史裡有 decryptFailed 訊息。unmonitoredChats 列出未監聽的白名單室。
   // issues 只列有失敗的聊天室 (依最近失敗時間新到舊), 附失敗數/掃描數/最近失敗時間/寄件者名稱。
   decryptSummary() {
     const issues = [];
@@ -940,11 +952,15 @@ export class HelperBot {
       }
     }
     missedIssues.sort((a, b) => String(b.newestMissedAt ?? "").localeCompare(String(a.newestMissedAt ?? "")));
+    const monitor = this.monitorStatus();
     return {
-      state: this.decryptLastScanAt == null ? "unknown" : totalFailed > 0 ? "failed" : "ok",
+      state: this.decryptLastScanAt == null ? "unknown" : totalFailed > 0 ? "failed" : monitor.unmonitored.length > 0 ? "partial" : "ok",
       totalFailed,
       totalScanned,
       chatsChecked: this.decryptByChat.size,
+      // 修復 A: 掃描覆蓋的是哪些室、白名單裡還有誰沒被監聽, 總覽與管理頁據此誠實顯示。
+      whitelistTotal: monitor.total,
+      unmonitoredChats: monitor.unmonitored,
       lastScanAt: this.decryptLastScanAt,
       issues,
       // 現在真的讀不到、需要擋下發送的聊天室 (issue.blocking 的子集); 消費端 (殼/Ubuntu
@@ -959,14 +975,18 @@ export class HelperBot {
   // 只更新記憶體狀態; log 只在「某聊天室由正常變異常」或「全部恢復正常」時寫一筆,
   // 一般週期掃描不刷 log。單一聊天室抓取失敗就保留它上次的紀錄並讓整輪算失敗 (退避),
   // 不把未知洗成正常。回傳本輪的 summary。
+  // 修復 A: 掃描對象 = 白名單 ∪ 即時清單, 不分頻道類型 — 影格缺的社群群也會被掃:
+  // 抓得到就順帶補登該室發言者 (管理員候選名單才會有社群群的身分), 抓不到就記失敗、
+  // 摘要裡以未監聽列出, 不再讓「只掃 2 室」看起來像全部正常。
   async scanDecryptHealthOnce() {
     if (this.decryptScanInFlight) return this.decryptSummary();
-    if (!this.connected || !this.botChats.length) return this.decryptSummary();
+    const scanTargets = [...new Set([...this.whitelistChats(), ...this.botChats])];
+    if (!this.connected || !scanTargets.length) return this.decryptSummary();
     this.decryptScanInFlight = true;
     const wasAlerting = new Set([...this.decryptByChat].filter(([, r]) => r.failed > 0).map(([id]) => id));
     let roundOk = true;
     try {
-      for (const chatId of [...this.botChats]) {
+      for (const chatId of scanTargets) {
         let frame;
         try {
           frame = await this.fetchHistoryPage(chatId);
@@ -1155,8 +1175,11 @@ export class HelperBot {
       return;
     }
     if (frame.type === "auth:state") { if (frame.state) this.lineState = frame.state; return; }
-    // 核心送來的聊天室清單 (機器人連線只會拿到 api.chats 白名單內的): 記下來, 並在連線完成後
-    // 主動對每個聊天室補登近期歷史 (prefetchHistory), 讓引用續答認得離線/重啟前的回答。
+    // 核心送來的聊天室清單 (機器人連線只會拿到 api.chats 白名單「且核心快照有」的):
+    // 記下來, 並在連線完成後主動對每個聊天室補登近期歷史 (prefetchHistory),
+    // 讓引用續答認得離線/重啟前的回答。修復 A: 影格可能缺白名單室 (社群群),
+    // 所以補登對象 = 影格 ∪ 白名單, 缺的室補登失敗會寫 log (不再靜默);
+    // 影格比上次縮水 (有室消失) 也寫 log, 讓「某群突然收不到」有跡可查。
     if (frame.type === "channels") {
       const list = Array.isArray(frame.channels) ? frame.channels : [];
       const ids = list.map((c) => c?.channelId).filter((x) => typeof x === "string" && x);
@@ -1164,8 +1187,12 @@ export class HelperBot {
         if (c?.channelId && typeof c.name === "string" && c.name) this.chatNames.set(c.channelId, c.name);
       }
       if (ids.length) {
+        const removed = this.botChats.filter((id) => !ids.includes(id));
+        if (this.botChats.length && removed.length) {
+          this.logger?.warn("LINE 連線", "以下聊天室不再出現在核心清單，機器人收不到這些聊天室的即時訊息", { removed, names: removed.map((id) => this.chatNames.get(id) ?? "") });
+        }
         this.botChats = ids;
-        void this.prefetchHistory(ids);
+        void this.prefetchHistory([...new Set([...ids, ...this.whitelistChats()])]);
       }
       return;
     }

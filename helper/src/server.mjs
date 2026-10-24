@@ -180,8 +180,9 @@ export function createConsoleServer({ settings, secrets, ai, kb, kbPool, bot, lo
         const r = adminEvents.markSent(body?.id, body?.ok === true, typeof body?.note === "string" ? body.note : "");
         return json(res, r.ok ? 200 : 400, r.ok ? { ok: true, event: r.event } : { ok: false, message: r.errors.join("；") });
       }
-      // 管理員候選名單 (第四階段): 白名單群組近期發言者 + OpenChat 管理員, 供「管理員名單」勾選
-      // 可選 query 參數 chat (修復版6): 有給時只回該聊天室的候選 (供聊天室管理頁勾選本室管理員)
+      // 管理員候選名單 (第四階段): 該室近期發言者 + 該室 OpenChat 管理員, 供管理員勾選。
+      // 必須帶 query 參數 chat (修復版6: 只回該聊天室的候選, 不得混室; 2026-10-25 老吳定案:
+      // 備援聯集已廢除, 不帶 chat 不再回跨室聯集, 直接回白話錯誤)。
       // 可選 query 參數 all=1 (修復版6 擴充, 選人原則「人多的情境先行」): 預設只列近期在該室
       // 發言過的人 + 該室社群管理員; all=1 放寬為曾記錄過的本室發言者全部 + 該室社群管理員。
       // 平台事實 (已查證): 機器人 API 沒有列出群組完整成員名單的接口, all 模式涵蓋的是
@@ -189,6 +190,7 @@ export function createConsoleServer({ settings, secrets, ai, kb, kbPool, bot, lo
       if (req.method === "GET" && path === "/api/admin-candidates") {
         const chat = url.searchParams.get("chat") ?? "";
         const all = url.searchParams.get("all") === "1";
+        if (!chat) return json(res, 400, { ok: false, message: "請先選一個聊天室，管理員只能從該室成員裡選。" });
         const candidates = bot ? await bot.adminCandidates(chat, { all }).catch(() => []) : [];
         return json(res, 200, { ok: true, candidates });
       }

@@ -80,7 +80,8 @@ export function defaultSettings() {
       // chatty = 聒噪模式開關 (預設 false, 修復版5); personaCustom = 人設是否本群自訂
       // (修復版5 起才有此欄位; 舊存檔沒有此欄位 = 視為 true, 與修復版4「有條目即自訂」相同)。
       // chatty 與 personaCustom 互相獨立: 只開聒噪的群人設照舊跟全域走, 不被迫自訂。
-      // admins = 本聊天室自己的管理員 [{id,name}] (修復版6); 舊存檔沒有此欄位 = 預設 [] (用全域管理員)。
+      // admins = 本聊天室自己的管理員, 只存 ID [{id}] (2026-10-25 老吳定案: 記 ID 不記名字);
+    // 舊存檔沒有此欄位 = 預設 [] = 沒設管理員 (事件不 @ 任何人, 只寫紀錄)。
       chatProfiles: {},
     },
     scam: {
@@ -90,8 +91,11 @@ export function defaultSettings() {
       jev: { enabled: false, model: "jev-1.13.0" },
     },
     kb: { folder: "" },
-    // 管理員通知 (非機密, publicView 明文回傳): admins=[{id,name}] 由畫面勾選產生、不手打代號;
-    // rules=[{id,kind,keyword,notifyAdminIds,enabled}], kind 見 adminnotify.mjs 的 NOTIFY_EVENT_KINDS
+    // 管理員通知 (非機密, publicView 明文回傳): rules=[{id,kind,keyword,notifyAdminIds,enabled}],
+    // kind 見 adminnotify.mjs 的 NOTIFY_EVENT_KINDS。收件人只有該聊天室自己的管理員
+    // (2026-10-25 老吳定案: 備援已廢除, 未設管理員的室不 @ 任何人、只寫紀錄)。
+    // notify.admins 是舊版全域備援名單的存檔殘留: 值留置不動 (不擅自刪使用者資料),
+    // 但發送解析不再讀它; notifyAdminIds 同樣僅儲存相容保留。
     notify: { admins: [], rules: [] },
     log: { debug: false, retentionDays: 14 },
   };
@@ -102,6 +106,9 @@ export const CHAT_ID_RE = /^[ucrsm][0-9a-f]{32}$/;
 // 本聊天室管理員名單正規化 (修復版6): id 須為字串且符合格式, name 為字串修剪後上限 100 字 (可空字串);
 // 同 id 去重、上限 20 筆; 形狀不符的筆 silently 丟棄 (比照既有欄位作法)。非陣列一律回 []。
 export const CHAT_ADMIN_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+// 本室管理員只存 ID (2026-10-25 老吳定案: 記 ID 不記名字):
+// 舊存檔裡的名字快照一律丟掉, 顯示名由 bot 每次從該室最新發言資料即時解析
+// (改名後顯示自動跟著變、通知對象不變); 比對只認 ID, 絕不用名字認人。
 export function normalizeChatAdmins(admins) {
   if (!Array.isArray(admins)) return [];
   const seen = new Set();
@@ -109,10 +116,9 @@ export function normalizeChatAdmins(admins) {
   for (const a of admins) {
     if (!a || typeof a !== "object" || Array.isArray(a)) continue;
     if (typeof a.id !== "string" || !CHAT_ADMIN_ID_RE.test(a.id)) continue;
-    if (typeof a.name !== "string") continue;
     if (seen.has(a.id)) continue;
     seen.add(a.id);
-    out.push({ id: a.id, name: a.name.trim().slice(0, 100) });
+    out.push({ id: a.id });
     if (out.length >= 20) break;
   }
   return out;

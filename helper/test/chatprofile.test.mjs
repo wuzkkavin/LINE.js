@@ -173,13 +173,14 @@ test("getChatAdmins (修復版6): 無條目/停用/非陣列回空, personaCusto
   assert.deepEqual(getChatAdmins(s, CHAT_A), []);
   // personaCustom=false (只設管理員的條目) 仍讀得到管理員, 且人設解析仍走全域 (admins-only 不影響人設)
   s.ai.chatProfiles[CHAT_A] = { rolePrompt: "", scopePrompt: "", kbEnabled: true, kbFolder: "", suspended: false, chatty: false, personaCustom: false, admins: [{ id: "u-chat1", name: "本室管理員甲" }, { id: "u-chat2", name: "" }] };
-  assert.deepEqual(getChatAdmins(s, CHAT_A), [{ id: "u-chat1", name: "本室管理員甲" }, { id: "u-chat2", name: "" }]);
+  // 2026-10-25 定案: 只存 ID, 名字快照一律丟掉 (顯示名由 bot 從該室最新發言資料即時解析)。
+  assert.deepEqual(getChatAdmins(s, CHAT_A), [{ id: "u-chat1" }, { id: "u-chat2" }]);
   assert.equal(resolveChatSettings(s, CHAT_A).source, "global", "admins-only 條目 (personaCustom=false) 人設仍應走全域");
   assert.equal(getChatProfile(s, CHAT_A), null);
   // suspended -> []
   s.ai.chatProfiles[CHAT_B] = { suspended: true, admins: [{ id: "u-x", name: "停用管理員" }] };
   assert.deepEqual(getChatAdmins(s, CHAT_B), [], "suspended 的條目管理員應回空");
-  // 形狀正規化: 無效 id/非字串 name 丟棄、同 id 去重、name 修剪並截斷 100 字
+  // 形狀正規化 (2026-10-25 定案: 只存 ID): 無效 id 丟棄、同 id 去重、名字一律不留
   s.ai.chatProfiles[CHAT_C] = { suspended: false, admins: [
     { id: "u-ok", name: "  阿明  " },
     { id: "u-ok", name: "重複應被去重" },
@@ -191,9 +192,8 @@ test("getChatAdmins (修復版6): 無條目/停用/非陣列回空, personaCusto
     null,
   ] };
   const normalized = getChatAdmins(s, CHAT_C);
-  assert.deepEqual(normalized.map((a) => a.id), ["u-ok", "u-long"]);
-  assert.equal(normalized[0].name, "阿明");
-  assert.equal(normalized[1].name.length, 100);
+  assert.deepEqual(normalized.map((a) => a.id), ["u-ok", "u-noname", "u-long"]);
+  assert.ok(normalized.every((a) => !("name" in a)), "正規化後不得留名字快照");
   // 上限 20 筆
   const many = { ai: { chatProfiles: { [CHAT_A]: { suspended: false, admins: Array.from({ length: 25 }, (_, i) => ({ id: `u-${i}`, name: `管理員${i}` })) } } } };
   assert.equal(getChatAdmins(many, CHAT_A).length, 20, "管理員上限 20 筆");
@@ -205,8 +205,9 @@ test("SettingsStore: chatProfiles admins 存讀正規化來回一致", async () 
   const store = new SettingsStore({ path });
   store.update({ ai: { chatProfiles: { [CHAT_B]: { admins: [{ id: "u-b1", name: " 乙群管理員 " }, { id: "u-b1", name: "重複" }, { id: "bad!", name: "丟棄" }] } } } });
   const store2 = new SettingsStore({ path });
-  assert.deepEqual(store2.get().ai.chatProfiles[CHAT_B].admins, [{ id: "u-b1", name: "乙群管理員" }]);
-  assert.deepEqual(getChatAdmins(store2.get(), CHAT_B), [{ id: "u-b1", name: "乙群管理員" }]);
+  // 2026-10-25 定案: 存讀來回只留 ID。
+  assert.deepEqual(store2.get().ai.chatProfiles[CHAT_B].admins, [{ id: "u-b1" }]);
+  assert.deepEqual(getChatAdmins(store2.get(), CHAT_B), [{ id: "u-b1" }]);
 });
 
 test("CONFIDENTIALITY_RULE: 四類不可透露 + 套話應對齊備", () => {

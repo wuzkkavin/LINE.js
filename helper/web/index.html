@@ -115,7 +115,7 @@ a.btn { text-decoration: none; }
 
   <section class="card">
     <h2>機器人聊天情況</h2>
-    <div class="hint">這裡看得到 AI寶 最近在各聊天室做了什麼：回答了什麼、婉拒了什麼、有沒有發出防詐騙警告。紀錄只保留最近 50 筆，重新開啟程式後會清空。</div>
+    <div class="hint">最近在各聊天室做了什麼都在這裡，紀錄只留最近 50 筆。</div>
     <label for="activityChatFilter">顯示群組</label>
     <select id="activityChatFilter"><option value="">全部群組</option></select>
     <div class="hint" id="activityFilterNote" style="display:none"></div>
@@ -125,13 +125,13 @@ a.btn { text-decoration: none; }
 
   <section class="card">
     <h2>LINE 連接設定 (照著四步做)</h2>
-    <div class="hint">第一次使用要完成這四步, AI寶 才能進群組回答問題。一步一步來, 做完一步再做下一步。</div>
+    <div class="hint">第一次使用照著四步做，AI寶 才能進群組回答問題。</div>
     <h3>步驟一: 用次要帳號登入 LINE</h3>
-    <div class="hint">打開核心登入頁, 用手機 LINE 掃畫面上的 QR 碼, 再輸入畫面上的 PIN 碼。<strong>一定要用次要帳號登入, 不要用主帳號。</strong></div>
-    <div class="hint">什麼時候要登出再重新登入? 如果機器人突然讀不到某位同事的訊息 (例如群組有人加入或離開之後), 那是 LINE 換了讀訊息的鑰匙、跟這台電腦對不上。請在核心登入頁先登出、再重新掃 QR 登入, 讓鑰匙重新對齊; 若還是讀不到, 下一步是把機器人移出該群組、再重新邀請它加入 (重新入群會重新分發鑰匙)。重新啟動程式修不好這個問題。</div>
+    <div class="hint">打開核心登入頁，用手機 LINE 掃 QR 碼、輸入 PIN 碼。<strong>一定要用次要帳號登入，不要用主帳號。</strong></div>
+    <div class="hint">如果機器人突然讀不到某位同事的訊息，請先在登入頁登出再重新掃碼登入。</div>
     <div style="margin-top:8px"><a class="btn" href="http://127.0.0.1:3789/" target="_blank" rel="noopener"><button type="button">開啟核心登入頁</button></a></div>
     <h3>步驟二: 把機器人加入群組, 並把群組加入白名單</h3>
-    <div class="hint">先在手機 LINE 把剛登入的次要帳號邀請進要使用 AI寶 的群組。然後回來按「讀取我的群組清單」, 群組會自己列出來, 用點的加入白名單就好, 不用自己找代號。</div>
+    <div class="hint">先把次要帳號邀請進群組，再按「讀取我的群組清單」，用點的加入白名單就好。</div>
     <div style="margin-top:8px"><button type="button" class="ghost" id="btnLoadChats">讀取我的群組清單</button><span class="test-result" id="chatsMsg"></span></div>
     <div id="chatList" style="margin-top:8px"></div>
     <details style="margin-top:10px">
@@ -143,9 +143,9 @@ a.btn { text-decoration: none; }
     </details>
     <div class="hint" id="lineCfgState">白名單狀態讀取中…</div>
     <div id="wlList" style="margin-top:8px"></div>
-    <div class="hint">白名單改好之後, 要把 AI寶 <strong>完全關閉再重新開啟</strong>才會生效; 重開後再繼續步驟三。</div>
+    <div class="hint">白名單改好後要完全關閉再重新開啟才生效。</div>
     <h3>步驟三: 取得機器人 Token</h3>
-    <div class="hint">Token 是機器人連上核心的鑰匙。打包版直接按「自動產生 Token」, 產生後會自動儲存、自動重新連線, 不用再貼一次。手邊已有 Token 的話, 貼到欄位按「儲存 Token」也可以。</div>
+    <div class="hint">打包版直接按「自動產生 Token」，產生後會自動儲存並重新連線。</div>
     <label for="lineKey">機器人 Token</label>
     <input type="password" id="lineKey" placeholder="尚未設定" autocomplete="off">
     <div class="hint" id="lineKeyState"></div>
@@ -154,21 +154,22 @@ a.btn { text-decoration: none; }
       <button type="button" class="ghost" id="btnGenToken">自動產生 Token</button>
       <span class="test-result" id="lineTokenMsg"></span>
     </div>
-    <div class="hint">注意: 重新產生 Token 會讓舊 Token 立刻失效; 用「自動產生」會一併把新 Token 存好, 不會弄丟。</div>
+    <div class="hint">重新產生 Token 會讓舊 Token 立刻失效。</div>
     <h3>步驟四: 確認連線成功</h3>
-    <div class="hint">看本頁最上方的「LINE 連線狀態」卡片變成「已連線」就完成了。之後在群組裡打「AI寶, 你的問題?」就會回答。</div>
+    <div class="hint">看最上方的狀態卡變成「已連線」就完成了。</div>
     <div style="margin-top:8px"><button type="button" class="ghost" id="btnRefreshTop">重新整理狀態</button></div>
   </section>
 
   <section class="card">
     <h2>聊天室管理</h2>
-    <div class="hint">每個聊天室自己的設定都集中在這裡改：先選一個聊天室，再改它的角色定位、回答範圍、知識庫、聒噪模式跟管理員。全控制台只有這裡可以改各聊天室的設定。</div>
+    <div class="hint">先點一個聊天室，再改它的五區設定。</div>
     <label for="cmChatSearch">選擇聊天室（群很多時先搜尋，每列有設定狀態摘要）</label>
     <input type="text" id="cmChatSearch" placeholder="打群名關鍵字篩選…" autocomplete="off">
     <div id="cmChatList"></div>
     <select id="cmChatSelect" style="display:none"></select>
-    <div class="hint" id="cmEmpty">目前還沒有可以管理的聊天室：先完成上面步驟二，把群組加入白名單，這裡就會出現。</div>
+    <div class="hint" id="cmEmpty">目前還沒有可以管理的聊天室：先把群組加入白名單，這裡就會出現。</div>
     <div id="cmEditor" style="display:none">
+      <h3 id="cmEditingTitle">正在設定：</h3>
       <div style="margin-top:12px"><span class="pill" id="cmSourcePill">目前用全域預設</span></div>
       <div class="hint" id="cmSuspendedBanner" style="display:none">
         <span>這個聊天室之前有一份自訂設定，目前停用中。</span>
@@ -178,24 +179,25 @@ a.btn { text-decoration: none; }
       <label class="checkline"><input type="radio" name="cm-mode" id="cmModeDefault" value="default"> 使用全域預設</label>
       <label class="checkline"><input type="radio" name="cm-mode" id="cmModeCustom" value="custom"> 本聊天室自訂</label>
       <div id="cmCustomBox">
-        <div class="hint">這個聊天室用自己的設定，全域預設在這個聊天室不生效，也不會合併。</div>
+        <div class="hint">選「本聊天室自訂」才改這裡；用全域預設時跟著全域走。</div>
         <label for="cmRole">角色定位</label>
         <textarea id="cmRole" style="min-height:64px"></textarea>
         <label for="cmScope">回答範圍</label>
         <textarea id="cmScope"></textarea>
-        <div class="hint">清空這個欄位＝這個聊天室不限制回答範圍。</div>
-        <label class="checkline"><input type="checkbox" id="cmKbEnabled"> 這個聊天室可以讀知識庫</label>
-        <label for="cmKbFolder">知識庫資料夾（這個聊天室專屬）</label>
-        <input type="text" id="cmKbFolder" autocomplete="off">
-        <div class="hint">留空＝用全域知識庫資料夾。關閉知識庫後，這個聊天室問公司問題時不會查知識庫，也不會因為查不到資料而通知管理員；AI 會依一般知識回答，不知道會誠實說不知道。</div>
-        <div class="hint" id="cmKbStatus" style="display:none"></div>
+        <div class="hint">清空＝這個聊天室不限制回答範圍。</div>
       </div>
+      <h3>知識庫</h3>
+      <div class="hint">留空＝用全域知識庫資料夾；關掉後這個聊天室不查知識庫。</div>
+      <label class="checkline"><input type="checkbox" id="cmKbEnabled"> 這個聊天室可以讀知識庫</label>
+      <label for="cmKbFolder">知識庫資料夾（這個聊天室專屬）</label>
+      <input type="text" id="cmKbFolder" autocomplete="off">
+      <div class="hint" id="cmKbStatus" style="display:none"></div>
+      <h3>聒噪</h3>
+      <div class="hint">不用叫名字也會自己找話題接話；觸發是全域規則、聒噪是各室開關，同一則不會回兩次。</div>
       <label class="checkline"><input type="checkbox" id="cmChatty"> 聒噪模式：不用叫名字，我也會自己找話題接話</label>
-      <div class="hint">打開後，我會看著這個聊天室最近的對話，自己判斷有沒有自然合適的話可以接；沒有合適的話就保持安靜，不會每則都回。打開後 AI 用量會增加。叫名字或引用問我時，還是照平常方式優先回答；別的聊天室的事、個人資料跟公司機密，我一樣不會說出去。</div>
       <h3>本聊天室管理員</h3>
-      <div class="hint">先列這個聊天室最近說過話的人與社群管理員，可以打名字搜尋；勾好的人會固定排在最上方。未設定時用備援管理員（在下面「一般與觸發」區設定）。這裡的管理員只是「通知對象」：有重要事件時，AI寶 會在群組裡 @ 他們出面處理；AI寶 本身不會踢人或處分任何人。</div>
+      <div class="hint">勾這個聊天室出事時要 @ 出來處理的人。</div>
       <div id="cmAdminsList"><div class="hint">候選名單讀取中…</div></div>
-      <div style="margin-top:14px"><button type="button" id="btnSaveCmProfile">儲存本聊天室設定</button><span class="test-result" id="cmSaveMsg"></span></div>
     </div>
     <div id="cmOrphanBox" style="margin-top:10px"></div>
   </section>
@@ -206,7 +208,7 @@ a.btn { text-decoration: none; }
       <div>
         <label for="botName">機器人名字 (主名)</label>
         <input type="text" id="botName" placeholder="範例:AI寶">
-        <div class="hint">名字由你自訂: 同事在群組打到這個名字, 我就會回應。改名不用改程式, 儲存後馬上生效。</div>
+        <div class="hint">名字由你自訂：同事在群組打到這個名字，我就會回應。</div>
       </div>
       <div>
         <label for="aliases">其他叫法 (別名, 可多個, 用逗號分開)</label>
@@ -234,21 +236,21 @@ a.btn { text-decoration: none; }
       <div>
         <label for="perUserChatMinuteLimit">每人每群／60 秒上限 (次)</label>
         <input type="number" id="perUserChatMinuteLimit" min="0" max="1000">
-        <div class="hint">同一個人在同一個聊天室，任意連續 60 秒內最多問 AI 幾次。填 0 表示不限制。</div>
+        <div class="hint">同一個人在同一個聊天室 60 秒內最多問幾次，填 0 表示不限制。</div>
       </div>
       <div>
         <label for="allChatsMinuteLimit">所有群合計／60 秒上限 (次)</label>
         <input type="number" id="allChatsMinuteLimit" min="0" max="1000">
-        <div class="hint">所有允許的聊天室加起來，任意連續 60 秒內最多問幾次；用滿後，其他群的人也要等有空額才能問。填 0 表示不限制。</div>
+        <div class="hint">所有聊天室加起來 60 秒內最多問幾次，填 0 表示不限制。</div>
       </div>
     </div>
-    <div class="hint">上面兩個 60 秒上限只算真正送出的提問：只叫名字打招呼不算，AI 當次回答失敗也算一次。次數在服務重啟後會清零。</div>
+    <div class="hint">只算真正送出的提問，服務重啟後清零。</div>
     <label for="lineApiUrl">LINE 核心連線位置 (進階, 通常不用改)</label>
     <input type="text" id="lineApiUrl">
     <h3>關於 AI寶 自己的事</h3>
     <div class="hint">有人問 AI寶 是誰做的、問到版權，或問 AI寶 是用什麼技術做成的時候，AI寶 會委婉拒答（機敏資訊不透露）。</div>
     <h3>機器人人設</h3>
-    <div class="hint">填了才算數: 同事問我的年紀、生日、星座、性別、三圍、興趣、婚姻狀態或自我介紹時, 我只會照這裡填的回答; 沒填的欄位我會老實說「這部分我還沒有設定」, 不會自己編。年紀不用填, 我會用出生日自己算。</div>
+    <div class="hint">填了才算數，沒填的欄位我會老實說還沒設定。</div>
     <div class="row">
       <div>
         <label for="personaBirthdate">出生日 (西元年-月-日, 範例:2000-10-21)</label>
@@ -281,27 +283,34 @@ a.btn { text-decoration: none; }
     </div>
     <label for="personaIntro">自我介紹</label>
     <input type="text" id="personaIntro" autocomplete="off">
-    <h3>備援管理員（聊天室未設管理員時用）</h3>
-    <div class="hint">每個聊天室可以在「聊天室管理」區設定自己的管理員；該聊天室有自己的管理員時，重要事件只通知該室管理員。這裡勾的是備援名單：聊天室沒有自己的管理員時，才通知這裡的人。候選名單來自各聊天室最近說過話的人與社群管理員；勾好後按最下方「儲存全部設定」就會生效。</div>
-    <div id="notifyAdminsList"><div class="hint">候選名單讀取中…</div></div>
+    <h3>通知事件</h3>
+    <div class="hint">通知收件人是「該聊天室管理員」；同一種事情 10 分鐘內最多通知一次、每天最多 20 次。</div>
   </section>
 
   <section class="card">
     <h2>AI 供應商</h2>
-    <div class="hint">三家都填了 Key 也可以, 用哪一家由下面的單選決定。Key 只存在這台電腦的機密存放區, 不會寫進設定檔, 也不會顯示出來 (只看得到末 4 碼)。</div>
+    <div class="hint">用哪一家由單選決定，Key 只存在這台電腦、不會顯示出來。</div>
     <div id="providers"></div>
     <label class="checkline"><input type="checkbox" id="aiFallback"> 啟用自動備援 (使用中的 AI 失敗時, 自動改用下一家)</label>
     <h3>機器人定位與範圍</h3>
     <div style="margin-top:6px"><span class="pill">全域的預設設定</span></div>
-    <div class="hint">各聊天室自己的設定請到「聊天室管理」區修改；已有本聊天室自訂的聊天室不會用這份，也不會合併。</div>
+    <div class="hint">已有本聊天室自訂的聊天室不會用這份，也不會合併。</div>
     <label for="rolePrompt">角色定位</label>
     <textarea id="rolePrompt" style="min-height:64px"></textarea>
-    <div class="hint">清空後儲存，會自動回復成出廠預設的角色定位。例：也可以改成「你是華葳集成的資訊小老師，專門陪同事學電腦」這類你想要的身分描述。</div>
+    <div class="hint">清空後儲存會回到出廠預設的角色定位。</div>
     <label for="scopePrompt">回答範圍</label>
     <textarea id="scopePrompt"></textarea>
-    <div class="hint">清空這個欄位＝不限制範圍，什麼問題都回答。例：也可以改成「離題問題只簡短回答一句，並提醒對方你主要負責電腦學習協助」這類比較寬鬆的寫法。</div>
+    <div class="hint">清空＝不限制範圍，什麼問題都回答。</div>
     <label for="systemPrompt">回答規則 (系統提示詞)</label>
     <textarea id="systemPrompt"></textarea>
+    <h3>知識庫（全域預設）</h3>
+    <div class="hint">這是全域預設：沒自訂的聊天室都用這個資料夾。</div>
+    <label for="kbFolder">知識庫資料夾（只讀取，不會修改裡面的檔案；內容請先脫敏）</label>
+    <input type="text" id="kbFolder" placeholder="範例:D:/公司知識庫">
+    <label class="checkline"><input type="checkbox" id="showSources"> 回答時附上參考來源（在回答最後註明知識庫來源檔名；預設關閉）</label>
+    <div class="hint" id="kbStatus">尚未讀取狀態</div>
+    <div style="margin-top:12px"><button type="button" class="ghost" id="btnKb">立即重新整理知識庫</button><span class="test-result" id="kbMsg"></span></div>
+    <div class="hint">只讀取 .txt、.md、.csv，查不到會明說，不會亂編。</div>
   </section>
 
   <section class="card">
@@ -318,7 +327,7 @@ a.btn { text-decoration: none; }
       </div>
     </div>
     <h3>TypeSafe Jev (選用, 預設停用)</h3>
-    <div class="hint">原作者的詐騙分析選項。每次判讀依 TypeSafe 計費; 未填 Key 前不會啟用。</div>
+    <div class="hint">選用的詐騙分析服務，沒填 Key 就不會啟用。</div>
     <div class="row">
       <div>
         <label for="jevKey">Jev API Key</label>
@@ -334,18 +343,8 @@ a.btn { text-decoration: none; }
   </section>
 
   <section class="card">
-    <h2>知識庫</h2>
-    <label for="kbFolder">知識庫資料夾 (只讀取, 不會修改裡面的檔案; 內容請先脫敏)</label>
-    <input type="text" id="kbFolder" placeholder="範例:D:/公司知識庫">
-    <label class="checkline"><input type="checkbox" id="showSources"> 回答時附上參考來源 (在回答最後註明知識庫來源檔名; 預設關閉)</label>
-    <div class="hint" id="kbStatus">尚未讀取狀態</div>
-    <div style="margin-top:12px"><button type="button" class="ghost" id="btnKb">立即重新整理知識庫</button><span class="test-result" id="kbMsg"></span></div>
-    <div class="hint">第一版支援 .txt、.md、.csv。同事問公司資訊時會先查知識庫, 回答時會註明來源檔名; 查不到會明說, 不會亂編。</div>
-  </section>
-
-  <section class="card">
     <h2>Log 與診斷包</h2>
-    <div class="hint">Log 只存在這台電腦的使用者資料夾, 不記 API Key、不記訊息全文。出問題時下載診斷包傳給維護人員, 就能查到是哪一步出問題。</div>
+    <div class="hint">Log 只存在這台電腦，不記 Key 與訊息全文。</div>
     <label class="checkline"><input type="checkbox" id="logDebug"> 除錯模式 (會記錄問題全文, 查完問題請關掉)</label>
     <div class="row">
       <div>
@@ -369,9 +368,7 @@ a.btn { text-decoration: none; }
       ©Copyright 2026 By 吳治綱
     </div>
     <div class="hint" style="font-size:13.5px; line-height:1.8">
-      本頁的版權宣告是針對本客製版本 (helper 伴隨模組)。<br>
-      上游出處: 原始專案 <strong>JS-PACKAGE/LINE.js</strong> (授權: Apache License 2.0), 核心函式庫 <strong>@evex/linejs</strong> (evex-dev)。上游著作權與授權標示完整保留, 詳見 Repo 根目錄 LICENSE 與 helper/README.md。<br>
-      本頁圖示 (AI寶 icon) 由吳治綱提供; 字體 jf open 粉圓依 SIL Open Font License 1.1 使用。
+      上游出處：原始專案 <strong>JS-PACKAGE/LINE.js</strong>（授權：Apache License 2.0），核心函式庫 <strong>@evex/linejs</strong>；圖示與字體授權詳見 Repo 說明。
     </div>
   </section>
 
@@ -382,7 +379,7 @@ a.btn { text-decoration: none; }
 </main>
 <div class="savebar">
   <button type="button" id="btnSave">儲存全部設定</button>
-  <span id="saveMsg"></span>
+  <span id="saveMsg">已儲存</span>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -394,7 +391,8 @@ let chatProfilesGlobalRole = "";
 let chatProfilesGlobalScope = "";
 let kbChatsState = {};
 let currentWhitelistChats = [];
-let notifyAdminsState = [];
+let monitorState = null; // 修復 A: /api/status 的 bot.monitor, 管理頁每室顯示監聽中/未監聽
+let notifyAdminsStored = []; // 舊版備援名單存檔值: 只留置直通、畫面不再編輯、發送不再讀它 (2026-10-25 定案)
 let notifyRulesState = [];
 let activityFilterChatId = "";
 let cmCurrentChatId = "";
@@ -403,6 +401,8 @@ let cmEditorSuspended = false;
 let cmMarkedDelete = false;
 let cmAdminsSelected = [];
 function deepCloneObj(v) { return JSON.parse(JSON.stringify(v || {})); }
+// 已選管理員只存 ID (2026-10-25 定案: 記 ID 不記名字): 顯示名一律取候選名單的即時名字,
+// 候選名單裡沒有的 (沒說過話、改名後舊名單對不上) 顯示 ID, 不拿舊快照充數。
 function normalizeAdmins(list) {
   const out = [];
   const seen = new Set();
@@ -410,12 +410,12 @@ function normalizeAdmins(list) {
     const id = typeof a?.id === "string" ? a.id : "";
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    out.push({ id, name: typeof a?.name === "string" ? a.name : "" });
+    out.push({ id });
   }
   return out;
 }
 function adminsKey(list) {
-  return normalizeAdmins(list).map((a) => a.id + "|" + a.name).sort().join(";");
+  return normalizeAdmins(list).map((a) => a.id).sort().join(";");
 }
 function unnamedChatLabel(id) {
   const tail = String(id || "").slice(-4);
@@ -448,7 +448,7 @@ function providerCard(p) {
         <select id="model-${p.id}"></select>
         <input type="text" id="modelmanual-${p.id}" placeholder="模型代號 (進階手動輸入)" autocomplete="off" style="display:none; margin-top:6px">
         <div style="margin-top:8px"><button type="button" class="ghost" id="models-${p.id}">取得可用模型</button><span class="test-result" id="modelsres-${p.id}"></span></div>
-        <div class="hint">先貼上 Key, 按「取得可用模型」, 再從選單挑一個; 選好記得按最下方「儲存全部設定」。</div>
+        <div class="hint">先貼上 Key，按「取得可用模型」，再從選單挑一個，選好記得按下方儲存列儲存。</div>
       </div>
       <div><label>Base URL</label><input type="text" id="base-${p.id}"></div>
     </div>
@@ -476,7 +476,7 @@ async function loadAll() {
   $("perUserChatMinuteLimit").value = s.perUserChatMinuteLimit ?? 3;
   $("allChatsMinuteLimit").value = s.allChatsMinuteLimit ?? 10;
   $("lineApiUrl").value = s.lineApiUrl;
-  notifyAdminsState = normalizeAdmins(s.notify && s.notify.admins ? s.notify.admins : []);
+  notifyAdminsStored = deepCloneObj(s.notify && s.notify.admins ? s.notify.admins : []);
   notifyRulesState = deepCloneObj(s.notify && Array.isArray(s.notify.rules) ? s.notify.rules : []);
   const persona = s.persona || {};
   $("personaBirthdate").value = persona.birthdate || "";
@@ -505,7 +505,6 @@ async function loadAll() {
   $("lineKeyState").textContent = s.line?.set ? `已設定 (末 4 碼 ${s.line.last4}), 要更換直接在左邊欄位輸入新 Token 按儲存` : "尚未設定, 請先完成步驟一、二, 再回來產生 Token";
   loadLineCfg();
   loadActivity();
-  loadNotifyAdmins();
   $("aiFallback").checked = !!s.ai.fallback;
   $("rolePrompt").value = s.ai.rolePrompt || "";
   $("scopePrompt").value = s.ai.scopePrompt || "";
@@ -520,6 +519,7 @@ async function loadAll() {
   $("logDebug").checked = !!s.log.debug;
   $("logRetention").value = s.log.retentionDays || 14;
   const b = status.bot || {};
+  monitorState = b.monitor || null;
   // 帳號登入 (核心 session) 與機器人連線 (bot WS) 是兩件事, 分開顯示:
   // 換 Token 被踢線時就是「登入還在、機器人斷線」, 混在一起看不出來 (2026-10-20 實機)。
   const lineOn = !!b.selfName || b.lineState === "已登入";
@@ -638,12 +638,15 @@ function chatManageEntries() {
 // 管理員與知識庫狀態, 不用逐群點開。資料看 chatProfilesState (編輯中的工作副本)。
 function cmProfileSummary(id) {
   const p = (typeof chatProfilesState !== "undefined" && chatProfilesState[id]) || null;
-  if (!p) return "全域預設・聒噪關・未設管理員・知識庫開";
+  // 修復 A: 每室監聽狀態 (白名單 vs 即時清單對照): 有資料才標, 沒資料不亂標。
+  const monitor = monitorState && Array.isArray(monitorState.unmonitored) && monitorState.unmonitored.some((u) => u.chatId === id) ? "・未監聽"
+    : (monitorState && Array.isArray(monitorState.monitored) && monitorState.monitored.includes(id) ? "・監聽中" : "");
+  if (!p) return "全域預設・聒噪關・未設管理員・知識庫開" + monitor;
   const source = p.suspended ? "已停用待確認" : (p.personaCustom ? "本聊天室自訂" : "全域預設");
   const chatty = p.chatty ? "聒噪開" : "聒噪關";
   const admins = Array.isArray(p.admins) && p.admins.length ? "管理員 " + p.admins.length + " 位" : "未設管理員";
   const kb = p.kbEnabled === false ? "知識庫關" : "知識庫開";
-  return source + "・" + chatty + "・" + admins + "・" + kb;
+  return source + "・" + chatty + "・" + admins + "・" + kb + monitor;
 }
 function renderCmChatList(entries) {
   const box = $("cmChatList");
@@ -713,6 +716,9 @@ function updateCmSourcePill() {
 }
 function syncCmMode() {
   $("cmCustomBox").style.display = $("cmModeCustom").checked ? "" : "none";
+  // 知識庫專屬欄位只在自訂模式能改 (預設模式跟著全域走, 存檔本來就會強制回全域預設值)
+  const kbOff = !$("cmModeCustom").checked;
+  $("cmKbEnabled").disabled = kbOff; $("cmKbFolder").disabled = kbOff;
   updateCmSourcePill();
 }
 function renderCmEditor() {
@@ -740,7 +746,8 @@ function renderCmEditor() {
     kbStatus.style.display = "";
     kbStatus.textContent = kbInfo.scanning ? "這個聊天室的知識庫狀態：整理中" : "這個聊天室的知識庫狀態：" + (kbInfo.files ?? 0) + " 個檔案、" + (kbInfo.chunks ?? 0) + " 段";
   } else kbStatus.style.display = "none";
-  $("cmSaveMsg").textContent = "";
+  const cmEntry = chatManageEntries().find((e) => e.id === chatId);
+  $("cmEditingTitle").textContent = "正在設定：" + (cmEntry ? cmEntry.label : chatId);
   syncCmMode();
   loadCmAdmins(chatId);
 }
@@ -773,8 +780,6 @@ function adminCandidateRow(candidate, selectedList, onToggle) {
 // 上方有搜尋框可打名字即時篩選; 人多的群組不用從整份名單一個個找。
 let cmAdminCandidates = new Map();
 let cmAdminFilter = "";
-let notifyAdminCandidates = new Map();
-let notifyAdminFilter = "";
 function renderAdminPicker(box, opts) {
   box.innerHTML = "";
   const selected = opts.getSelected();
@@ -852,13 +857,13 @@ async function loadCmAdmins(chatId, wide = false) {
   if (cmCurrentChatId !== chatId) return;
   const byId = new Map();
   for (const c of candidates || []) { if (c && c.id) byId.set(c.id, { id: c.id, name: c.name || "", chats: c.chats || [], source: c.source || "" }); }
-  for (const a of cmAdminsSelected) { if (!byId.has(a.id)) byId.set(a.id, { id: a.id, name: a.name || "", chats: [], source: "", retained: true }); }
+  for (const a of cmAdminsSelected) { if (!byId.has(a.id)) byId.set(a.id, { id: a.id, name: a.id, chats: [], source: "", retained: true }); }
   cmAdminCandidates = byId;
   if (!byId.size) {
     box.innerHTML = "";
     const d = document.createElement("div");
     d.className = "hint";
-    d.textContent = "目前還沒有候選名單：等這個聊天室有人說過話，這裡就會出現可以勾選的人。在那之前，重要事件會通知備援管理員。";
+    d.textContent = "目前還沒有候選名單：等這個聊天室有人說過話，這裡就會出現可以勾選的人。";
     box.appendChild(d);
     return;
   }
@@ -868,7 +873,7 @@ async function loadCmAdmins(chatId, wide = false) {
     getFilter: () => cmAdminFilter,
     setFilter: (v) => { cmAdminFilter = v; },
     onToggle: (c, on) => {
-      if (on) { if (!cmAdminsSelected.some((a) => a.id === c.id)) cmAdminsSelected.push({ id: c.id, name: c.name || "" }); }
+      if (on) { if (!cmAdminsSelected.some((a) => a.id === c.id)) cmAdminsSelected.push({ id: c.id }); }
       else cmAdminsSelected = cmAdminsSelected.filter((a) => a.id !== c.id);
       loadCmAdminsRenderOnly(chatId, wide);
     },
@@ -885,46 +890,13 @@ function loadCmAdminsRenderOnly(chatId, wide) {
     getFilter: () => cmAdminFilter,
     setFilter: (v) => { cmAdminFilter = v; },
     onToggle: (c, on) => {
-      if (on) { if (!cmAdminsSelected.some((a) => a.id === c.id)) cmAdminsSelected.push({ id: c.id, name: c.name || "" }); }
+      if (on) { if (!cmAdminsSelected.some((a) => a.id === c.id)) cmAdminsSelected.push({ id: c.id }); }
       else cmAdminsSelected = cmAdminsSelected.filter((a) => a.id !== c.id);
       loadCmAdminsRenderOnly(chatId, wide);
     },
     note: wide ? "這份是比較完整的名單：曾在這個聊天室出現過的人與社群管理員。LINE 沒有提供完整成員名單，從未出現過的人無法列出。" : "",
     onWiden: wide ? null : () => loadCmAdmins(chatId, true),
   });
-}
-async function loadNotifyAdmins() {
-  const box = $("notifyAdminsList");
-  if (!box) return;
-  let candidates = [];
-  try {
-    const r = await (await fetch("/api/admin-candidates")).json();
-    candidates = Array.isArray(r) ? r : (r.candidates || []);
-  } catch { candidates = []; }
-  const byId = new Map();
-  for (const c of candidates || []) { if (c && c.id) byId.set(c.id, { id: c.id, name: c.name || "", chats: c.chats || [], source: c.source || "" }); }
-  for (const a of notifyAdminsState) { if (!byId.has(a.id)) byId.set(a.id, { id: a.id, name: a.name || "", chats: [], source: "", retained: true }); }
-  notifyAdminCandidates = byId;
-  if (!byId.size) {
-    box.innerHTML = "";
-    const d = document.createElement("div");
-    d.className = "hint";
-    d.textContent = "目前還沒有候選名單：等群組裡有人說過話，這裡就會出現可以勾選的人。";
-    box.appendChild(d);
-    return;
-  }
-  const render = () => renderAdminPicker(box, {
-    candidates: notifyAdminCandidates,
-    getSelected: () => notifyAdminsState,
-    getFilter: () => notifyAdminFilter,
-    setFilter: (v) => { notifyAdminFilter = v; },
-    onToggle: (c, on) => {
-      if (on) { if (!notifyAdminsState.some((a) => a.id === c.id)) notifyAdminsState.push({ id: c.id, name: c.name || "" }); }
-      else notifyAdminsState = notifyAdminsState.filter((a) => a.id !== c.id);
-      render();
-    },
-  });
-  render();
 }
 function cmPendingProfile() {
   const chatId = cmCurrentChatId;
@@ -939,32 +911,6 @@ function cmPendingProfile() {
     : { rolePrompt: $("cmRole").value, scopePrompt: $("cmScope").value, kbEnabled: !!$("cmKbEnabled").checked, kbFolder: $("cmKbFolder").value.trim(), suspended: !!cmEditorSuspended, chatty, personaCustom: true, admins };
   if (profilesEqual(obj, snap)) return undefined;
   return obj;
-}
-async function saveCurrentChatProfile() {
-  const btn = $("btnSaveCmProfile");
-  const msg = $("cmSaveMsg");
-  const chatId = cmCurrentChatId;
-  if (!chatId) { msg.textContent = "請先選一個聊天室"; msg.style.color = "var(--err)"; return; }
-  const pending = cmPendingProfile();
-  if (pending === undefined) { msg.textContent = "沒有變更需要儲存"; msg.style.color = ""; return; }
-  btn.disabled = true; msg.textContent = "儲存中…"; msg.style.color = "";
-  try {
-    const r = await (await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ai: { chatProfiles: { [chatId]: pending } } }) })).json();
-    if (r.ok) {
-      if (pending === null) { delete chatProfilesState[chatId]; delete chatProfilesSnapshot[chatId]; }
-      else { chatProfilesState[chatId] = deepCloneObj(pending); chatProfilesSnapshot[chatId] = deepCloneObj(pending); }
-      const okText = r.message || "已儲存，馬上生效";
-      msg.textContent = okText;
-      msg.style.color = "var(--dark)";
-      await loadWhitelist();
-      const newMsg = $("cmSaveMsg");
-      if (newMsg) { newMsg.textContent = okText; newMsg.style.color = "var(--dark)"; }
-    } else {
-      msg.textContent = "儲存失敗：" + (r.message || "");
-      msg.style.color = "var(--err)";
-    }
-  } catch { msg.textContent = "儲存失敗：連不上控制台服務，請重新整理頁面再試"; msg.style.color = "var(--err)"; }
-  btn.disabled = false;
 }
 const ACTIVITY_KIND_LABEL = { answered: "已回答", chatty: "接話", chatty_pass: "選擇不接話", declined: "婉拒（範圍外）", clarify: "反問確認", name_only: "引導說明", cooldown: "冷卻略過", window_user: "問太密擋下", window_all: "全部群問太密擋下", daily_limit: "每日上限擋下", scam_warned: "防詐騙警告", ai_busy: "AI 忙線", ai_failed: "AI 連不上" };
 async function loadActivity() {
@@ -1198,7 +1144,7 @@ function collect() {
     allChatsMinuteLimit: $("allChatsMinuteLimit").value.trim() === "" ? 10 : Math.max(0, Math.floor(Number($("allChatsMinuteLimit").value) || 0)),
     lineApiUrl: $("lineApiUrl").value.trim(),
     showSources: $("showSources").checked,
-    notify: { admins: normalizeAdmins(notifyAdminsState), rules: deepCloneObj(notifyRulesState) },
+    notify: { admins: deepCloneObj(notifyAdminsStored), rules: deepCloneObj(notifyRulesState) },
     persona: {
       birthdate: $("personaBirthdate").value.trim(),
       gender: $("personaGender").value.trim(),
@@ -1215,14 +1161,46 @@ function collect() {
   };
 }
 $("btnSave").onclick = async () => {
+  // 底部固定儲存列是唯一的儲存控制: 除了全部設定, 也一併存目前編輯中的聊天室設定
+  // (舊的「儲存本聊天室設定」鈕已刪除, 不再分開存, 避免改了室設定卻以為全域儲存已涵蓋)。
+  const payload = collect();
+  let cmPending = undefined;
+  let cmPendingId = "";
+  if (cmCurrentChatId) {
+    try {
+      cmPending = cmPendingProfile();
+      cmPendingId = cmCurrentChatId;
+    } catch { cmPending = undefined; }
+    if (cmPending !== undefined) {
+      payload.ai = payload.ai || {};
+      payload.ai.chatProfiles = { [cmPendingId]: cmPending };
+    }
+  }
   $("btnSave").disabled = true; $("saveMsg").textContent = "儲存中…";
   try {
-    const r = await (await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(collect()) })).json();
+    const r = await (await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })).json();
     $("saveMsg").textContent = r.ok ? r.message : ("儲存失敗:" + (r.message || ""));
-    if (r.ok) loadAll();
+    if (r.ok) {
+      if (cmPending !== undefined) {
+        if (cmPending === null) { delete chatProfilesState[cmPendingId]; delete chatProfilesSnapshot[cmPendingId]; }
+        else { chatProfilesState[cmPendingId] = deepCloneObj(cmPending); chatProfilesSnapshot[cmPendingId] = deepCloneObj(cmPending); }
+      }
+      loadAll();
+    }
   } catch { $("saveMsg").textContent = "儲存失敗: 連不上控制台服務, 請重新整理頁面再試"; }
   $("btnSave").disabled = false;
 };
+// 底部儲存列狀態: 頁面有任何設定修改就顯示未儲存, 存檔成功後回到已儲存 (伺服器回訊)。
+// 搜尋框、聊天室切換與聊天情況篩選不是設定, 不觸發未儲存。
+function markSaveDirty(e) {
+  const t = e.target || {};
+  if (t.id === "cmChatSearch" || t.id === "cmChatSelect" || t.id === "activityChatFilter") return;
+  if (t.tagName === "INPUT" && ((t.placeholder || "").includes("搜尋"))) return;
+  const m = $("saveMsg");
+  if (m && m.textContent !== "儲存中…") m.textContent = "有還沒儲存的修改";
+}
+document.querySelector("main").addEventListener("input", markSaveDirty);
+document.querySelector("main").addEventListener("change", markSaveDirty);
 $("btnKb").onclick = async () => {
   $("kbMsg").textContent = "整理中… (會先儲存目前設定)";
   try {
@@ -1320,9 +1298,8 @@ $("cmDiscardBtn").addEventListener("click", () => {
   cmAdminsSelected = [];
   $("cmModeDefault").checked = true; $("cmModeCustom").checked = false;
   syncCmMode();
-  $("cmSaveMsg").textContent = "已標記捨棄這份設定，按「儲存本聊天室設定」後才會真的刪掉。";
+  $("saveMsg").textContent = "已標記捨棄這份設定，按下方儲存列儲存後才會真的刪掉。";
 });
-$("btnSaveCmProfile").onclick = () => saveCurrentChatProfile();
 $("btnLogDir").onclick = async () => { try { const r = await (await fetch("/api/log-dir")).json(); $("logDirText").textContent = r.dir; } catch { $("logDirText").textContent = "讀取失敗: 連不上控制台服務, 請重新整理頁面"; } };
 $("btnLogRefresh").onclick = loadLog;
 loadAll().catch(() => { $("saveMsg").textContent = "讀不到設定, 請確認程式有在執行, 再重新整理頁面"; });
