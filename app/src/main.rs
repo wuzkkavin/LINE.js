@@ -1667,12 +1667,17 @@ fn send_entry_items(ch: &mut pagesend::PageChannel, entry: &Value, prev: Option<
 
 /// 把待送的管理員通知送掉 (第四階段): @ 送不出去 (核心保留訊息裡沒有這個人) 就改純文字點名重送,
 /// 結果與原因都寫回事件紀錄, 畫面與紀錄只出現白話。
-/// 回傳 (有沒有真的送成功至少一筆, 最後一筆失敗的白話原因) — 呼叫端據此在畫面顯示
+/// 回傳 (有沒有真的送成功至少一筆, 有沒有只寫進紀錄而跳過的筆,
+/// 最後一筆失敗的白話原因) — 呼叫端據此在畫面顯示
 /// 「通知目前送不出去」的狀態, 不讓失敗只留在 log 裡 (2026-10-22 修復)。
-fn send_admin_events(ch: &mut pagesend::PageChannel) -> (bool, Option<String>) {
-    let Ok(v) = helper_api::get_admin_events() else { return (false, Some("通知清單讀不到, 請稍後再試".to_string())) };
+/// 跳過的筆 (未設管理員的室, targets 為空) 不算送成功、也不算送失敗:
+/// 殼端絕不把通知本文裸送進群組, 只寫回「只寫進紀錄」的註記讓待發清單結案
+/// (2026-10-25 界面重整整合檢查抓到的斷線: 舊版空目標會照常送出本文並標 ok)。
+fn send_admin_events(ch: &mut pagesend::PageChannel) -> (bool, bool, Option<String>) {
+    let Ok(v) = helper_api::get_admin_events() else { return (false, false, Some("通知清單讀不到, 請稍後再試".to_string())) };
     let pending = v.get("pending").and_then(|p| p.as_array()).cloned().unwrap_or_default();
     let mut sent_any = false;
+    let mut skipped_any = false;
     let mut last_error: Option<String> = None;
     for ev in &pending {
         let id = ev.get("id").and_then(|x| x.as_str()).unwrap_or("");
@@ -1685,6 +1690,14 @@ fn send_admin_events(ch: &mut pagesend::PageChannel) -> (bool, Option<String>) {
             continue;
         }
         let targets = ev.get("targets").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+        if targets.is_empty() {
+            // 未設管理員: 不送進群組、不算失敗, 只寫回註記結案 (畫面狀態見 sent_state 的註記判斷)。
+            let note = "這個聊天室還沒設管理員，這則只寫進紀錄，沒有送進群組";
+            let _ = helper_api::mark_admin_event_sent(id, false, note);
+            shell::log_line(&format!("管理員通知跳過: 未設管理員，只寫進紀錄，未送進群組 id={id}"));
+            skipped_any = true;
+            continue;
+        }
         let (text, mentions, any_plain) = pagesend::build_notify_text(body, &targets);
         let plain_note = "有管理員還沒在這個群說過話或不在群裡, 已改用寫名字的方式點名 (請管理員先在群裡說一句話, 之後就能被 @ 到)";
         let (ok, note) = match ch.send_text(chat, &text, &mentions) {
@@ -1704,7 +1717,7 @@ fn send_admin_events(ch: &mut pagesend::PageChannel) -> (bool, Option<String>) {
         shell::log_line(&format!("管理員通知送出: id={id} ok={ok} note={note}"));
         if ok { sent_any = true; } else { last_error = Some(note.clone()); }
     }
-    (sent_any, last_error)
+    (sent_any, skipped_any, last_error)
 }
 
 /// 排程一輪 (背景執行緒呼叫): 讀待發清單與解密狀態, 照 pagesend::plan_entry 逐筆處置;
@@ -1786,9 +1799,9 @@ fn run_send_engine_once(started_ms: i64) -> Value {
                 // 管理員通知優先 (2026-10-22 修復): 舊版先送完所有排程待發才送通知,
                 // 通知被排程壅塞拖慢, 體感像沒回應。改成連線一開先送通知。
                 if has_notify {
-                    let (sent_any, err) = send_admin_events(&mut ch);
+                    let (sent_any, skipped_any, err) = send_admin_events(&mut ch);
                     changed = true; // 通知紀錄有更新, 順帶觸發畫面重讀
-                    if !sent_any {
+                    if !sent_any && !skipped_any {
                         notify_error = err;
                     }
                 }
@@ -1823,9 +1836,11 @@ fn run_notify_once() -> Value {
     }
     match pagesend::PageChannel::connect() {
         Ok(mut ch) => {
-            let (sent_any, err) = send_admin_events(&mut ch);
+            let (sent_any, skipped_any, err) = send_admin_events(&mut ch);
             if sent_any {
                 serde_json::json!({ "changed": true, "notes": ["管理員通知已送出"], "notifyError": null })
+            } else if skipped_any {
+                serde_json::json!({ "changed": true, "notes": ["管理員通知已處理 (未設管理員的室只寫進紀錄, 沒有送進群組)"], "notifyError": null })
             } else {
                 let msg = err.unwrap_or_else(|| "管理員通知目前送不出去".to_string());
                 serde_json::json!({ "changed": true, "notes": [format!("管理員通知送出失敗: {msg}")], "notifyError": msg })
@@ -4552,14 +4567,21 @@ impl App {
                 let merged = ev.get("mergedCount").and_then(|v| v.as_u64()).unwrap_or(0);
                 let merged_total = ev.get("mergedTotal").and_then(|v| v.as_u64()).unwrap_or(0);
                 let sent_ok = ev.get("sentOk");
-                let sent_state = match sent_ok.and_then(|v| v.as_bool()) {
-                    Some(true) => "已通知管理員".to_string(),
-                    Some(false) => "通知沒有送出去".to_string(),
-                    None => {
-                        if ev.get("notified").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            "等程式送出中".to_string()
-                        } else {
-                            "只寫進紀錄 (沒有另外通知)".to_string()
+                let note = ev.get("note").and_then(|v| v.as_str()).unwrap_or("");
+                // 未設管理員而跳過的筆: 寫回時 ok=false 只是為了不佔每日額度與節流錨點,
+                // 畫面不得顯示成「送失敗」; 註記開頭即為此類的標記。
+                let sent_state = if note.starts_with("這個聊天室還沒設管理員") {
+                    "只寫進紀錄 (沒有另外通知)".to_string()
+                } else {
+                    match sent_ok.and_then(|v| v.as_bool()) {
+                        Some(true) => "已通知管理員".to_string(),
+                        Some(false) => "通知沒有送出去".to_string(),
+                        None => {
+                            if ev.get("notified").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                "等程式送出中".to_string()
+                            } else {
+                                "只寫進紀錄 (沒有另外通知)".to_string()
+                            }
                         }
                     }
                 };

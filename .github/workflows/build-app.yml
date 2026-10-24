@@ -129,20 +129,27 @@ jobs:
         shell: pwsh
         run: |
           $exe = (Resolve-Path 'out/AI寶.exe').Path
-          # 階段 A (2026-10-22 問題 6 修復的出廠預設驗證): 全新資料目錄、不預寫任何設定 —
-          # 「開啟程式時自動登入」出廠預設關閉, App 開啟後應停在未啟用狀態: 行程活著、
-          # 引擎雙埠都不起來; --quit 要能乾淨結束 (沒有引擎也要能關)。
+          # 階段 A (修復 B, 2026-10-25 改為出廠預設開啟, 取代 2026-10-22 的關閉預設):
+          # 全新資料目錄、不預寫任何設定 — 「開啟程式時自動登入並啟用服務」出廠預設開啟,
+          # App 開啟後應直接啟動引擎 (雙埠就緒); --quit 要能乾淨結束。
+          # 明確關閉的未啟用態另由逐頁截圖的 overview-idle (auto_login=false) 覆蓋。
           $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-gui-default-data'
           $procA = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 12
-          if ($procA.HasExited) { throw '階段A: 出廠預設下 App 啟動後自行結束 (應停在未啟用狀態等使用者按登入)' }
-          $helperUpA = $false
-          try { Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3 | Out-Null; $helperUpA = $true } catch { }
-          if ($helperUpA) { throw '階段A: 出廠預設 (自動登入關閉) 下引擎不應自行啟動, 但 3790 已有回應' }
-          Write-Host '階段A: 出廠預設不自動登入 — App 待命、引擎未啟動 (符合問題 6 新規格)'
+          $okA = $false
+          foreach ($i in 1..45) {
+            Start-Sleep -Seconds 2
+            if ($procA.HasExited) { throw "階段A: 出廠預設下 App 啟動後自行結束 (exit $($procA.ExitCode))" }
+            try {
+              $a = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3789/' -TimeoutSec 3
+              $b = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3790/api/status' -TimeoutSec 3
+              if ($a.StatusCode -eq 200 -and $b.StatusCode -eq 200) { $okA = $true; break }
+            } catch { }
+          }
+          if (-not $okA) { throw '階段A: 出廠預設 (自動登入開啟) 下 90 秒內引擎雙埠未就緒' }
+          Write-Host '階段A: 出廠預設自動登入開啟 — 引擎已啟動 (符合修復 B 新規格)'
           Start-Process -FilePath $exe -ArgumentList '--quit' -Wait
-          if (-not $procA.WaitForExit(60000)) { throw '階段A: 未啟用狀態下 --quit 後 60 秒內未結束' }
-          Write-Host '階段A: 未啟用狀態 --quit 乾淨結束'
+          if (-not $procA.WaitForExit(60000)) { throw '階段A: --quit 後 60 秒內未結束' }
+          Write-Host '階段A: --quit 乾淨結束'
           # 階段 B: 預寫 shell-settings.json 開啟 auto_login, 走原本的自動登入全流程驗證。
           $env:HWLINEHELPER_HOME = Join-Path $env:RUNNER_TEMP 'aibao-gui-data'
           New-Item -ItemType Directory -Force -Path $env:HWLINEHELPER_HOME | Out-Null
