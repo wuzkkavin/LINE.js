@@ -593,6 +593,10 @@ struct App {
     // 聊天室管理頁聊天室清單的搜尋關鍵字 (群很多時打群名篩選, 企業多群場景)。
     manage_chat_search: String,
     manage_candidates_all: bool,
+    // 從白名單表跳到管理員區時用: 選中該室後, 下方編輯區畫到管理員標題時捲過去一次。
+    manage_jump_admin: bool,
+    // 從白名單表「設定這個聊天室」跳過來時用: 選中該室後, 下方編輯區畫到編輯卡時捲過去一次。
+    manage_jump_edit: bool,
     // 機器人與觸發頁備援管理員選人: 搜尋關鍵字 (本機即時過濾)。
     backup_admin_search: String,
     // 聊天室畫面頁進頁紀錄: 記上次寫過紀錄時所在的頁面, 避免每一幀都刷 log。
@@ -615,14 +619,6 @@ struct App {
     chat_suspend_id: Option<String>,
     /// 正在移除白名單的 chatId: 移除成功後若該群有自訂設定, 要追加送 suspended=true 保留但停用。
     pending_remove_chat: Option<String>,
-    // 機器人聊天情況面板 (第 12 項): 活動端點的最近結果與上次抓取時間
-    activity_slot: Arc<Mutex<Option<serde_json::Value>>>,
-    activity: Option<serde_json::Value>,
-    activity_fetched_at: Option<std::time::Instant>,
-    activity_msg: Option<String>,
-    // 群組篩選 (2026-10-23 老吳裁示): Some((chatId, 顯示名)) = 只看該群; None = 全部群組。
-    // 純顯示層狀態, 連同名稱一起存, 讓該群暫時不在最近紀錄裡時選單仍顯示得出來。
-    activity_chat_filter: Option<(String, String)>,
     // 發送群組訊息頁 (2026-10-22 第一階段): 表單狀態 + 待發清單/紀錄的載入 slot
     send_chat_id: String,
     send_chat_name: String,
@@ -1160,6 +1156,8 @@ impl App {
             manage_ci_prefill_done: false,
             manage_chat_search: String::new(),
             manage_candidates_all: false,
+            manage_jump_admin: false,
+            manage_jump_edit: false,
             backup_admin_search: String::new(),
             chat_log_last_page: None,
             overview_last_page: None,
@@ -1172,11 +1170,6 @@ impl App {
             chat_suspend_slot: Arc::new(Mutex::new(None)),
             chat_suspend_id: None,
             pending_remove_chat: None,
-            activity_slot: Arc::new(Mutex::new(None)),
-            activity: None,
-            activity_fetched_at: None,
-            activity_msg: None,
-            activity_chat_filter: None,
             send_chat_id: String::new(),
             send_chat_name: String::new(),
             send_text: String::new(),
@@ -1685,11 +1678,6 @@ fn primary_btn(ui: &mut egui::Ui, pal: theme::Palette, label: &str) -> egui::Res
     ui.add(egui::Button::new(text).fill(pal.primary))
 }
 
-// ---------- 群組清單共用列 (2026-10-21 版面整理) ----------
-// 讀取清單與白名單清單共用同一種列: 左側主行 = 群組名稱、副行小字 = 類型・人數;
-// 右側固定欄位 (固定寬度、靠右) 放動作按鈕或狀態標籤, 讓每列按鈕水平成一直線;
-// 列與列之間以分隔線區隔。畫面上不顯示原始 chat ID (ID 只留在 log/診斷資料)。
-
 /// 聊天情況群組篩選的選單標籤: 有群名用群名; 沒群名 (核心尚未回報名稱) 不顯示
 /// 完整編號 (畫面不露原始 ID 的產品規格), 以末 4 碼區分不同的未命名聊天室。
 fn activity_chat_label(id: &str, name: &str) -> String {
@@ -2043,25 +2031,6 @@ fn chat_display_name(name: Option<&str>, resolved: bool) -> String {
     } else {
         "未命名群組".to_string()
     }
-}
-
-fn chat_list_row(ui: &mut egui::Ui, name: &str, sub: &str, action: impl FnOnce(&mut egui::Ui)) {
-    // 版面: 整列用右到左配置 — 動作按鈕先靠右固定, 左側剩餘空間放名稱 (主行) 與
-    // 類型/人數 (副行小字)。先前用 allocate_ui_with_layout 切左右兩塊的寫法實測會
-    // 把名稱擠掉、按鈕位置逐列漂移 (2026-10-21 本機截圖), 改用這個 egui 慣用式。
-    // 名稱不用 RichText::strong(): 本 App 主題把「啟用中」文字色設為白色 (給深色
-    // 按鈕用), 而 egui 的 strong 文字色正是取自該值 — 沒另外指定顏色時 strong
-    // 標籤會變成白字、在淺色卡片上看不見 (同卡的步驟標題也因此改用 size 強調)。
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        action(ui);
-        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.vertical(|ui| {
-                ui.label(egui::RichText::new(name).size(15.0));
-                ui.label(egui::RichText::new(sub).weak().small());
-            });
-        });
-    });
-    ui.separator();
 }
 
 /// 清單列右側的動作按鈕: 固定最小尺寸, 讓各列按鈕大小一致、水平對齊。
@@ -3648,222 +3617,6 @@ impl App {
         }
         }
     }
-    // 機器人聊天情況面板 (第 12 項): 登入卡片下方顯示機器人在群組的服務實況。
-    // 資料來自 helper 的 GET /api/bot/activity (唯讀; 問題只留前 30 字且只在 helper 記憶體)。
-    // 開頁立即抓、之後每約 4 秒自動刷新; 失敗顯示白話訊息, 不跳原始錯誤。
-    // 2026-10-21 第 2 項: 已回答事件在問題行下方多一行回答預覽 (灰色小字, 約 40 字),
-    // 點一下展開完整回答、再點收合; 未回答的事件 (冷卻/上限/忙線/引導) 不顯示回答區。
-    // 退場 (2026-10-24 老吳親自定奪: 總覽改 Codex 式,「機器人聊天情況」活動清單卡拿掉,
-    // 含修復版3 的群組篩選功能一併退場)。函式本體留置不刪, 以免後續整理誤傷;
-    // 後端活動紀錄本身 (紀錄頁可查) 不受影響, 不要刪資料。若編譯因此出現 dead_code 警告,
-    // 如實列入回報, 不在此加 allow 掩蓋; 是否整段移除由老吳裁示。
-    fn activity_panel(&mut self, ui: &mut egui::Ui, logged_in: bool) {
-        let ctx = ui.ctx().clone();
-        {
-            if !logged_in {
-                ui.label("登入後這裡會顯示機器人的聊天情況");
-                return;
-            }
-            // 收取背景抓取結果
-            if let Some(v) = self.activity_slot.lock().unwrap().take() {
-                self.busy.insert("activity".into(), false);
-                if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
-                    self.activity = Some(v);
-                    self.activity_msg = None;
-                } else {
-                    let m = v.get("message").and_then(|x| x.as_str()).unwrap_or("讀取聊天情況失敗, 請稍後再試。").to_string();
-                    self.activity_msg = Some(m);
-                }
-            }
-            let busy_act = self.busy.get("activity").copied().unwrap_or(false);
-            let due = self.activity_fetched_at.map(|t| t.elapsed() > std::time::Duration::from_secs(4)).unwrap_or(true);
-            if due && !busy_act {
-                self.busy.insert("activity".into(), true);
-                self.activity_fetched_at = Some(std::time::Instant::now());
-                let slot = self.activity_slot.clone();
-                let ctx2 = ctx.clone();
-                let chat_filter = self.activity_chat_filter.as_ref().map(|(id, _)| id.clone());
-                std::thread::spawn(move || {
-                    let r = helper_api::bot_activity(chat_filter.as_deref());
-                    *slot.lock().unwrap() = Some(match r {
-                        Ok(v) => v,
-                        Err(e) => serde_json::json!({ "ok": false, "message": e }),
-                    });
-                    ctx2.request_repaint();
-                });
-            }
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
-            let act = self.activity.clone();
-            let status = act.as_ref().and_then(|a| a.get("status").cloned()).unwrap_or(Value::Null);
-            if status.is_object() {
-                let bc = status.get("botConnected").and_then(|v| v.as_bool()).unwrap_or(false);
-                let ai = status.get("aiActive").and_then(|v| v.as_str()).unwrap_or("-");
-                let model = status.get("aiModel").and_then(|v| v.as_str()).unwrap_or("-");
-                let answered = status.get("answeredToday").and_then(|v| v.as_u64()).unwrap_or(0);
-                let limit = status.get("dailyLimit").and_then(|v| v.as_u64()).unwrap_or(0);
-                let scam = status.get("scam").cloned().unwrap_or(Value::Null);
-                let scanned = scam.get("scannedToday").and_then(|v| v.as_u64()).unwrap_or(0);
-                let checked = scam.get("checkedToday").and_then(|v| v.as_u64()).unwrap_or(0);
-                let warned = scam.get("warnedToday").and_then(|v| v.as_u64()).unwrap_or(0);
-                // 修復版6後續修復: 舊版用不換行的 horizontal, 這列在 1024 寬視窗會被右邊緣裁掉
-                // (真機: 「警告 0」後面的字被切)。改可換行, 太長就折到第二行, 不再裁字。
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(status_dot(if bc { self.palette.ok } else { self.palette.warn }));
-                    ui.label(if bc { "機器人已連線" } else { "機器人未連線" });
-                    ui.separator();
-                    ui.label(format!("AI: {ai} / {model}"));
-                    ui.separator();
-                    ui.label(format!("今日已回答 {answered} / 上限 {limit}"));
-                    ui.separator();
-                    ui.label(format!("防詐騙: 掃描 {scanned}、判讀 {checked}、警告 {warned}"));
-                });
-            } else if self.activity_msg.is_none() {
-                ui.label("正在讀取聊天情況…");
-            }
-            if let Some(m) = &self.activity_msg {
-                ui.label(egui::RichText::new(m.clone()).color(self.palette.warn_text));
-            }
-            // 群組篩選 (2026-10-23 老吳裁示): 純顯示層 — 篩選在 helper 端完成
-            // (activityfilter.mjs), 這裡只給選單與標明計數口徑。選單清單取端點的
-            // chats (未篩選的不重複群組); 舊版 helper 沒有 chats 時退回用手邊的
-            // events 萃取 (篩選啟用時可能不完整, 僅相容兜底)。
-            let events = act.as_ref().and_then(|a| a.get("events")).and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let total = act.as_ref().and_then(|a| a.get("total")).and_then(|v| v.as_u64());
-            let mut chat_options: Vec<(String, String)> = Vec::new();
-            if let Some(chats) = act.as_ref().and_then(|a| a.get("chats")).and_then(|v| v.as_array()) {
-                for c in chats {
-                    let id = c.get("chatId").and_then(|v| v.as_str()).unwrap_or("");
-                    if id.is_empty() || chat_options.iter().any(|(x, _)| x == id) { continue; }
-                    chat_options.push((id.to_string(), c.get("chatName").and_then(|v| v.as_str()).unwrap_or("").to_string()));
-                }
-            } else {
-                for ev in &events {
-                    let id = ev.get("chatId").and_then(|v| v.as_str()).unwrap_or("");
-                    if id.is_empty() || chat_options.iter().any(|(x, _)| x == id) { continue; }
-                    chat_options.push((id.to_string(), ev.get("chatName").and_then(|v| v.as_str()).unwrap_or("").to_string()));
-                }
-            }
-            if !chat_options.is_empty() || self.activity_chat_filter.is_some() {
-                let selected_text = match &self.activity_chat_filter {
-                    Some((id, name)) => activity_chat_label(id, name),
-                    None => "全部群組".to_string(),
-                };
-                let mut picked: Option<Option<(String, String)>> = None;
-                ui.horizontal(|ui| {
-                    ui.label("顯示群組:");
-                    egui::ComboBox::from_id_salt("activity-chat-filter")
-                        .selected_text(selected_text)
-                        .width(260.0)
-                        .show_ui(ui, |ui| {
-                            if ui.selectable_label(self.activity_chat_filter.is_none(), "全部群組").clicked() {
-                                picked = Some(None);
-                            }
-                            for (id, name) in &chat_options {
-                                let label = activity_chat_label(id, name);
-                                let is_sel = self.activity_chat_filter.as_ref().map(|(x, _)| x == id).unwrap_or(false);
-                                if ui.selectable_label(is_sel, label.clone()).clicked() {
-                                    picked = Some(Some((id.clone(), name.clone())));
-                                }
-                            }
-                        });
-                });
-                if let Some(p) = picked {
-                    if p != self.activity_chat_filter {
-                        self.activity_chat_filter = p;
-                        // 換群組就丟掉舊清單重新抓, 不讓上一個群組的紀錄在新篩選下殘留一幀以上
-                        self.activity = None;
-                        self.activity_fetched_at = None;
-                    }
-                }
-                if let Some((fid, name)) = &self.activity_chat_filter {
-                    let shown = events.len();
-                    let label = activity_chat_label(fid, name);
-                    let count_txt = match total {
-                        Some(t) => format!("只看「{label}」: 顯示 {shown} 筆 (全部共 {t} 筆)。"),
-                        None => format!("只看「{label}」: 顯示 {shown} 筆。"),
-                    };
-                    ui.label(egui::RichText::new(count_txt).weak().small());
-                    ui.label(egui::RichText::new("上面那排今日數字是全部群組的統計; 下面清單只顯示這個群組。").weak().small());
-                }
-            }
-            ui.add_space(4.0);
-            if events.is_empty() {
-                if let Some((fid, name)) = &self.activity_chat_filter {
-                    ui.label(egui::RichText::new(format!("「{}」目前還沒有紀錄: 紀錄只保留最近 50 筆, 較早的會被新的蓋掉; 也可以改選「全部群組」看其他群的情況。", activity_chat_label(fid, name))).weak());
-                } else {
-                    ui.label(egui::RichText::new("目前還沒有紀錄: 有人在群組跟機器人說話後, 這裡會逐筆出現。").weak());
-                }
-            } else {
-                let max_h = ui.available_height().max(80.0);
-                egui::ScrollArea::vertical().id_salt("activity-scroll").max_height(max_h).show(ui, |ui| {
-                    for ev in &events {
-                        let time = ev.get("time").and_then(|v| v.as_str()).unwrap_or("");
-                        let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                        let (label, color) = match kind {
-                            "answered" => ("已回答", self.palette.ok),
-                            "chatty" => ("接話", self.palette.ok),
-                            "chatty_pass" => ("選擇不接話", self.palette.idle),
-                            "declined" => ("婉拒（範圍外）", self.palette.idle),
-                            "clarify" => ("反問確認", self.palette.warn),
-                            "name_only" => ("引導說明", self.palette.idle),
-                            "cooldown" => ("冷卻略過", self.palette.warn),
-                            "window_user" => ("問太密擋下", self.palette.warn),
-                            "window_all" => ("全部群問太密擋下", self.palette.warn),
-                            "daily_limit" => ("每日上限擋下", self.palette.warn),
-                            "scam_warned" => ("防詐騙警告", self.palette.bad),
-                            "ai_busy" => ("AI 忙線", self.palette.warn),
-                            "ai_failed" => ("AI 連不上", self.palette.bad),
-                            _ => ("紀錄", self.palette.idle),
-                        };
-                        let chat = ev.get("chatName").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("(群組)");
-                        let sender = ev.get("senderName").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("(同事)");
-                        let q = ev.get("question").and_then(|v| v.as_str()).unwrap_or("");
-                        let chars = ev.get("answerChars").and_then(|v| v.as_u64());
-                        let ms = ev.get("ms").and_then(|v| v.as_u64());
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(egui::RichText::new(time).weak());
-                            ui.label(egui::RichText::new(label).color(color).strong());
-                            ui.label(format!("{chat}・{sender}: {q}"));
-                            if let Some(c) = chars {
-                                ui.label(egui::RichText::new(format!("(回答 {c} 字{})", ms.map(|m| format!("・{} 毫秒", m)).unwrap_or_default())).weak());
-                            }
-                        });
-                        // 回答內容 (第 2 項): 只有已回答事件才有 answer; 預覽列可點開/收合,
-                        // 展開狀態存 egui persisted data (以 時間|種類|提問者|問題 為鍵, 清單刷新不遺失;
-                        // 不用 temp data — 它只有一幀生命週期, 展開狀態留不住, 實測點了沒反應)。
-                        let answer = ev.get("answer").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-                        if let Some(ans) = answer {
-                            let truncated = ev.get("answerTruncated").and_then(|v| v.as_bool()).unwrap_or(false);
-                            let key = format!("{time}|{kind}|{sender}|{q}");
-                            let ans_id = ui.id().with(("activity-answer", key.clone()));
-                            let expanded = ui.ctx().data_mut(|d| d.get_persisted::<bool>(ans_id).unwrap_or(false));
-                            let total = ans.chars().count();
-                            let preview: String = ans.chars().take(40).collect();
-                            let preview_text = if total > 40 {
-                                format!("回答: {preview}… (點一下看全部)")
-                            } else {
-                                format!("回答: {preview}")
-                            };
-                            // 用無框按鈕當可點的預覽列: 外觀與小字標籤相同, 但點擊感應比 Label 可靠
-                            // (Label + Sense::click 在巢狀 ScrollArea 實測點不到, 2026-10-21 本機截圖驗證)。
-                            if ui
-                                .add(egui::Button::new(egui::RichText::new(preview_text).weak().small()).frame(false))
-                                .clicked()
-                            {
-                                ui.ctx().data_mut(|d| d.insert_persisted(ans_id, !expanded));
-                            }
-                            if expanded {
-                                ui.label(egui::RichText::new(ans).small());
-                                if truncated {
-                                    ui.label(egui::RichText::new("(回答原文較長, 這裡只保存前 2000 字)").weak().small());
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        }
-    }
 
 /// 聊天室畫面「目前不顯示」的原因 (白話, 檢查順序與 page_chat 的 want 條件一致)。
 /// 回 None = 應該顯示。單元測試鎖定優先順序, 免得狀態行與實際條件脫鉤。
@@ -4316,19 +4069,203 @@ impl App {
         }
     }
 
+    /// 從上方白名單表跳到下方編輯區: 選中對應頁簽 (搜尋字先清空, 免得頁簽被篩掉),
+    /// 並把管理員候選名單狀態清掉, 讓換室邏輯重新讀該室名單。admin=true 時再捲到管理員區。
+    fn select_manage_chat(&mut self, chat_id: &str, admin: bool) {
+        self.manage_chat_id = chat_id.to_string();
+        self.manage_chat_search.clear();
+        self.manage_admin_search.clear();
+        self.manage_admin_page = 0;
+        self.manage_candidates_all = false;
+        self.manage_candidates.clear();
+        self.manage_jump_admin = admin;
+        self.manage_jump_edit = !admin;
+    }
+
+    /// 白名單管理區 (聊天室管理頁最上方; 原在「機器人與觸發」頁的「LINE 開通」卡內)。
+    /// 表格每列一個聊天室: 「從白名單移除」走現有 config-remove;「設定這個聊天室」
+    /// 選中下方頁簽;「設定管理員」同樣選中該室並捲到下方管理員區, 不另造選人器。
+    /// 新增入口沿用觸發頁現有加入流程 (讀群組清單用點的加入 + 進階貼 ID), 不留第二入口。
+    /// 未登入時只顯示白話占位, 不讀取、不留空白。
+    fn whitelist_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, logged_in: bool) {
+        card(ui, self.palette, "白名單 (機器人只在這些聊天室回應)", |ui| {
+            if !logged_in {
+                ui.label("還沒登入 LINE, 所以還讀不到聊天室。請先到「總覽」頁登入 (用次要帳號掃 QR 碼), 登入後回到這裡, 白名單就會列出來。");
+                if ui.button("去總覽登入").clicked() {
+                    self.page = Page::Overview;
+                }
+                return;
+            }
+            ui.label("只有加進白名單的聊天室, 機器人才會在裡面回應; 沒加進來的群組, 機器人不會說話。下面每列就是一個已經加進來的聊天室, 可以直接移除、或是跳去設定那個聊天室。");
+            ui.add_space(4.0);
+            if !self.wl_loaded && !self.wl_attempted && !self.busy.get("wl").copied().unwrap_or(false) {
+                self.spawn_whitelist_load(ctx);
+            }
+            let busy_wl = self.busy.get("wl").copied().unwrap_or(false);
+            ui.horizontal(|ui| {
+                if ui.button(if busy_wl { "讀取中…" } else { "重新讀取白名單" }).clicked() && !busy_wl {
+                    self.spawn_whitelist_load(ctx);
+                }
+                if self.wl_loaded {
+                    ui.label(format!("目前白名單共 {} 個聊天室。", self.whitelist.len()));
+                }
+            });
+            if let Some(m) = self.page_msg.get("wl") {
+                ui.label(m.clone());
+            }
+            if self.wl_loaded {
+                if self.whitelist.is_empty() {
+                    ui.label("白名單目前是空的: 還沒有任何群組被加入, 機器人不會在任何群組回應。");
+                }
+                let wl = self.whitelist.clone();
+                let busy_apply_now = self.busy.get("apply").copied().unwrap_or(false);
+                for c in &wl {
+                    let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if id.is_empty() {
+                        continue;
+                    }
+                    let resolved = c.get("nameResolved").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let name = chat_display_name(c.get("name").and_then(|v| v.as_str()), resolved);
+                    let sub_base = chat_sub_text(
+                        c.get("kind").and_then(|v| v.as_str()),
+                        c.get("memberCount").and_then(|v| v.as_i64()),
+                        resolved,
+                    );
+                    // 狀態小字 (唯讀): 這個群目前用哪一套設定, 一眼可分; 改設定用下面頁簽, 這裡不提供編輯。
+                    let prof = self.form.chat_profiles.get(&id);
+                    let state_txt = match prof.map(|f| (f.custom, f.suspended)) {
+                        Some((_, true)) => "已停用待確認",
+                        Some((true, false)) => "本群自訂",
+                        _ => "用預設",
+                    };
+                    let chatty_mark = if prof.map(|f| f.chatty).unwrap_or(false) { "・聒噪開" } else { "" };
+                    let sub = format!("{sub_base}・{state_txt}{chatty_mark}");
+                    let mut jump: Option<(String, bool)> = None;
+                    let mut remove_clicked = false;
+                    // 表列不用共用的 chat_list_row: 它的 with_layout 根列在捲動區裡會把列撐高
+                    // (名稱在上、按鈕掉到下方, 本機截圖實測); 這裡用標準橫列寫法, 名稱在左、按鈕靠右對齊。
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(name.as_str()).size(15.0));
+                            ui.label(egui::RichText::new(sub.as_str()).weak().small());
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // 右到左先加的靠右, 所以加的順序與畫面左右順序相反。
+                            if chat_action_btn(ui, "設定管理員", !busy_apply_now).clicked() {
+                                jump = Some((id.clone(), true));
+                            }
+                            if chat_action_btn(ui, "設定這個聊天室", !busy_apply_now).clicked() {
+                                jump = Some((id.clone(), false));
+                            }
+                            if chat_action_btn(ui, "從白名單移除", !busy_apply_now).clicked() {
+                                remove_clicked = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    if let Some((cid, admin)) = jump {
+                        self.select_manage_chat(&cid, admin);
+                    }
+                    if remove_clicked {
+                        self.start_remove(ctx, id.clone());
+                    }
+                }
+                ui.label(egui::RichText::new("白名單改完要把 AI寶 完全結束再重新開啟才會生效 (用系統匣的「結束服務並關閉程式」)。").weak());
+            } else if !busy_wl {
+                ui.label("正在讀取白名單…");
+            }
+            ui.add_space(8.0);
+            ui.separator();
+            // 新增白名單室 (原觸發頁步驟一加入流程, 整段搬過來): 先讀群組清單用點的加入,
+            // 貼 ID 降為進階, 不留第二入口。
+            ui.label(egui::RichText::new("加入新的聊天室").size(15.0));
+            ui.label(egui::RichText::new("不用自己找代號: 先在手機 LINE 把這個次要帳號邀請進要用的群組, 回來按「讀取我的群組清單」, 群組會列出來, 用點的加入白名單。").weak());
+            let busy_chats = self.busy.get("chats").copied().unwrap_or(false);
+            if ui.button(if busy_chats { "讀取中…" } else { "讀取我的群組清單" }).clicked() && !busy_chats {
+                self.spawn_chats_load(ctx);
+            }
+            if let Some(m) = self.page_msg.get("chats") {
+                ui.label(m.clone());
+            }
+            if self.chats_loaded {
+                let chats = self.group_chats.clone();
+                let busy_apply_now = self.busy.get("apply").copied().unwrap_or(false);
+                for c in &chats {
+                    let name = chat_display_name(c.get("name").and_then(|v| v.as_str()), true);
+                    let sub = chat_sub_text(
+                        c.get("kind").and_then(|v| v.as_str()),
+                        c.get("memberCount").and_then(|v| v.as_i64()),
+                        true,
+                    );
+                    let whitelisted = c.get("whitelisted").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    // 表列同上: 不用共用的 chat_list_row (在捲動區裡會把列撐高)。
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(name.as_str()).size(15.0));
+                            ui.label(egui::RichText::new(sub.as_str()).weak().small());
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if whitelisted {
+                                // 已在白名單: 停用態標籤 (與按鈕同尺寸同欄位, 保持每列對齊)
+                                let _ = chat_action_btn(ui, "已在白名單", false);
+                            } else if chat_action_btn(ui, "加入白名單", !busy_apply_now).clicked() {
+                                self.start_apply(ctx, id.clone());
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
+            }
+            ui.collapsing("進階: 手動貼上群組 ID (清單讀不到時才需要)", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("群組 ID:");
+                    let mut chat_id = self.page_msg.get("chatid").cloned().unwrap_or_default();
+                    if ui.add(egui::TextEdit::singleline(&mut chat_id).desired_width(320.0).hint_text("共 33 碼 (群組 c 開頭、社群 m 開頭)")).changed() {
+                        self.page_msg.insert("chatid".into(), chat_id);
+                    }
+                });
+                ui.label(egui::RichText::new(format!("備用方法: 在核心網頁 (http://127.0.0.1:{}) 點進群組聊天室, 用右鍵「複製聊天室 ID」取得 ID, 再貼到上面欄位。", crate::engine::core_port())).weak());
+                let busy_apply = self.busy.get("apply").copied().unwrap_or(false);
+                if ui.button(if busy_apply { "處理中…" } else { "加入白名單" }).clicked() && !busy_apply {
+                    let chat_id = self.page_msg.get("chatid").cloned().unwrap_or_default();
+                    if chat_id.trim().is_empty() {
+                        self.page_msg.insert("apply".into(), "請先貼上群組 ID 再按加入白名單".to_string());
+                    } else {
+                        self.start_apply(ctx, chat_id);
+                    }
+                }
+            });
+            if let Some(m) = self.page_msg.get("apply") {
+                ui.label(m.clone());
+            }
+        });
+    }
+
     /// 聊天室管理頁 (修復版6 新頁): 先選一個聊天室, 在同一頁改完這個聊天室的全部設定再儲存。
     /// 分群設定全 App 只在這一頁可以改; 全域預設在「AI 設定」頁, 這裡不重複提供。
     fn page_manage(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if !self.wl_loaded && !self.wl_attempted && !self.busy.get("wl").copied().unwrap_or(false) {
-            self.spawn_whitelist_load(&ctx);
-        }
+        let logged_in = matches!(self.login_snapshot().auth, AuthState::Ready);
+        // 頁面標題列: 右上角放一顆看得見的儲存鈕 (Codex 管理頁同款位置),
+        // 存的與標題下方、表單最下方那兩顆是同一個動作 (存這個聊天室的設定)。
+        // 標題下方最上方就是白名單區, 不用去別頁。
+        ui.horizontal(|ui| {
+            ui.heading("聊天室管理");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let saving_profiles = self.busy.get("chat_profiles").copied().unwrap_or(false);
+                if primary_btn(ui, self.palette, if saving_profiles { "儲存中…" } else { "儲存這個聊天室的設定" }).clicked() && !saving_profiles {
+                    self.save_chat_profiles(&ctx);
+                }
+            });
+        });
+        ui.add_space(8.0);
+        self.whitelist_section(ui, &ctx, logged_in);
+        ui.add_space(10.0);
         let options = self.manage_chat_options();
         if options.is_empty() {
-            ui.heading("聊天室管理");
-            ui.add_space(8.0);
             card(ui, self.palette, "聊天室管理", |ui| {
-                ui.label("目前還沒有可以管理的聊天室: 請先到「機器人與觸發」頁把群組加入白名單, 這裡就會列出來。");
+                ui.label("目前還沒有可以管理的聊天室: 請先在本頁上方的白名單加入群組, 這裡就會列出來。");
                 if let Some(m) = self.page_msg.get("wl") {
                     ui.label(m.clone());
                 }
@@ -4360,26 +4297,10 @@ impl App {
                 self.manage_admin_search = s;
             }
         }
-        // 頁面標題列: 右上角放一顆看得見的儲存鈕 (Codex 管理頁同款位置),
-        // 存的與標題下方、表單最下方那兩顆是同一個動作 (存這個聊天室的設定)。
-        ui.horizontal(|ui| {
-            ui.heading("聊天室管理");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let saving_profiles = self.busy.get("chat_profiles").copied().unwrap_or(false);
-                if primary_btn(ui, self.palette, if saving_profiles { "儲存中…" } else { "儲存這個聊天室的設定" }).clicked() && !saving_profiles {
-                    self.save_chat_profiles(&ctx);
-                }
-            });
-        });
-        ui.add_space(8.0);
         // 三步指引 (老吳 2026-10-24: 原頁面看不出改完按哪裡儲存、改完去哪裡看效果)。
-        // 第零步學 Codex 流程: 白名單先設好, 這裡才有室可以管 (白名單本身仍在
-        // 「機器人與觸發」頁改, 這裡只指路, 不複製第二份可改的白名單)。
+        // 第零步: 白名單先設好, 這裡才有室可以管; 白名單表就在本頁最上方, 不用去別頁。
         card(ui, self.palette, "怎麼用這個頁面 (三步)", |ui| {
-            ui.label("第零步 (先做一次就好): 到「機器人與觸發」頁把要管的群組加入白名單, 這裡才會列出來。");
-            if ui.button("去「機器人與觸發」頁設白名單").clicked() {
-                self.page = Page::BotSettings;
-            }
+            ui.label("第零步 (先做一次就好): 先在本頁最上方的白名單把要管的群組加進來, 加進來的聊天室才會出現在下面, 才能編輯。");
             ui.label("第一步: 下面點一個聊天室的頁簽, 點哪個頁簽就是在設哪個聊天室。");
             ui.label("第二步: 改下面五區的設定 (角色、回答範圍、知識庫、管理員、聒噪)。");
             ui.label("第三步: 按「儲存這個聊天室的設定」 (頁面右上角、標題下面和表單最下面都有)。");
@@ -4486,6 +4407,9 @@ impl App {
             self.manage_admin_page = 0;
             self.manage_candidates_all = false;
             self.manage_candidates.clear();
+            // 手動點頁簽 = 自己換室, 白名單表帶來的跳轉不再需要。
+            self.manage_jump_admin = false;
+            self.manage_jump_edit = false;
         }
         ui.add_space(8.0);
         let chat_id = self.manage_chat_id.clone();
@@ -4519,12 +4443,18 @@ impl App {
                 self.form.chat_profiles.get(&chat_id),
                 self.form.chat_profiles_orig.get(&chat_id),
             );
-            if saved_suspended {
-                ui.label(egui::RichText::new("已儲存的狀態: 已停用待確認 (這個聊天室的自訂設定暫停中, 請到本頁最下方處理)").color(pal.warn_text).strong());
+            let edit_head = if saved_suspended {
+                ui.label(egui::RichText::new("已儲存的狀態: 已停用待確認 (這個聊天室的自訂設定暫停中, 請到本頁最下方處理)").color(pal.warn_text).strong())
             } else if saved_custom {
-                ui.label(egui::RichText::new("已儲存的狀態: 用本聊天室設定 (全域預設不生效)").color(pal.primary).strong());
+                ui.label(egui::RichText::new("已儲存的狀態: 用本聊天室設定 (全域預設不生效)").color(pal.primary).strong())
             } else {
-                ui.label(egui::RichText::new("已儲存的狀態: 用全域預設").strong());
+                ui.label(egui::RichText::new("已儲存的狀態: 用全域預設").strong())
+            };
+            if self.manage_jump_edit {
+                // 從上方白名單表「設定這個聊天室」跳過來: 捲到編輯卡, 只捲一次
+                // (往上多留 40 讓卡片標題「正在設定: …」也留在畫面內)。
+                ui.scroll_to_rect(edit_head.rect.expand2(egui::vec2(0.0, 40.0)), Some(egui::Align::TOP));
+                self.manage_jump_edit = false;
             }
             if dirty {
                 ui.label(egui::RichText::new("⚠ 上面有還沒儲存的修改 (尚未生效), 按「儲存這個聊天室的設定」才會真的生效。").color(pal.warn_text).strong());
@@ -4613,7 +4543,12 @@ impl App {
             // 本聊天室管理員挑選 (五區第四區, 人多先行): 預設只列近期發言過的人 + 社群管理員;
             // 已選的人另外列在已選區 (附移除鈕), 搜尋只過濾下方待選清單, 已選區不會被篩掉;
             // 待選清單分頁 (每頁 50 位, Codex 管理頁同款), 同名的人靠帳號末 4 碼區分。
-            ui.label(egui::RichText::new("本聊天室管理員").strong());
+            let admin_head = ui.label(egui::RichText::new("本聊天室管理員").strong());
+            if self.manage_jump_admin {
+                // 從上方白名單表「設定管理員」跳過來: 捲到這個標題, 只捲一次。
+                ui.scroll_to_rect(admin_head.rect, Some(egui::Align::TOP));
+                self.manage_jump_admin = false;
+            }
             ui.label(egui::RichText::new("這區是選這個聊天室出事時要 @ 出來處理的人。").weak().small());
             ui.label(egui::RichText::new("這裡的管理員只是「通知對象」: 有重要事件時, AI寶 會在群組裡 @ 他們出面處理; AI寶 本身不會踢人或處分任何人。未設定時, 重要事件會通知「機器人與觸發」頁的備援管理員。").weak().small());
             ui.label(egui::RichText::new("管理員認的是帳號不是名字: 這個人改名字、或在不同聊天室顯示不同名字, 管理員身分都不會認不得。上面顯示的是他最近一次發言用的名字, 若和存檔舊名不同會加註。").weak().small());
@@ -4801,7 +4736,7 @@ impl App {
         suspended_ids.sort();
         if !suspended_ids.is_empty() {
             card(ui, pal, "已停用設定", |ui| {
-                ui.label(egui::RichText::new("這些聊天室之前有自訂設定, 移出白名單後先保留但停用。恢復使用後要把聊天室加回白名單才會真的生效; 不要了可以捨棄這份設定 (會把這份設定刪掉, 聒噪/管理員等欄位也會一起刪掉)。").weak().small());
+                ui.label(egui::RichText::new("這些聊天室之前有自訂設定, 移出白名單後先保留但停用。恢復使用後要在本頁上方白名單把聊天室加回來才會真的生效; 不要了可以捨棄這份設定 (會把這份設定刪掉, 聒噪/管理員等欄位也會一起刪掉)。").weak().small());
                 let mut restore_id: Option<String> = None;
                 let mut discard_id: Option<String> = None;
                 for sid in &suspended_ids {
@@ -4924,130 +4859,8 @@ impl App {
             });
         });
         ui.add_space(10.0);
-        card(ui, self.palette, "LINE 開通 (讓機器人能在群組說話)", |ui| {
-            // 步驟一: 白名單 (用選的: 先讀群組清單, 再點選加入; 貼 ID 降為進階)
-            let cfg = self.line_cfg_status.lock().unwrap().clone();
-            ui.label(egui::RichText::new("步驟一: 把目標群組加入白名單").size(15.0));
-            if let Some(c) = &cfg {
-                let enabled = c.get("apiEnabled").and_then(|v| v.as_bool()).unwrap_or(false);
-                let chats = c.get("chats").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                ui.label(format!(
-                    "機器人 API: {}; 已加入白名單的群組: {} 個",
-                    if enabled { "已啟用" } else { "尚未啟用" },
-                    chats
-                ));
-            } else {
-                ui.label("正在讀取核心設定狀態…");
-            }
-            ui.label(egui::RichText::new("不用自己找代號: 先在手機 LINE 把這個次要帳號邀請進要用的群組, 回來按「讀取我的群組清單」, 群組會列出來, 用點的加入白名單。").weak());
-            let busy_chats = self.busy.get("chats").copied().unwrap_or(false);
-            if ui.button(if busy_chats { "讀取中…" } else { "讀取我的群組清單" }).clicked() && !busy_chats {
-                self.spawn_chats_load(&ctx);
-            }
-            if let Some(m) = self.page_msg.get("chats") {
-                ui.label(m.clone());
-            }
-            if self.chats_loaded {
-                let chats = self.group_chats.clone();
-                let busy_apply_now = self.busy.get("apply").copied().unwrap_or(false);
-                for c in &chats {
-                    let name = chat_display_name(c.get("name").and_then(|v| v.as_str()), true);
-                    let sub = chat_sub_text(
-                        c.get("kind").and_then(|v| v.as_str()),
-                        c.get("memberCount").and_then(|v| v.as_i64()),
-                        true,
-                    );
-                    let whitelisted = c.get("whitelisted").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    chat_list_row(ui, &name, &sub, |ui| {
-                        if whitelisted {
-                            // 已在白名單: 停用態標籤 (與按鈕同尺寸同欄位, 保持每列對齊)
-                            let _ = chat_action_btn(ui, "已在白名單", false);
-                        } else if chat_action_btn(ui, "加入白名單", !busy_apply_now).clicked() {
-                            self.start_apply(&ctx, id.clone());
-                        }
-                    });
-                }
-            }
-            ui.collapsing("進階: 手動貼上群組 ID (清單讀不到時才需要)", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("群組 ID:");
-                    let mut chat_id = self.page_msg.get("chatid").cloned().unwrap_or_default();
-                    if ui.add(egui::TextEdit::singleline(&mut chat_id).desired_width(320.0).hint_text("共 33 碼 (群組 c 開頭、社群 m 開頭)")).changed() {
-                        self.page_msg.insert("chatid".into(), chat_id);
-                    }
-                });
-                ui.label(egui::RichText::new(format!("備用方法: 在核心網頁 (http://127.0.0.1:{}) 點進群組聊天室, 用右鍵「複製聊天室 ID」取得 ID, 再貼到上面欄位。", crate::engine::core_port())).weak());
-                let busy_apply = self.busy.get("apply").copied().unwrap_or(false);
-                if ui.button(if busy_apply { "處理中…" } else { "加入白名單" }).clicked() && !busy_apply {
-                    let chat_id = self.page_msg.get("chatid").cloned().unwrap_or_default();
-                    if chat_id.trim().is_empty() {
-                        self.page_msg.insert("apply".into(), "請先貼上群組 ID 再按加入白名單".to_string());
-                    } else {
-                        self.start_apply(&ctx, chat_id);
-                    }
-                }
-            });
-            if let Some(m) = self.page_msg.get("apply") {
-                ui.label(m.clone());
-            }
-            ui.add_space(8.0);
-            // 目前白名單 (修復項 8): 已儲存的 chats 逐筆列出與移除, 不能只給計數;
-            // 名稱/類型/人數由 helper 對照核心快照解析; 2026-10-21 版面整理: 畫面不顯示原始 ID,
-            // 名稱讀不到就顯示「未命名群組」與「名稱與資料待讀取」 (ID 只留在 log/診斷資料)。
-            ui.label(egui::RichText::new("目前白名單 (已儲存的群組)").size(15.0));
-            if !self.wl_loaded && !self.wl_attempted && !self.busy.get("wl").copied().unwrap_or(false) {
-                self.spawn_whitelist_load(&ctx);
-            }
-            let busy_wl = self.busy.get("wl").copied().unwrap_or(false);
-            if ui.button(if busy_wl { "讀取中…" } else { "重新讀取白名單" }).clicked() && !busy_wl {
-                self.spawn_whitelist_load(&ctx);
-            }
-            if let Some(m) = self.page_msg.get("wl") {
-                ui.label(m.clone());
-            }
-            if self.wl_loaded {
-                if self.whitelist.is_empty() {
-                    ui.label("白名單目前是空的: 還沒有任何群組被加入, 機器人不會在任何群組回應。");
-                }
-                let wl = self.whitelist.clone();
-                let busy_apply_now = self.busy.get("apply").copied().unwrap_or(false);
-                for c in &wl {
-                    let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if id.is_empty() {
-                        continue;
-                    }
-                    let resolved = c.get("nameResolved").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let name = chat_display_name(c.get("name").and_then(|v| v.as_str()), resolved);
-                    let sub_base = chat_sub_text(
-                        c.get("kind").and_then(|v| v.as_str()),
-                        c.get("memberCount").and_then(|v| v.as_i64()),
-                        resolved,
-                    );
-                    // 狀態小字 (唯讀): 這個群目前用哪一套設定, 一眼可分; 改設定去「聊天室管理」頁, 這裡不提供編輯。
-                    let prof = self.form.chat_profiles.get(&id);
-                    let state_txt = match prof.map(|f| (f.custom, f.suspended)) {
-                        Some((_, true)) => "已停用待確認",
-                        Some((true, false)) => "本群自訂",
-                        _ => "用預設",
-                    };
-                    let chatty_mark = if prof.map(|f| f.chatty).unwrap_or(false) { "・聒噪開" } else { "" };
-                    let sub = format!("{sub_base}・{state_txt}{chatty_mark}");
-                    let mut remove_clicked = false;
-                    chat_list_row(ui, &name, &sub, |ui| {
-                        if chat_action_btn(ui, "移除", !busy_apply_now).clicked() {
-                            remove_clicked = true;
-                        }
-                    });
-                    if remove_clicked {
-                        self.start_remove(&ctx, id.clone());
-                    }
-                }
-                ui.label(egui::RichText::new("移除後要把 AI寶 完全關閉再重新開啟才會生效 (與加入相同)。各聊天室自己的設定請到「聊天室管理」頁改。").weak());
-            }
-            ui.add_space(8.0);
-            // 步驟二: Token
-            ui.label(egui::RichText::new("步驟二: 產生機器人 Token").size(15.0));
+        card(ui, self.palette, "機器人 Token (讓機器人能在群組說話)", |ui| {
+            ui.label(egui::RichText::new("機器人要在群組裡說話, 需要先產生這把 Token 並儲存; 產生後機器人會自動連上。").weak());
             ui.label(if self.form.line_token_configured {
                 format!("目前 Token: 已設定 (末 4 碼 {})", self.form.line_token_last4)
             } else {
@@ -5070,7 +4883,6 @@ impl App {
             if let Some(m) = self.page_msg.get("token") {
                 ui.label(m.clone());
             }
-            ui.label(egui::RichText::new("注意: 白名單生效需要把 AI寶 完全結束再重新開啟一次 (用系統匣的「結束服務並關閉程式」)。").weak());
         });
         ui.add_space(10.0);
         card(ui, self.palette, "備援管理員 (聊天室未設管理員時用)", |ui| {
